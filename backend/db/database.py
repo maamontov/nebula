@@ -42,6 +42,24 @@ class Database:
         with self.transaction() as conn:
             conn.executescript(sql)
 
+    def backup(self, target_path: str) -> str:
+        """Performs consistent online SQLite WAL backup to target_path."""
+        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+        source_conn = self.get_connection()
+        dest_conn = sqlite3.connect(target_path)
+        try:
+            source_conn.backup(dest_conn)
+        finally:
+            dest_conn.close()
+            source_conn.close()
+        return target_path
+
+    def verify_integrity(self) -> bool:
+        """Verifies database integrity using PRAGMA integrity_check."""
+        with self.transaction() as conn:
+            row = conn.execute("PRAGMA integrity_check;").fetchone()
+            return row[0] == "ok" if row else False
+
     @contextmanager
     def transaction(self) -> Generator[sqlite3.Connection, None, None]:
         conn = self.get_connection()

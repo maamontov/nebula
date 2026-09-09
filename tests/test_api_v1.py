@@ -104,3 +104,45 @@ def test_add_segments_and_jobs(client):
     detail = client.get("/api/v1/interviews/inv-test-3").json()
     assert len(detail["transcript_segments"]) == 1
     assert detail["transcript_segments"][0]["text"].startswith("Terraform")
+
+
+def test_delete_interview_privacy_lifecycle(client, tmp_path):
+    spool_dir = tmp_path / "spool"
+    spool_inv = spool_dir / "inv-delete-1"
+    spool_inv.mkdir(parents=True)
+    (spool_inv / "audio.wav").write_bytes(b"audio data")
+
+    client.post(
+        "/api/v1/interviews",
+        json={"id": "inv-delete-1", "title": "QA", "candidate_name": "Елена", "role": "QA"},
+    )
+    client.post(
+        "/api/v1/interviews/inv-delete-1/segments",
+        json={"id": "seg-del-1", "track_id": "candidate", "start_time_ms": 0, "end_time_ms": 1000, "text": "test"},
+    )
+
+    # Delete interview
+    del_res = client.delete(f"/api/v1/interviews/inv-delete-1?spool_dir={spool_dir}")
+    assert del_res.status_code == 200
+    assert del_res.json()["success"] is True
+
+    # Check 404
+    get_res = client.get("/api/v1/interviews/inv-delete-1")
+    assert get_res.status_code == 404
+
+    # Check disk spool purged
+    assert not spool_inv.exists()
+
+
+def test_system_backup_and_integrity(client, tmp_path):
+    # Integrity check
+    integ_res = client.get("/api/v1/system/integrity")
+    assert integ_res.status_code == 200
+    assert integ_res.json()["integrity_ok"] is True
+
+    # Backup
+    backup_file = tmp_path / "backup.db"
+    backup_res = client.post("/api/v1/system/backup", json={"target_path": str(backup_file)})
+    assert backup_res.status_code == 200
+    assert backup_file.exists()
+

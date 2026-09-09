@@ -337,4 +337,45 @@ export async function finalizeAndSealReport(
   return res.json();
 }
 
+// -------------------------------------------------------------
+// Stage 7: Reliability, Privacy Lifecycle & Backup
+// -------------------------------------------------------------
+export async function deleteInterview(interviewId: string, spoolDir?: string): Promise<{
+  status: string;
+  interview_id: string;
+  success: boolean;
+}> {
+  const url = spoolDir
+    ? `${API_BASE}/interviews/${interviewId}?spool_dir=${encodeURIComponent(spoolDir)}`
+    : `${API_BASE}/interviews/${interviewId}`;
+  const res = await fetch(url, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(`Delete interview error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function createDatabaseBackup(targetPath: string): Promise<{
+  status: string;
+  target_path: string;
+}> {
+  const res = await fetch(`${API_BASE}/system/backup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target_path: targetPath }),
+  });
+  if (!res.ok) throw new Error(`Create backup error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function checkDatabaseIntegrity(): Promise<{
+  status: string;
+  integrity_ok: boolean;
+}> {
+  const res = await fetch(`${API_BASE}/system/integrity`);
+  if (!res.ok) throw new Error(`Check integrity error: ${res.statusText}`);
+  return res.json();
+}
+
+
 

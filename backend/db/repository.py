@@ -5,7 +5,10 @@ Provides safe database operations with JSON serialization and timestamps.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from backend.db.database import Database
@@ -96,6 +99,31 @@ class Repository:
                     "UPDATE interviews SET status = ?, updated_at = ? WHERE id = ?",
                     (new_status.value, now, interview_id),
                 )
+
+    def delete_interview(self, interview_id: str, spool_dir: str | Path | None = None) -> bool:
+        """
+        Permanently deletes an interview and cascades across all SQLite WAL tables.
+        Cancels associated jobs and removes local audio spool files.
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT id FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+            if not row:
+                return False
+
+            # Delete jobs
+            conn.execute("DELETE FROM jobs WHERE interview_id = ?", (interview_id,))
+            # Delete audit events
+            conn.execute("DELETE FROM audit_events WHERE interview_id = ?", (interview_id,))
+            # Delete interview (triggers cascading delete for all child tables)
+            conn.execute("DELETE FROM interviews WHERE id = ?", (interview_id,))
+
+        # Physical audio spool deletion
+        if spool_dir:
+            spool_path = Path(spool_dir) / interview_id
+            if spool_path.exists() and spool_path.is_dir():
+                shutil.rmtree(spool_path, ignore_errors=True)
+
+        return True
 
     # -------------------------------------------------------------
     # Interview Plans
@@ -602,6 +630,20 @@ class Repository:
             job["payload"] = json.loads(job["payload_json"])
             job["attempts"] += 1
             return job
+
+    def reclaim_expired_jobs(self) -> int:
+        """Counts and resets expired PROCESSING jobs back to PENDING for retry."""
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'PENDING', locked_until = NULL, updated_at = ?
+                WHERE status = 'PROCESSING' AND locked_until < ? AND attempts < max_attempts
+                """,
+                (now, now),
+            )
+            return cursor.rowcount
 
     def complete_job(self, job_id: str) -> None:
         now = utc_now_iso()

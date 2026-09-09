@@ -59,6 +59,13 @@ class PipelineWorker:
         interview_id = job["interview_id"]
         payload = job["payload"]
 
+        # Check if interview exists before processing (privacy lifecycle protection)
+        interview = self.repo.get_interview(interview_id)
+        if not interview:
+            logger.warning("Interview %s was deleted. Discarding job %s without saving results.", interview_id, job_id)
+            self.repo.fail_job(job_id, "Interview was deleted (privacy lifecycle)")
+            return True
+
         try:
             if job_type == "TRANSCRIBE_AUDIO":
                 await self._handle_transcribe(interview_id, payload)
@@ -70,6 +77,12 @@ class PipelineWorker:
                 await self._handle_generate_summary(interview_id, payload)
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
+
+            # Re-verify interview wasn't deleted while job was running
+            if not self.repo.get_interview(interview_id):
+                logger.warning("Interview %s deleted during execution. Discarding job %s.", interview_id, job_id)
+                self.repo.fail_job(job_id, "Interview was deleted during execution")
+                return True
 
             self.repo.complete_job(job_id)
             self.repo.record_audit_event(
@@ -104,6 +117,10 @@ class PipelineWorker:
             language=language,
         )
 
+        if not self.repo.get_interview(interview_id):
+            logger.warning("Interview %s was deleted before saving transcript segment.", interview_id)
+            return
+
         segment_id = payload.get("segment_id", f"seg-{uuid.uuid4().hex[:8]}")
         self.repo.add_transcript_segment(
             segment_id=segment_id,
@@ -116,6 +133,10 @@ class PipelineWorker:
         )
 
     async def _handle_evaluate(self, interview_id: str, payload: dict[str, Any]) -> None:
+        if not self.repo.get_interview(interview_id):
+            logger.warning("Interview %s was deleted before evaluation. Discarding.", interview_id)
+            return
+
         question_id = payload["question_id"]
         candidate_text = payload["candidate_text"]
         segment_id = payload.get("segment_id", "seg-default")
@@ -168,7 +189,7 @@ Respond strictly with a JSON object conforming to:
                     payload=self.llm_adapter.last_fallback_event,
                 )
         else:
-            llm_res = await self.llm_adapter.execute_request(
+            raw_res = await self.llm_adapter.execute_request(
                 messages=messages,
                 json_schema={
                     "type": "object",
@@ -180,9 +201,13 @@ Respond strictly with a JSON object conforming to:
                 },
                 schema_name="assessment_schema",
             )
-            actual_model_id = self.llm_adapter.model.upstream_model_id
+            if isinstance(raw_res, tuple):
+                llm_res, actual_model_id = raw_res
+            else:
+                llm_res = raw_res
+                actual_model_id = getattr(getattr(self.llm_adapter, "model", None), "upstream_model_id", "mock-model")
 
-        parsed_json = llm_res.get("data", {})
+        parsed_json = llm_res.get("data", llm_res) if isinstance(llm_res, dict) else {}
         scores = parsed_json.get("scores", [])
         critical_errors = parsed_json.get("critical_errors", [])
 
@@ -219,6 +244,10 @@ Respond strictly with a JSON object conforming to:
         if not validation.is_valid:
             logger.warning("Evidence validation failed for proposal %s: %s", proposal.id, validation.errors)
 
+        if not self.repo.get_interview(interview_id):
+            logger.warning("Interview %s was deleted before saving evaluation proposal.", interview_id)
+            return
+
         self.repo.save_assessment_proposal(
             proposal_id=proposal.id,
             interview_id=interview_id,
@@ -234,6 +263,10 @@ Respond strictly with a JSON object conforming to:
         new_rev_id = payload.get("new_revision_id", "trans-rev-2")
         old_rev_id = payload.get("old_revision_id", "trans-rev-1")
         revision_number = payload.get("revision_number", 2)
+
+        if not self.repo.get_interview(interview_id):
+            logger.warning("Interview %s was deleted before batch retranscribe.", interview_id)
+            return
 
         self.repo.create_transcript_revision(
             revision_id=new_rev_id,
@@ -347,6 +380,10 @@ Respond strictly with a JSON object conforming to:
             decisions=list(decisions_map.values()),
             audio_health_summary=payload.get("audio_health", {}),
         )
+
+        if not self.repo.get_interview(interview_id):
+            logger.warning("Interview %s was deleted before saving summary proposal.", interview_id)
+            return
 
         prop_id = f"sum-{uuid.uuid4().hex[:8]}"
         self.repo.save_summary_proposal(

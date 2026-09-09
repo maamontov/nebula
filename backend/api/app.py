@@ -5,6 +5,7 @@ Provides endpoints for health check, scoring, proposal validation, and lifecycle
 import hashlib
 import json
 import uuid
+import os
 from typing import Any
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -123,6 +124,10 @@ class FinalizeReportRequest(BaseModel):
     hiring_recommendation: str | None = None
 
 
+class CreateBackupRequest(BaseModel):
+    target_path: str
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "version": "0.1.0"}
@@ -181,6 +186,20 @@ async def get_interview_endpoint(
         "transcript_segments": segments,
         "assessment_proposals": proposals,
     }
+
+
+@app.delete("/api/v1/interviews/{interview_id}")
+async def delete_interview_endpoint(
+    interview_id: str,
+    spool_dir: str = os.getenv("NEBULA_SPOOL_DIR", "./spool"),
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    deleted = repo.delete_interview(interview_id=interview_id, spool_dir=spool_dir)
+    return {"status": "deleted", "interview_id": interview_id, "success": deleted}
 
 
 @app.post("/api/v1/interviews/{interview_id}/status")
@@ -775,3 +794,27 @@ async def transition_state_endpoint(payload: TransitionStateRequest):
         return {"current_status": new_status.value}
     except InvalidStateTransitionError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# -------------------------------------------------------------
+# System & Reliability Maintenance
+# -------------------------------------------------------------
+@app.post("/api/v1/system/backup")
+async def backup_database_endpoint(
+    payload: CreateBackupRequest,
+    repo: Repository = Depends(get_repository),
+):
+    try:
+        target = repo.db.backup(payload.target_path)
+        return {"status": "ok", "target_path": target}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
+
+
+@app.get("/api/v1/system/integrity")
+async def check_database_integrity_endpoint(
+    repo: Repository = Depends(get_repository),
+):
+    is_ok = repo.db.verify_integrity()
+    return {"status": "ok" if is_ok else "corrupted", "integrity_ok": is_ok}
+
