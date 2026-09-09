@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.111.0",
     "pydantic>=2.7.0",
     "httpx>=0.27.0",
+    "python-dotenv>=1.2.3",
 ]
 
 [dependency-groups]

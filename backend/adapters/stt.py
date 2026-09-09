@@ -1,0 +1,161 @@
+"""
+Universal OpenAI-compatible Speech-to-Text (STT) Adapter.
+Implements POST /v1/audio/transcriptions adhering to docs/implementation-plan.md Section 4.5.
+"""
+import asyncio
+import logging
+import os
+import time
+from dataclasses import dataclass
+from typing import BinaryIO
+
+import httpx
+
+from contracts.provider import STTProfile
+
+logger = logging.getLogger(__name__)
+
+
+class STTAdapterError(Exception):
+    """Base exception for STT failures."""
+
+
+class STTAuthenticationError(STTAdapterError):
+    """401/403 auth failure."""
+
+
+class STTRateLimitError(STTAdapterError):
+    """429 rate limit exceeded."""
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class STTTransientError(STTAdapterError):
+    """Temporary 5xx or network failure."""
+
+
+@dataclass(frozen=True)
+class STTTranscriptionResult:
+    text: str
+    model_id: str
+    latency_seconds: float
+    raw_response: dict
+
+
+class OpenAICompatibleSTTAdapter:
+    def __init__(
+        self,
+        profile: STTProfile,
+        api_key_env: str = "PLUSVIBE_API_KEY",
+        http_client: httpx.AsyncClient | None = None,
+    ):
+        self.profile = profile
+        self.api_key_env = api_key_env
+        self._external_client = http_client
+
+    def _get_api_key(self) -> str:
+        return os.getenv(self.api_key_env, "")
+
+    async def transcribe_audio(
+        self,
+        audio_data: bytes | BinaryIO,
+        filename: str = "chunk.wav",
+        content_type: str = "audio/wav",
+        language: str | None = "ru",
+        max_retries: int = 3,
+        initial_backoff: float = 1.0,
+    ) -> STTTranscriptionResult:
+        """
+        Transcribes an audio chunk or file via the standard multipart/form-data endpoint.
+        """
+        api_key = self._get_api_key()
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        client = self._external_client or httpx.AsyncClient(timeout=self.profile.timeout_seconds)
+        close_client = self._external_client is None
+
+        attempt = 0
+        backoff = initial_backoff
+        t0 = time.perf_counter()
+
+        try:
+            while attempt < max_retries:
+                attempt += 1
+                try:
+                    # Prepare multipart form
+                    if isinstance(audio_data, bytes):
+                        file_payload = (filename, audio_data, content_type)
+                    else:
+                        file_payload = (filename, audio_data.read(), content_type)
+
+                    files = {"file": file_payload}
+                    data = {"model": self.profile.model_id}
+                    if language:
+                        data["language"] = language
+
+                    resp = await client.post(
+                        self.profile.endpoint_url,
+                        files=files,
+                        data=data,
+                        headers=headers,
+                    )
+
+                    if resp.status_code in (401, 403):
+                        raise STTAuthenticationError(
+                            f"STT Authentication error {resp.status_code}: {resp.text}"
+                        )
+
+                    if resp.status_code == 429:
+                        retry_h = resp.headers.get("Retry-After")
+                        retry_sec = float(retry_h) if retry_h and retry_h.isdigit() else backoff
+                        if attempt >= max_retries:
+                            raise STTRateLimitError(
+                                f"STT Rate limit exceeded after {attempt} attempts: {resp.text}",
+                                retry_after=retry_sec,
+                            )
+                        logger.warning("STT Rate limit hit, sleeping for %.2fs", retry_sec)
+                        await asyncio.sleep(retry_sec)
+                        backoff *= 2.0
+                        continue
+
+                    if resp.status_code >= 500:
+                        if attempt >= max_retries:
+                            raise STTTransientError(
+                                f"STT Server error {resp.status_code}: {resp.text}"
+                            )
+                        logger.warning("STT upstream error %d, retrying (%d/%d)", resp.status_code, attempt, max_retries)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2.0
+                        continue
+
+                    if resp.status_code != 200:
+                        raise STTAdapterError(
+                            f"Unexpected STT response status {resp.status_code}: {resp.text}"
+                        )
+
+                    latency = time.perf_counter() - t0
+                    res_json = resp.json()
+                    text = res_json.get("text", "").strip()
+
+                    return STTTranscriptionResult(
+                        text=text,
+                        model_id=self.profile.model_id,
+                        latency_seconds=latency,
+                        raw_response=res_json,
+                    )
+
+                except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as net_err:
+                    if attempt >= max_retries:
+                        raise STTTransientError(f"STT network error: {net_err}")
+                    logger.warning("STT network error on attempt %d: %s", attempt, net_err)
+                    await asyncio.sleep(backoff)
+                    backoff *= 2.0
+
+            raise STTTransientError(f"Exceeded max retries ({max_retries})")
+
+        finally:
+            if close_client:
+                await client.aclose()

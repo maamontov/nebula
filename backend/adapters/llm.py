@@ -119,6 +119,18 @@ class OpenAICompatibleAdapter:
                 }
             elif self.model.structured_output_mode == StructuredOutputMode.JSON_OBJECT:
                 payload["response_format"] = {"type": "json_object"}
+                # In JSON_OBJECT mode, models require schema description in the prompt
+                instruction = (
+                    f"\nYou must respond STRICTLY with a valid JSON object conforming to this schema:\n"
+                    f"{json.dumps(json_schema, ensure_ascii=False)}"
+                )
+                if payload["messages"] and payload["messages"][0]["role"] == "system":
+                    payload["messages"][0] = {
+                        "role": "system",
+                        "content": payload["messages"][0]["content"] + "\n" + instruction,
+                    }
+                else:
+                    payload["messages"].insert(0, {"role": "system", "content": instruction})
             elif self.model.structured_output_mode == StructuredOutputMode.PROMPT_INSTRUCTION:
                 # Append instruction to system message
                 instruction = (

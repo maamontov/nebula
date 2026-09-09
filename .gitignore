@@ -50,5 +50,6 @@ spool/
 recordings/
 
 # Desktop / Tauri / Rust
+target/
 apps/desktop/src-tauri/target/
 node_modules/

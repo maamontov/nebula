@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/audio-capture",
+    "apps/audio-spike",
+]
+resolver = "2"

@@ -20,29 +20,38 @@ Nebula — кроссплатформенный AI-помощник для пр�
 
 ### Структура репозитория
 ```text
+crates/
+  audio-capture/  # Нативное ядро захвата звука (Rust, CoreAudio/WASAPI, ringbuffer, spool)
+apps/
+  audio-spike/    # CLI-утилита для спайка и стресс-тестирования аудиозахвата
+  desktop/        # Tauri 2 + React десктопное приложение (Этап 3+)
 contracts/        # Pydantic v2 и JSON Schema контракты (провайдеры, аудио, домен)
 backend/
   core/           # Доменная логика: детерминированный скоринг, state machine, evidence validator
   adapters/       # OpenAI-compatible LLM адаптер без завязки на GPT
   api/            # FastAPI приложение и эндпоинты
 evals/            # Provider probe CLI для проверки любых non-GPT провайдеров
-apps/desktop/     # Tauri 2 + React десктопное приложение (Этап 1-3)
 tests/            # Набор модульных и интеграционных тестов (pytest)
-docs/             # Концепция, план реализации, спецификация контрактов
+docs/             # Концепция, план реализации, спецификации контрактов и аудио
 ```
 
 ### Быстрый старт
 ```bash
-# Установка зависимостей через uv
+# 1. Установка зависимостей и запуск тестов Python (бэкенд и контракты)
 uv sync
-
-# Запуск тестов
 uv run pytest -v
-
-# Проверка качества кода (ruff)
 uv run ruff check .
 
-# Запуск диагностического пробника LLM-провайдера
+# 2. Запуск тестов нативного ядра захвата звука (Rust)
+cargo test --workspace
+
+# 3. Инспекция аудиоустройств ввода/вывода (CoreAudio / WASAPI)
+cargo run -p audio-spike -- list-devices
+
+# 4. Запуск часового стресс-теста аудиозахвата со сведением дрейфа
+cargo run --release -p audio-spike -- synthetic-test --simulated-duration-sec 3600
+
+# 5. Запуск диагностического пробника LLM-провайдера
 uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --model qwen2.5:7b
 ```
 
@@ -50,6 +59,8 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 - [Концепция продукта](docs/product-concept.md)
 - [План реализации](docs/implementation-plan.md)
 - [Спецификация контрактов и доменной модели](docs/contracts-spec.md)
+- [Спецификация аудиозахвата и spooling](docs/audio-capture-spec.md)
+- [Спецификация интеграции STT и LLM](docs/stt-llm-provider-spec.md)
 
 ---
 
@@ -70,29 +81,38 @@ Core product principle: **Nebula is a decision-support system, not an autonomous
 
 ### Repository Layout
 ```text
+crates/
+  audio-capture/  # Native audio capture core (Rust, CoreAudio/WASAPI, ringbuffer, spool)
+apps/
+  audio-spike/    # CLI tool for audio spike & stress testing
+  desktop/        # Tauri 2 + React desktop application (Stage 3+)
 contracts/        # Pydantic v2 and JSON Schema data contracts (providers, audio, domain)
 backend/
   core/           # Domain logic: deterministic scoring, state machine, evidence validator
   adapters/       # OpenAI-compatible LLM adapter without GPT assumptions
   api/            # FastAPI application and HTTP routes
 evals/            # Provider probe CLI tool to validate non-GPT LLM endpoints
-apps/desktop/     # Tauri 2 + React desktop shell (Stages 1-3)
 tests/            # Unit and contract test suite (pytest)
-docs/             # Product concept, implementation plan, contracts spec
+docs/             # Product concept, implementation plan, contracts and audio specs
 ```
 
 ### Quickstart
 ```bash
-# Install dependencies using uv
+# 1. Install dependencies and run Python test suite (backend & contracts)
 uv sync
-
-# Run test suite
 uv run pytest -v
-
-# Run linter
 uv run ruff check .
 
-# Run provider compatibility probe
+# 2. Run native audio capture test suite (Rust)
+cargo test --workspace
+
+# 3. Inspect system audio input and output devices
+cargo run -p audio-spike -- list-devices
+
+# 4. Run 1-hour 2-channel audio stress test with clock drift simulation
+cargo run --release -p audio-spike -- synthetic-test --simulated-duration-sec 3600
+
+# 5. Run LLM provider compatibility probe
 uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --model qwen2.5:7b
 ```
 
@@ -100,3 +120,5 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 - [Product Concept](docs/product-concept.md)
 - [Implementation Plan](docs/implementation-plan.md)
 - [Contracts & Domain Model Specification](docs/contracts-spec.md)
+- [Audio Capture & Spooling Specification](docs/audio-capture-spec.md)
+- [STT & LLM Integration Specification](docs/stt-llm-provider-spec.md)
