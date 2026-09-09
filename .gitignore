@@ -62,3 +62,9 @@ apps/desktop/dist/
 *.db-shm
 data/
 
+# Runtime and process logs
+.run/
+logs/
+*.log
+
+

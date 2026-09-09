@@ -55,12 +55,24 @@ cargo run --release -p audio-spike -- synthetic-test --simulated-duration-sec 36
 uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --model qwen2.5:7b
 ```
 
+### Управление сервисами (CLI)
+```bash
+./scripts/start.sh                    # Запуск всех компонентов (Backend + Worker + Desktop)
+./scripts/start.sh backend            # Запуск только API сервера
+./scripts/status.sh                   # Мониторинг PID, здоровья API и целостности SQLite WAL
+./scripts/stop.sh                     # Корректная остановка всех сервисов
+./scripts/restart.sh                  # Перезапуск системы
+./scripts/nebula.sh logs worker -f    # Просмотр логов воркера в реальном времени
+```
+
 ### Документация
 - [Концепция продукта](docs/product-concept.md)
 - [План реализации](docs/implementation-plan.md)
 - [Спецификация контрактов и доменной модели](docs/contracts-spec.md)
 - [Спецификация аудиозахвата и spooling](docs/audio-capture-spec.md)
 - [Спецификация интеграции STT и LLM](docs/stt-llm-provider-spec.md)
+- [Спецификация управления сервисами](docs/service-management-spec.md)
+- [Спецификация надёжности и пилотной готовности](docs/stage7-reliability-and-pilot-spec.md)
 
 ---
 
@@ -116,9 +128,21 @@ cargo run --release -p audio-spike -- synthetic-test --simulated-duration-sec 36
 uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --model qwen2.5:7b
 ```
 
+### Service Management (CLI)
+```bash
+./scripts/start.sh                    # Start all components (Backend + Worker + Desktop)
+./scripts/start.sh backend            # Start API server only
+./scripts/status.sh                   # Check PIDs, API health & SQLite WAL integrity
+./scripts/stop.sh                     # Gracefully stop all services
+./scripts/restart.sh                  # Restart system services
+./scripts/nebula.sh logs worker -f    # Live stream pipeline worker logs
+```
+
 ### Documentation
 - [Product Concept](docs/product-concept.md)
 - [Implementation Plan](docs/implementation-plan.md)
 - [Contracts & Domain Model Specification](docs/contracts-spec.md)
 - [Audio Capture & Spooling Specification](docs/audio-capture-spec.md)
 - [STT & LLM Integration Specification](docs/stt-llm-provider-spec.md)
+- [Service Management Specification](docs/service-management-spec.md)
+- [Reliability & Pilot Readiness Specification](docs/stage7-reliability-and-pilot-spec.md)

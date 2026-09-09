@@ -410,14 +410,12 @@ if __name__ == "__main__":
     from backend.db.repository import Repository
     from backend.adapters.stt import OpenAICompatibleSTTAdapter
     from backend.adapters.resilient_llm import ResilientLLMAdapter
-    from backend.core.profiles import get_plusvibe_whisper_profile
+    from backend.core.profiles import get_plusvibe_whisper_stt
 
     db = get_db()
     db.init_schema()
     repo = Repository(db)
-    stt_adapter = OpenAICompatibleSTTAdapter(get_plusvibe_whisper_profile())
-    llm_adapter = ResilientLLMAdapter()
-    worker = PipelineWorker(repo=repo, stt_adapter=stt_adapter, llm_adapter=llm_adapter)
+    worker = PipelineWorker(repository=repo)
     logger.info("Starting Nebula Pipeline Worker daemon...")
     try:
         asyncio.run(worker.run_loop())
