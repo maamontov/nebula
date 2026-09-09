@@ -2,8 +2,10 @@
 FastAPI entry point for Nebula backend.
 Provides endpoints for health check, scoring, proposal validation, and lifecycle.
 """
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import uuid
+from typing import Any
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 from backend.core.evidence_validator import (
     validate_proposal,
@@ -16,6 +18,8 @@ from backend.core.state_machine import (
     InvalidStateTransitionError,
     transition_status,
 )
+from backend.db.database import get_db
+from backend.db.repository import Repository
 from contracts.domain import (
     AssessmentProposal,
     HumanQuestionAssessment,
@@ -31,6 +35,41 @@ app = FastAPI(
 )
 
 
+def get_repository() -> Repository:
+    db = get_db()
+    db.init_schema()
+    return Repository(db)
+
+
+class CreateInterviewRequest(BaseModel):
+    id: str
+    title: str
+    candidate_name: str
+    role: str
+    plan: dict[str, Any] | None = None
+
+
+class AddSegmentRequest(BaseModel):
+    id: str
+    track_id: str
+    start_time_ms: int
+    end_time_ms: int
+    text: str
+    is_final: bool = True
+
+
+class ApproveAssessmentRequest(BaseModel):
+    reviewed_scores: list[dict[str, Any]] | None = None
+    reviewer_notes: str | None = None
+
+
+class EnqueueJobRequest(BaseModel):
+    id: str
+    type: str
+    payload: dict[str, Any]
+    max_attempts: int = 3
+
+
 class CalculateScoreRequest(BaseModel):
     rubric: RubricRevision
     assessments: list[HumanQuestionAssessment]
@@ -44,6 +83,8 @@ class ValidateProposalRequest(BaseModel):
 class TransitionStateRequest(BaseModel):
     current_status: InterviewStatus
     target_status: InterviewStatus
+    consent_confirmed_at: str | None = None
+    consent_version: str | None = None
 
 
 @app.get("/healthz")
@@ -51,6 +92,209 @@ async def healthz():
     return {"status": "ok", "version": "0.1.0"}
 
 
+# -------------------------------------------------------------
+# Interview Management
+# -------------------------------------------------------------
+@app.post("/api/v1/interviews")
+async def create_interview_endpoint(
+    payload: CreateInterviewRequest,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.create_interview(
+        interview_id=payload.id,
+        title=payload.title,
+        candidate_name=payload.candidate_name,
+        role=payload.role,
+        status=InterviewStatus.DRAFT,
+    )
+    if payload.plan:
+        repo.save_plan(f"plan-{payload.id}", payload.id, payload.plan, version=1)
+    repo.record_audit_event(
+        event_id=f"audit-{uuid.uuid4().hex[:8]}",
+        interview_id=payload.id,
+        event_type="INTERVIEW_CREATED",
+        payload={"title": payload.title, "candidate": payload.candidate_name, "role": payload.role},
+    )
+    return inv
+
+
+@app.get("/api/v1/interviews")
+async def list_interviews_endpoint(
+    limit: int = 50,
+    repo: Repository = Depends(get_repository),
+):
+    return repo.list_interviews(limit=limit)
+
+
+@app.get("/api/v1/interviews/{interview_id}")
+async def get_interview_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    plan = repo.get_latest_plan(interview_id)
+    segments = repo.get_transcript_segments(interview_id)
+    proposals = repo.get_assessment_proposals(interview_id)
+
+    return {
+        "interview": inv,
+        "plan": plan["payload"] if plan else None,
+        "transcript_segments": segments,
+        "assessment_proposals": proposals,
+    }
+
+
+@app.post("/api/v1/interviews/{interview_id}/status")
+async def update_status_endpoint(
+    interview_id: str,
+    payload: TransitionStateRequest,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    try:
+        current_status = InterviewStatus(inv["status"])
+        new_status = transition_status(current_status, payload.target_status)
+        repo.update_interview_status(
+            interview_id=interview_id,
+            new_status=new_status,
+            consent_confirmed_at=payload.consent_confirmed_at,
+            consent_version=payload.consent_version,
+        )
+        repo.record_audit_event(
+            event_id=f"audit-{uuid.uuid4().hex[:8]}",
+            interview_id=interview_id,
+            event_type="STATUS_TRANSITIONED",
+            payload={"from": current_status.value, "to": new_status.value},
+        )
+        return {"status": new_status.value}
+    except InvalidStateTransitionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/v1/interviews/{interview_id}/segments")
+async def add_segment_endpoint(
+    interview_id: str,
+    payload: AddSegmentRequest,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    repo.add_transcript_segment(
+        segment_id=payload.id,
+        interview_id=interview_id,
+        track_id=payload.track_id,
+        start_time_ms=payload.start_time_ms,
+        end_time_ms=payload.end_time_ms,
+        text=payload.text,
+        is_final=payload.is_final,
+    )
+    return {"status": "ok", "segment_id": payload.id}
+
+
+@app.post("/api/v1/interviews/{interview_id}/jobs/enqueue")
+async def enqueue_job_endpoint(
+    interview_id: str,
+    payload: EnqueueJobRequest,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    repo.enqueue_job(
+        job_id=payload.id,
+        job_type=payload.type,
+        interview_id=interview_id,
+        payload=payload.payload,
+        max_attempts=payload.max_attempts,
+    )
+    return {"status": "enqueued", "job_id": payload.id}
+
+
+@app.post("/api/v1/interviews/{interview_id}/assessments/{proposal_id}/approve")
+async def approve_assessment_endpoint(
+    interview_id: str,
+    proposal_id: str,
+    payload: ApproveAssessmentRequest,
+    repo: Repository = Depends(get_repository),
+):
+    repo.approve_assessment(
+        proposal_id=proposal_id,
+        reviewed_scores=payload.reviewed_scores,
+        reviewer_notes=payload.reviewer_notes,
+    )
+    repo.record_audit_event(
+        event_id=f"audit-{uuid.uuid4().hex[:8]}",
+        interview_id=interview_id,
+        event_type="ASSESSMENT_APPROVED",
+        payload={"proposal_id": proposal_id, "reviewer_notes": payload.reviewer_notes},
+    )
+    return {"status": "approved", "proposal_id": proposal_id}
+
+
+@app.get("/api/v1/interviews/{interview_id}/export")
+async def export_interview_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    plan = repo.get_latest_plan(interview_id)
+    segments = repo.get_transcript_segments(interview_id)
+    proposals = repo.get_assessment_proposals(interview_id)
+    audit_events = repo.get_audit_events(interview_id)
+
+    total_score = 0.0
+    count = 0
+    decisions = []
+    for p in proposals:
+        score_val = None
+        if p.get("reviewed_scores") and len(p["reviewed_scores"]) > 0:
+            score_val = p["reviewed_scores"][0].get("score")
+        elif p.get("scores") and len(p["scores"]) > 0:
+            score_val = p["scores"][0].get("score")
+
+        if score_val is not None:
+            total_score += float(score_val)
+            count += 1
+            decisions.append({
+                "proposal_id": p["id"],
+                "question_id": p["question_id"],
+                "score": score_val,
+                "is_approved": bool(p.get("is_approved")),
+                "reviewer_notes": p.get("reviewer_notes"),
+            })
+
+    final_score_100 = round((total_score / (count * 5.0)) * 100.0, 2) if count > 0 else 0.0
+
+    return {
+        "interview_id": inv["id"],
+        "title": inv["title"],
+        "candidate_name": inv["candidate_name"],
+        "role": inv["role"],
+        "status": inv["status"],
+        "plan": plan["payload"] if plan else None,
+        "transcript_segments": segments,
+        "assessment_proposals": proposals,
+        "decisions": decisions,
+        "final_score_100": final_score_100,
+        "audit_trail": audit_events,
+    }
+
+
+# -------------------------------------------------------------
+# Scoring and Validation Utilities
+# -------------------------------------------------------------
 @app.post("/api/v1/scoring/calculate", response_model=None)
 async def calculate_score_endpoint(payload: CalculateScoreRequest):
     try:

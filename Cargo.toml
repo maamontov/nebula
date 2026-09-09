@@ -2,5 +2,6 @@
 members = [
     "crates/audio-capture",
     "apps/audio-spike",
+    "apps/desktop/src-tauri",
 ]
 resolver = "2"
