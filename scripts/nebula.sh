@@ -126,12 +126,20 @@ start_desktop() {
         return 0
     fi
 
+    # Check if port 1420 is occupied by an orphaned vite process
+    local port_occupier
+    port_occupier=$(lsof -ti :1420 2>/dev/null || echo "")
+    if [[ -n "$port_occupier" ]]; then
+        kill -9 $port_occupier 2>/dev/null || true
+        sleep 0.5
+    fi
+
     echo -ne "  Starting Desktop Shell (Tauri 2 + React)... "
     cd "$ROOT_DIR"
     nohup npm --prefix apps/desktop run tauri dev > "$log_file" 2>&1 &
     local new_pid=$!
     echo "$new_pid" > "$pid_file"
-    sleep 1.5
+    sleep 2.0
 
     if kill -0 "$new_pid" 2>/dev/null; then
         echo -e "${GREEN}[OK]${NC} (PID: $new_pid, logging to .run/logs/desktop.log)"
@@ -186,7 +194,7 @@ stop_backend() {
     local p
     p=$(lsof -ti :8000 2>/dev/null || echo "")
     if [[ -n "$p" ]]; then
-        kill -9 "$p" 2>/dev/null || true
+        kill -9 $p 2>/dev/null || true
     fi
 }
 
@@ -196,6 +204,14 @@ stop_worker() {
 
 stop_desktop() {
     stop_process "Desktop App" "$RUN_DIR/desktop.pid"
+    # Ensure port 1420 and any child vite or nebula-desktop processes are cleaned up
+    local p
+    p=$(lsof -ti :1420 2>/dev/null || echo "")
+    if [[ -n "$p" ]]; then
+        kill -9 $p 2>/dev/null || true
+    fi
+    pkill -f "nebula-desktop" 2>/dev/null || true
+    pkill -f "vite" 2>/dev/null || true
 }
 
 # ------------------------------------------------------------------------------
