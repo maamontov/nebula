@@ -402,3 +402,25 @@ Respond strictly with a JSON object conforming to:
 
     def stop(self) -> None:
         self._running = False
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    from backend.db.database import get_db
+    from backend.db.repository import Repository
+    from backend.adapters.stt import OpenAICompatibleSTTAdapter
+    from backend.adapters.resilient_llm import ResilientLLMAdapter
+    from backend.core.profiles import get_plusvibe_whisper_profile
+
+    db = get_db()
+    db.init_schema()
+    repo = Repository(db)
+    stt_adapter = OpenAICompatibleSTTAdapter(get_plusvibe_whisper_profile())
+    llm_adapter = ResilientLLMAdapter()
+    worker = PipelineWorker(repo=repo, stt_adapter=stt_adapter, llm_adapter=llm_adapter)
+    logger.info("Starting Nebula Pipeline Worker daemon...")
+    try:
+        asyncio.run(worker.run_loop())
+    except KeyboardInterrupt:
+        logger.info("Pipeline Worker stopped by user.")
+
