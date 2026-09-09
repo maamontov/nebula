@@ -12,6 +12,7 @@ import uuid
 from typing import Any
 
 from backend.adapters.llm import OpenAICompatibleAdapter
+from backend.adapters.resilient_llm import ResilientLLMAdapter
 from backend.adapters.stt import OpenAICompatibleSTTAdapter
 from backend.core.evidence_validator import validate_proposal
 from backend.core.profiles import (
@@ -35,16 +36,14 @@ class PipelineWorker:
         self,
         repository: Repository,
         stt_adapter: OpenAICompatibleSTTAdapter | None = None,
-        llm_adapter: OpenAICompatibleAdapter | None = None,
+        llm_adapter: OpenAICompatibleAdapter | ResilientLLMAdapter | None = None,
     ) -> None:
         self.repo = repository
         self.provider = get_plusvibe_provider()
         self.stt_adapter = stt_adapter or OpenAICompatibleSTTAdapter(
             get_plusvibe_whisper_stt(), api_key_env="PLUSVIBE_API_KEY"
         )
-        self.llm_adapter = llm_adapter or OpenAICompatibleAdapter(
-            self.provider, get_plusvibe_gemini_model()
-        )
+        self.llm_adapter = llm_adapter or ResilientLLMAdapter()
         self._running = False
 
     async def process_one_job(self) -> bool:
@@ -142,18 +141,40 @@ Respond strictly with a JSON object conforming to:
             },
         ]
 
-        llm_res = await self.llm_adapter.execute_request(
-            messages=messages,
-            json_schema={
-                "type": "object",
-                "properties": {
-                    "scores": {"type": "array"},
-                    "critical_errors": {"type": "array"},
+        if isinstance(self.llm_adapter, ResilientLLMAdapter):
+            llm_res, actual_model_id = await self.llm_adapter.execute_request(
+                messages=messages,
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "scores": {"type": "array"},
+                        "critical_errors": {"type": "array"},
+                    },
+                    "required": ["scores", "critical_errors"],
                 },
-                "required": ["scores", "critical_errors"],
-            },
-            schema_name="assessment_schema",
-        )
+                schema_name="assessment_schema",
+            )
+            if self.llm_adapter.last_fallback_event:
+                self.repo.record_audit_event(
+                    event_id=f"audit-{uuid.uuid4().hex[:8]}",
+                    interview_id=interview_id,
+                    event_type="MODEL_FALLBACK_TRIGGERED",
+                    payload=self.llm_adapter.last_fallback_event,
+                )
+        else:
+            llm_res = await self.llm_adapter.execute_request(
+                messages=messages,
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "scores": {"type": "array"},
+                        "critical_errors": {"type": "array"},
+                    },
+                    "required": ["scores", "critical_errors"],
+                },
+                schema_name="assessment_schema",
+            )
+            actual_model_id = self.llm_adapter.model.upstream_model_id
 
         parsed_json = llm_res.get("data", {})
         scores = parsed_json.get("scores", [])
@@ -166,7 +187,7 @@ Respond strictly with a JSON object conforming to:
             question_id=question_id,
             rubric_revision_id="rub-rev-1",
             transcript_revision_id="trans-rev-1",
-            model_profile_id=self.llm_adapter.model.upstream_model_id,
+            model_profile_id=actual_model_id,
             scores=scores,
             critical_errors=critical_errors,
         )
@@ -193,7 +214,7 @@ Respond strictly with a JSON object conforming to:
             proposal_id=proposal.id,
             interview_id=interview_id,
             question_id=question_id,
-            model_profile_id=self.llm_adapter.model.upstream_model_id,
+            model_profile_id=actual_model_id,
             scores=scores,
             critical_errors=critical_errors,
         )

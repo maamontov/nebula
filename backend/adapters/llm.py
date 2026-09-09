@@ -188,13 +188,14 @@ class OpenAICompatibleAdapter:
 
                     if resp.status_code == 429:
                         retry_header = resp.headers.get("Retry-After")
-                        retry_after = float(retry_header) if retry_header and retry_header.isdigit() else backoff
+                        raw_retry_after = float(retry_header) if retry_header and retry_header.isdigit() else backoff
+                        retry_after = min(raw_retry_after, 5.0)
                         if attempt >= max_retries:
                             raise LLMRateLimitError(
                                 f"Rate limit exceeded after {attempt} attempts: {resp.text}",
-                                retry_after=retry_after,
+                                retry_after=raw_retry_after,
                             )
-                        logger.warning("Rate limit hit, sleeping for %.2fs", retry_after)
+                        logger.warning("Rate limit hit, sleeping for %.2fs (capped from %.2fs)", retry_after, raw_retry_after)
                         await asyncio.sleep(retry_after)
                         backoff *= 2.0
                         continue

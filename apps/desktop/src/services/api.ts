@@ -171,3 +171,50 @@ export async function exportInterview(interviewId: string): Promise<Record<strin
   return res.json();
 }
 
+export async function getAssociations(interviewId: string): Promise<{
+  interview_id: string;
+  associations: Array<{
+    id: string;
+    question_id: string;
+    segment_id: string;
+    confidence: number;
+    is_ambiguous: boolean;
+    is_manually_adjusted: boolean;
+    notes: string;
+  }>;
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/associations`);
+  if (!res.ok) throw new Error(`Get associations error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function reassociateSegment(
+  interviewId: string,
+  segmentId: string,
+  newQuestionId: string,
+  notes: string = "Ручная привязка интервьюером"
+): Promise<{ status: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/segments/${segmentId}/associate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      new_question_id: newQuestionId,
+      notes,
+    }),
+  });
+  if (!res.ok) throw new Error(`Reassociate error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getInterviewHealth(interviewId: string): Promise<{
+  interview_id: string;
+  is_healthy: boolean;
+  interviewer: { status: string; warnings: string[] };
+  candidate: { status: string; warnings: string[] };
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/health`);
+  if (!res.ok) throw new Error(`Get health error: ${res.statusText}`);
+  return res.json();
+}
+
+

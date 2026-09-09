@@ -68,7 +68,21 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS question_associations (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    is_ambiguous INTEGER NOT NULL DEFAULT 0,
+    is_manually_adjusted INTEGER NOT NULL DEFAULT 0,
+    notes TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_transcript_interview ON transcript_segments(interview_id, start_time_ms);
 CREATE INDEX IF NOT EXISTS idx_assessment_interview ON assessment_proposals(interview_id, question_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status_locked ON jobs(status, locked_until);
 CREATE INDEX IF NOT EXISTS idx_audit_interview ON audit_events(interview_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_assoc_interview_question ON question_associations(interview_id, question_id);
+

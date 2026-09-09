@@ -364,3 +364,88 @@ class Repository:
                 (interview_id,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # -------------------------------------------------------------
+    # Question Associations
+    # -------------------------------------------------------------
+    def save_association(
+        self,
+        assoc_id: str,
+        interview_id: str,
+        question_id: str,
+        segment_id: str,
+        confidence: float = 1.0,
+        is_ambiguous: bool = False,
+        is_manually_adjusted: bool = False,
+        notes: str = "",
+    ) -> None:
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO question_associations (
+                    id, interview_id, question_id, segment_id, confidence,
+                    is_ambiguous, is_manually_adjusted, notes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    question_id = excluded.question_id,
+                    confidence = excluded.confidence,
+                    is_ambiguous = excluded.is_ambiguous,
+                    is_manually_adjusted = excluded.is_manually_adjusted,
+                    notes = excluded.notes
+                """,
+                (
+                    assoc_id,
+                    interview_id,
+                    question_id,
+                    segment_id,
+                    confidence,
+                    1 if is_ambiguous else 0,
+                    1 if is_manually_adjusted else 0,
+                    notes,
+                    now,
+                ),
+            )
+
+    def get_associations(self, interview_id: str) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM question_associations WHERE interview_id = ? ORDER BY created_at ASC",
+                (interview_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def reassociate_segment(
+        self,
+        interview_id: str,
+        segment_id: str,
+        new_question_id: str,
+        notes: str = "Manually re-linked by reviewer",
+    ) -> None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT id FROM question_associations WHERE interview_id = ? AND segment_id = ?",
+                (interview_id, segment_id),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    UPDATE question_associations
+                    SET question_id = ?, is_ambiguous = 0, is_manually_adjusted = 1, notes = ?
+                    WHERE id = ?
+                    """,
+                    (new_question_id, notes, row["id"]),
+                )
+            else:
+                assoc_id = f"assoc-{uuid.uuid4().hex[:8]}"
+                self.save_association(
+                    assoc_id=assoc_id,
+                    interview_id=interview_id,
+                    question_id=new_question_id,
+                    segment_id=segment_id,
+                    confidence=1.0,
+                    is_ambiguous=False,
+                    is_manually_adjusted=True,
+                    notes=notes,
+                )
+

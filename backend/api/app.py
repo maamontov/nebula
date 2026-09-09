@@ -7,9 +7,11 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from backend.core.audio_health import AudioHealthMonitor, ChannelMetrics
 from backend.core.evidence_validator import (
     validate_proposal,
 )
+from backend.core.matcher import QuestionMatcher
 from backend.core.scoring import (
     ScoringError,
     calculate_interview_score,
@@ -85,6 +87,11 @@ class TransitionStateRequest(BaseModel):
     target_status: InterviewStatus
     consent_confirmed_at: str | None = None
     consent_version: str | None = None
+
+
+class ReassociateSegmentRequest(BaseModel):
+    new_question_id: str
+    notes: str = "Manually reassociated by reviewer"
 
 
 @app.get("/healthz")
@@ -290,6 +297,95 @@ async def export_interview_endpoint(
         "final_score_100": final_score_100,
         "audit_trail": audit_events,
     }
+
+
+@app.get("/api/v1/interviews/{interview_id}/associations")
+async def get_associations_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    assocs = repo.get_associations(interview_id)
+    if not assocs:
+        plan = repo.get_latest_plan(interview_id)
+        segments = repo.get_transcript_segments(interview_id)
+        if plan and segments:
+            questions = plan.get("payload", {}).get("questions", [])
+            matcher = QuestionMatcher()
+            results = matcher.associate_segments(questions, segments)
+            for r in results:
+                assoc_id = f"assoc-{uuid.uuid4().hex[:8]}"
+                repo.save_association(
+                    assoc_id=assoc_id,
+                    interview_id=interview_id,
+                    question_id=r.question_id,
+                    segment_id=r.segment_id,
+                    confidence=r.confidence,
+                    is_ambiguous=r.is_ambiguous,
+                    is_manually_adjusted=False,
+                    notes=r.notes,
+                )
+            assocs = repo.get_associations(interview_id)
+
+    return {"interview_id": interview_id, "associations": assocs}
+
+
+@app.post("/api/v1/interviews/{interview_id}/segments/{segment_id}/associate")
+async def reassociate_segment_endpoint(
+    interview_id: str,
+    segment_id: str,
+    payload: ReassociateSegmentRequest,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    repo.reassociate_segment(
+        interview_id=interview_id,
+        segment_id=segment_id,
+        new_question_id=payload.new_question_id,
+        notes=payload.notes,
+    )
+    repo.record_audit_event(
+        event_id=f"audit-{uuid.uuid4().hex[:8]}",
+        interview_id=interview_id,
+        event_type="SEGMENT_REASSOCIATED",
+        payload={
+            "segment_id": segment_id,
+            "new_question_id": payload.new_question_id,
+            "notes": payload.notes,
+        },
+    )
+    return {"status": "reassociated", "segment_id": segment_id, "question_id": payload.new_question_id}
+
+
+@app.get("/api/v1/interviews/{interview_id}/health")
+async def get_interview_health_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    monitor = AudioHealthMonitor()
+    report = monitor.evaluate_health(
+        interviewer=ChannelMetrics(rms=0.08, peak=0.35, silence_duration_ms=0, drift_ms=0),
+        candidate=ChannelMetrics(rms=0.12, peak=0.45, silence_duration_ms=0, drift_ms=4),
+    )
+    return {
+        "interview_id": interview_id,
+        "is_healthy": report.is_healthy,
+        "interviewer": {
+            "status": report.interviewer_status.value,
+            "warnings": report.interviewer_warnings,
+        },
+        "candidate": {
+            "status": report.candidate_status.value,
+            "warnings": report.candidate_warnings,
+        },
+    }
+
 
 
 # -------------------------------------------------------------
