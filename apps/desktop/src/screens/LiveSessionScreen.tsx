@@ -19,6 +19,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   const [activeQuestionIdx, setActiveQuestionIdx] = useState(0);
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
   const [evalSuccessNotice, setEvalSuccessNotice] = useState<string | null>(null);
 
   const [segments, setSegments] = useState<TranscriptSegment[]>([
@@ -98,8 +99,18 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   };
 
   const handleStop = async () => {
-    await stopAudioCapture();
-    await updateInterviewStatus(interviewId, isPaused ? 'paused' : 'recording', 'review');
+    if (isStopping) return;
+    setIsStopping(true);
+    try {
+      await stopAudioCapture();
+    } catch (e) {
+      console.warn('stopAudioCapture warning/error:', e);
+    }
+    try {
+      await updateInterviewStatus(interviewId, isPaused ? 'paused' : 'recording', 'review');
+    } catch (e) {
+      console.warn('updateInterviewStatus warning/error:', e);
+    }
     onFinishSession(interviewId);
   };
 
@@ -164,10 +175,11 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
 
           <button
             onClick={handleStop}
-            className="flex items-center space-x-1.5 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold rounded-lg shadow-sm shadow-rose-600/30 transition"
+            disabled={isStopping}
+            className="flex items-center space-x-1.5 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-xs font-semibold rounded-lg shadow-sm shadow-rose-600/30 transition cursor-pointer disabled:cursor-not-allowed"
           >
             <Square className="w-3.5 h-3.5 fill-white" />
-            <span>Завершить запись</span>
+            <span>{isStopping ? 'Завершение...' : 'Завершить запись'}</span>
           </button>
         </div>
       </div>

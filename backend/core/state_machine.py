@@ -19,8 +19,8 @@ class InvalidStateTransitionError(Exception):
 ALLOWED_TRANSITIONS: dict[InterviewStatus, set[InterviewStatus]] = {
     InterviewStatus.DRAFT: {InterviewStatus.READY, InterviewStatus.DELETED},
     InterviewStatus.READY: {InterviewStatus.RECORDING, InterviewStatus.DRAFT, InterviewStatus.DELETED},
-    InterviewStatus.RECORDING: {InterviewStatus.PAUSED, InterviewStatus.PROCESSING, InterviewStatus.DELETED},
-    InterviewStatus.PAUSED: {InterviewStatus.RECORDING, InterviewStatus.PROCESSING, InterviewStatus.DELETED},
+    InterviewStatus.RECORDING: {InterviewStatus.PAUSED, InterviewStatus.PROCESSING, InterviewStatus.REVIEW, InterviewStatus.DELETED},
+    InterviewStatus.PAUSED: {InterviewStatus.RECORDING, InterviewStatus.PROCESSING, InterviewStatus.REVIEW, InterviewStatus.DELETED},
     InterviewStatus.PROCESSING: {InterviewStatus.REVIEW, InterviewStatus.RECORDING, InterviewStatus.DELETED},
     InterviewStatus.REVIEW: {InterviewStatus.FINALIZED, InterviewStatus.PROCESSING, InterviewStatus.DELETED},
     InterviewStatus.FINALIZED: {InterviewStatus.DELETED},

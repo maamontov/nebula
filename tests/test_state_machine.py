@@ -33,6 +33,16 @@ def test_standard_happy_path_transitions():
     assert state == InterviewStatus.FINALIZED
 
 
+def test_direct_transition_to_review_from_recording_and_paused():
+    # Recording to Review directly when interviewer finishes session
+    state = transition_status(InterviewStatus.RECORDING, InterviewStatus.REVIEW)
+    assert state == InterviewStatus.REVIEW
+
+    # Paused to Review directly
+    state_paused = transition_status(InterviewStatus.PAUSED, InterviewStatus.REVIEW)
+    assert state_paused == InterviewStatus.REVIEW
+
+
 def test_terminal_deleted_from_any_state():
     for status in [
         InterviewStatus.DRAFT,
