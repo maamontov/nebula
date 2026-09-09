@@ -145,14 +145,15 @@ class Repository:
         end_time_ms: int,
         text: str,
         is_final: bool = True,
+        revision_id: str = "trans-rev-1",
     ) -> None:
         now = utc_now_iso()
         with self.db.transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO transcript_segments (
-                    id, interview_id, track_id, start_time_ms, end_time_ms, text, is_final, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    id, interview_id, track_id, start_time_ms, end_time_ms, text, is_final, revision_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     segment_id,
@@ -162,18 +163,54 @@ class Repository:
                     end_time_ms,
                     text,
                     1 if is_final else 0,
+                    revision_id,
                     now,
                 ),
             )
 
-    def get_transcript_segments(self, interview_id: str) -> list[dict[str, Any]]:
+    def get_transcript_segments(self, interview_id: str, revision_id: str | None = None) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            if revision_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM transcript_segments
+                    WHERE interview_id = ? AND revision_id = ?
+                    ORDER BY start_time_ms ASC
+                    """,
+                    (interview_id, revision_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM transcript_segments
+                    WHERE interview_id = ?
+                    ORDER BY start_time_ms ASC
+                    """,
+                    (interview_id,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def create_transcript_revision(
+        self,
+        revision_id: str,
+        interview_id: str,
+        revision_number: int = 1,
+        is_batch_final: bool = False,
+    ) -> None:
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (revision_id, interview_id, revision_number, 1 if is_batch_final else 0, now),
+            )
+
+    def get_transcript_revisions(self, interview_id: str) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM transcript_segments
-                WHERE interview_id = ?
-                ORDER BY start_time_ms ASC
-                """,
+                "SELECT * FROM transcript_revisions WHERE interview_id = ? ORDER BY revision_number ASC",
                 (interview_id,),
             ).fetchall()
             return [dict(r) for r in rows]
@@ -189,23 +226,43 @@ class Repository:
         model_profile_id: str,
         scores: list[dict[str, Any]],
         critical_errors: list[str] | None = None,
+        rubric_revision_id: str = "rub-rev-1",
+        transcript_revision_id: str = "trans-rev-1",
+        is_stale: bool = False,
+        stale_reason: str | None = None,
+        is_manually_adjusted: bool = False,
     ) -> None:
         now = utc_now_iso()
         with self.db.transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO assessment_proposals (
-                    id, interview_id, question_id, model_profile_id,
-                    scores_json, critical_errors_json, is_approved, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+                    id, interview_id, question_id, rubric_revision_id, transcript_revision_id,
+                    model_profile_id, scores_json, critical_errors_json, is_approved,
+                    is_stale, stale_reason, is_manually_adjusted, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    rubric_revision_id = excluded.rubric_revision_id,
+                    transcript_revision_id = excluded.transcript_revision_id,
+                    model_profile_id = excluded.model_profile_id,
+                    scores_json = excluded.scores_json,
+                    critical_errors_json = excluded.critical_errors_json,
+                    is_stale = excluded.is_stale,
+                    stale_reason = excluded.stale_reason,
+                    is_manually_adjusted = excluded.is_manually_adjusted
                 """,
                 (
                     proposal_id,
                     interview_id,
                     question_id,
+                    rubric_revision_id,
+                    transcript_revision_id,
                     model_profile_id,
                     json.dumps(scores, ensure_ascii=False),
                     json.dumps(critical_errors or [], ensure_ascii=False),
+                    1 if is_stale else 0,
+                    stale_reason,
+                    1 if is_manually_adjusted else 0,
                     now,
                 ),
             )
@@ -254,6 +311,240 @@ class Repository:
                     proposal_id,
                 ),
             )
+
+    def mark_proposals_stale(
+        self,
+        interview_id: str,
+        question_ids: list[str],
+        stale_reason: str,
+    ) -> None:
+        with self.db.transaction() as conn:
+            for q_id in question_ids:
+                conn.execute(
+                    """
+                    UPDATE assessment_proposals
+                    SET is_stale = 1, stale_reason = ?
+                    WHERE interview_id = ? AND question_id = ?
+                    """,
+                    (stale_reason, interview_id, q_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE human_assessments
+                    SET is_stale = 1, stale_reason = ?
+                    WHERE interview_id = ? AND question_id = ?
+                    """,
+                    (stale_reason, interview_id, q_id),
+                )
+
+    # -------------------------------------------------------------
+    # Human Assessments (Confirmed/Overridden Decisions)
+    # -------------------------------------------------------------
+    def save_human_assessment(
+        self,
+        assessment_id: str,
+        interview_id: str,
+        question_id: str,
+        rubric_revision_id: str,
+        transcript_revision_id: str,
+        scores: list[dict[str, Any]],
+        reviewer_notes: str | None = None,
+        reviewer_id: str | None = None,
+        is_manually_adjusted: bool = True,
+        is_stale: bool = False,
+        stale_reason: str | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO human_assessments (
+                    id, interview_id, question_id, rubric_revision_id, transcript_revision_id,
+                    reviewer_id, scores_json, reviewer_notes, is_manually_adjusted,
+                    is_stale, stale_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    rubric_revision_id = excluded.rubric_revision_id,
+                    transcript_revision_id = excluded.transcript_revision_id,
+                    reviewer_id = excluded.reviewer_id,
+                    scores_json = excluded.scores_json,
+                    reviewer_notes = excluded.reviewer_notes,
+                    is_manually_adjusted = excluded.is_manually_adjusted,
+                    is_stale = excluded.is_stale,
+                    stale_reason = excluded.stale_reason,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    assessment_id,
+                    interview_id,
+                    question_id,
+                    rubric_revision_id,
+                    transcript_revision_id,
+                    reviewer_id,
+                    json.dumps(scores, ensure_ascii=False),
+                    reviewer_notes,
+                    1 if is_manually_adjusted else 0,
+                    1 if is_stale else 0,
+                    stale_reason,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_human_assessments(self, interview_id: str) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM human_assessments WHERE interview_id = ? ORDER BY created_at ASC",
+                (interview_id,),
+            ).fetchall()
+            res = []
+            for r in rows:
+                item = dict(r)
+                item["scores"] = json.loads(item["scores_json"])
+                res.append(item)
+            return res
+
+    def get_human_assessment_for_question(self, interview_id: str, question_id: str) -> dict[str, Any] | None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM human_assessments WHERE interview_id = ? AND question_id = ? ORDER BY updated_at DESC LIMIT 1",
+                (interview_id, question_id),
+            ).fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            item["scores"] = json.loads(item["scores_json"])
+            return item
+
+    # -------------------------------------------------------------
+    # Executive Summary Proposals
+    # -------------------------------------------------------------
+    def save_summary_proposal(
+        self,
+        proposal_id: str,
+        interview_id: str,
+        model_profile_id: str,
+        summary_data: dict[str, Any],
+    ) -> None:
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO summary_proposals (
+                    id, interview_id, model_profile_id, summary_data_json, is_confirmed, created_at
+                ) VALUES (?, ?, ?, ?, 0, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    model_profile_id = excluded.model_profile_id,
+                    summary_data_json = excluded.summary_data_json
+                """,
+                (
+                    proposal_id,
+                    interview_id,
+                    model_profile_id,
+                    json.dumps(summary_data, ensure_ascii=False),
+                    now,
+                ),
+            )
+
+    def get_summary_proposal(self, interview_id: str) -> dict[str, Any] | None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM summary_proposals WHERE interview_id = ? ORDER BY created_at DESC LIMIT 1",
+                (interview_id,),
+            ).fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            item["summary_data"] = json.loads(item["summary_data_json"])
+            return item
+
+    def confirm_summary(
+        self,
+        interview_id: str,
+        reviewer_id: str,
+        confirmed_markdown: str,
+        confirmed_recommendation: str,
+    ) -> None:
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE summary_proposals
+                SET is_confirmed = 1,
+                    confirmed_by = ?,
+                    confirmed_markdown = ?,
+                    confirmed_recommendation = ?,
+                    confirmed_at = ?
+                WHERE interview_id = ?
+                """,
+                (reviewer_id, confirmed_markdown, confirmed_recommendation, now, interview_id),
+            )
+
+    # -------------------------------------------------------------
+    # Final Report Revisions (Sealed & Checksummed)
+    # -------------------------------------------------------------
+    def save_report_revision(
+        self,
+        report_id: str,
+        interview_id: str,
+        revision_number: int,
+        final_score_100: float | None,
+        coverage_percentage: float,
+        question_scores: dict[str, Any],
+        summary_markdown: str,
+        hiring_recommendation: str,
+        confirmed_by: str,
+        sha256_checksum: str,
+    ) -> None:
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO report_revisions (
+                    id, interview_id, revision_number, final_score_100, coverage_percentage,
+                    question_scores_json, summary_markdown, hiring_recommendation,
+                    confirmed_by, sha256_checksum, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report_id,
+                    interview_id,
+                    revision_number,
+                    final_score_100,
+                    coverage_percentage,
+                    json.dumps(question_scores, ensure_ascii=False),
+                    summary_markdown,
+                    hiring_recommendation,
+                    confirmed_by,
+                    sha256_checksum,
+                    now,
+                ),
+            )
+
+    def get_report_revisions(self, interview_id: str) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM report_revisions WHERE interview_id = ? ORDER BY revision_number ASC",
+                (interview_id,),
+            ).fetchall()
+            res = []
+            for r in rows:
+                item = dict(r)
+                item["question_scores"] = json.loads(item["question_scores_json"])
+                res.append(item)
+            return res
+
+    def get_latest_report_revision(self, interview_id: str) -> dict[str, Any] | None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM report_revisions WHERE interview_id = ? ORDER BY revision_number DESC LIMIT 1",
+                (interview_id,),
+            ).fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            item["question_scores"] = json.loads(item["question_scores_json"])
+            return item
 
     # -------------------------------------------------------------
     # Durable Jobs

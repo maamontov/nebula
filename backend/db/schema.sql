@@ -29,6 +29,15 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
     end_time_ms INTEGER NOT NULL,
     text TEXT NOT NULL,
     is_final INTEGER NOT NULL DEFAULT 1,
+    revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transcript_revisions (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    revision_number INTEGER NOT NULL DEFAULT 1,
+    is_batch_final INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 
@@ -36,14 +45,62 @@ CREATE TABLE IF NOT EXISTS assessment_proposals (
     id TEXT PRIMARY KEY,
     interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
     question_id TEXT NOT NULL,
+    rubric_revision_id TEXT NOT NULL DEFAULT 'rub-rev-1',
+    transcript_revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
     model_profile_id TEXT NOT NULL,
     scores_json TEXT NOT NULL,
     critical_errors_json TEXT NOT NULL DEFAULT '[]',
     is_approved INTEGER NOT NULL DEFAULT 0,
+    is_stale INTEGER NOT NULL DEFAULT 0,
+    stale_reason TEXT,
+    is_manually_adjusted INTEGER NOT NULL DEFAULT 0,
     reviewed_scores_json TEXT,
     reviewer_notes TEXT,
     created_at TEXT NOT NULL,
     reviewed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS human_assessments (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    rubric_revision_id TEXT NOT NULL,
+    transcript_revision_id TEXT NOT NULL,
+    reviewer_id TEXT,
+    scores_json TEXT NOT NULL,
+    reviewer_notes TEXT,
+    is_manually_adjusted INTEGER NOT NULL DEFAULT 0,
+    is_stale INTEGER NOT NULL DEFAULT 0,
+    stale_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS summary_proposals (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    model_profile_id TEXT NOT NULL,
+    summary_data_json TEXT NOT NULL,
+    is_confirmed INTEGER NOT NULL DEFAULT 0,
+    confirmed_by TEXT,
+    confirmed_markdown TEXT,
+    confirmed_recommendation TEXT,
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS report_revisions (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    revision_number INTEGER NOT NULL DEFAULT 1,
+    final_score_100 REAL,
+    coverage_percentage REAL NOT NULL,
+    question_scores_json TEXT NOT NULL,
+    summary_markdown TEXT NOT NULL,
+    hiring_recommendation TEXT,
+    confirmed_by TEXT,
+    sha256_checksum TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -81,8 +138,11 @@ CREATE TABLE IF NOT EXISTS question_associations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_transcript_interview ON transcript_segments(interview_id, start_time_ms);
+CREATE INDEX IF NOT EXISTS idx_transcript_rev ON transcript_segments(interview_id, revision_id);
 CREATE INDEX IF NOT EXISTS idx_assessment_interview ON assessment_proposals(interview_id, question_id);
+CREATE INDEX IF NOT EXISTS idx_human_assessment ON human_assessments(interview_id, question_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status_locked ON jobs(status, locked_until);
 CREATE INDEX IF NOT EXISTS idx_audit_interview ON audit_events(interview_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_assoc_interview_question ON question_associations(interview_id, question_id);
+CREATE INDEX IF NOT EXISTS idx_report_revisions ON report_revisions(interview_id, revision_number);
 

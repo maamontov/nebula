@@ -217,4 +217,124 @@ export async function getInterviewHealth(interviewId: string): Promise<{
   return res.json();
 }
 
+export async function startBatchRetranscribe(
+  interviewId: string,
+  newRevisionId: string = 'trans-rev-2',
+  segments: unknown[] = []
+): Promise<{ status: string; job_id: string; new_revision_id: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/batch-retranscribe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      new_revision_id: newRevisionId,
+      old_revision_id: 'trans-rev-1',
+      segments,
+    }),
+  });
+  if (!res.ok) throw new Error(`Batch retranscribe error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getTranscriptDiff(
+  interviewId: string,
+  fromRev: string = 'trans-rev-1',
+  toRev: string = 'trans-rev-2'
+): Promise<{
+  interview_id: string;
+  from_revision: string;
+  to_revision: string;
+  total_segment_diffs: number;
+  question_reports: Array<{
+    question_id: string;
+    is_modified: boolean;
+    diff_ratio: number;
+    stale_reason?: string;
+    broken_evidence_count: number;
+    changed_segments_count: number;
+  }>;
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/revisions/transcript/diff?from_rev=${fromRev}&to_rev=${toRev}`);
+  if (!res.ok) throw new Error(`Get transcript diff error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function submitHumanReviewWithRevision(
+  interviewId: string,
+  questionId: string,
+  payload: {
+    expected_transcript_revision: string;
+    scores: unknown[];
+    reviewer_notes?: string;
+    reviewer_id?: string;
+    is_manually_adjusted?: boolean;
+  }
+): Promise<{ status: string; assessment_id: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/assessments/${questionId}/review`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (res.status === 409) {
+    const err = await res.json();
+    throw new Error(`CONFLICT_409: ${err.detail}`);
+  }
+  if (!res.ok) throw new Error(`Human review error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getExecutiveSummary(interviewId: string): Promise<{
+  interview_id: string;
+  has_summary: boolean;
+  is_confirmed: boolean;
+  model_profile_id?: string;
+  summary?: Record<string, unknown>;
+  confirmed_markdown?: string;
+  confirmed_recommendation?: string;
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/summary`);
+  if (!res.ok) throw new Error(`Get summary error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function confirmExecutiveSummary(
+  interviewId: string,
+  payload: {
+    reviewer_id: string;
+    confirmed_markdown: string;
+    confirmed_recommendation: string;
+  }
+): Promise<{ status: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/summary/confirm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Confirm summary error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function finalizeAndSealReport(
+  interviewId: string,
+  payload: {
+    confirmed_by: string;
+    summary_markdown?: string;
+    hiring_recommendation?: string;
+  }
+): Promise<{
+  status: string;
+  report_id: string;
+  revision_number: number;
+  final_score_100: number;
+  coverage_percentage: number;
+  sha256_checksum: string;
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/report/finalize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Finalize report error: ${res.statusText}`);
+  return res.json();
+}
+
 
