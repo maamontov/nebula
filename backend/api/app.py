@@ -77,6 +77,7 @@ class AddSegmentRequest(BaseModel):
 class ApproveAssessmentRequest(BaseModel):
     reviewed_scores: list[dict[str, Any]] | None = None
     reviewer_notes: str | None = None
+    question_id: str | None = None
 
 
 class EnqueueJobRequest(BaseModel):
@@ -295,6 +296,8 @@ async def approve_assessment_endpoint(
         proposal_id=proposal_id,
         reviewed_scores=payload.reviewed_scores,
         reviewer_notes=payload.reviewer_notes,
+        interview_id=interview_id,
+        question_id=payload.question_id,
     )
     repo.record_audit_event(
         event_id=f"audit-{uuid.uuid4().hex[:8]}",

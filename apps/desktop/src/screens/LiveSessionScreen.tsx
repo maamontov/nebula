@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { InterviewPlan, TranscriptSegment, AssessmentProposal } from '../types';
-import { stopAudioCapture, updateInterviewStatus, getInterview, enqueueJob } from '../services/api';
+import { stopAudioCapture, updateInterviewStatus, getInterview, enqueueJob, addTranscriptSegment } from '../services/api';
 import { Square, Pause, Play, CheckCircle, MessageSquare, Quote, Sparkles, AlertTriangle, ExternalLink, Loader2 } from 'lucide-react';
 
 interface LiveSessionScreenProps {
@@ -90,6 +90,22 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
     }, 2000);
 
     return () => clearInterval(poll);
+  }, [interviewId]);
+
+  useEffect(() => {
+    async function seedInitialSegments() {
+      try {
+        const data = await getInterview(interviewId);
+        if (!data.transcript_segments || data.transcript_segments.length === 0) {
+          for (const seg of segments) {
+            await addTranscriptSegment(interviewId, seg);
+          }
+        }
+      } catch (e) {
+        console.warn('Seed initial segments error:', e);
+      }
+    }
+    seedInitialSegments();
   }, [interviewId]);
 
   const formatTime = (totalSeconds: number) => {

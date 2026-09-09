@@ -320,25 +320,51 @@ class Repository:
         proposal_id: str,
         reviewed_scores: list[dict[str, Any]] | None = None,
         reviewer_notes: str | None = None,
+        interview_id: str | None = None,
+        question_id: str | None = None,
     ) -> None:
         now = utc_now_iso()
         with self.db.transaction() as conn:
-            conn.execute(
-                """
-                UPDATE assessment_proposals
-                SET is_approved = 1,
-                    reviewed_scores_json = ?,
-                    reviewer_notes = ?,
-                    reviewed_at = ?
-                WHERE id = ?
-                """,
-                (
-                    json.dumps(reviewed_scores, ensure_ascii=False) if reviewed_scores else None,
-                    reviewer_notes,
-                    now,
-                    proposal_id,
-                ),
-            )
+            row = conn.execute(
+                "SELECT id FROM assessment_proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+            if not row and interview_id:
+                conn.execute(
+                    """
+                    INSERT INTO assessment_proposals (
+                        id, interview_id, question_id, rubric_revision_id, transcript_revision_id,
+                        model_profile_id, scores_json, critical_errors_json, is_approved,
+                        reviewed_scores_json, reviewer_notes, reviewed_at, created_at
+                    ) VALUES (?, ?, ?, 'rub-rev-1', 'trans-rev-1', 'manual/reviewer', ?, '[]', 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        proposal_id,
+                        interview_id,
+                        question_id or "q-default",
+                        json.dumps(reviewed_scores or [], ensure_ascii=False),
+                        json.dumps(reviewed_scores or [], ensure_ascii=False),
+                        reviewer_notes or "Оценка подтверждена экспертом",
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE assessment_proposals
+                    SET is_approved = 1,
+                        reviewed_scores_json = ?,
+                        reviewer_notes = ?,
+                        reviewed_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(reviewed_scores, ensure_ascii=False) if reviewed_scores else None,
+                        reviewer_notes,
+                        now,
+                        proposal_id,
+                    ),
+                )
 
     def mark_proposals_stale(
         self,

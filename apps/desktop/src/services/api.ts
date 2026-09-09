@@ -134,7 +134,8 @@ export async function approveAssessment(
   interviewId: string,
   proposalId: string,
   reviewedScores?: unknown[],
-  reviewerNotes?: string
+  reviewerNotes?: string,
+  questionId?: string
 ): Promise<{ status: string }> {
   const res = await fetch(`${API_BASE}/interviews/${interviewId}/assessments/${proposalId}/approve`, {
     method: 'POST',
@@ -142,6 +143,7 @@ export async function approveAssessment(
     body: JSON.stringify({
       reviewed_scores: reviewedScores,
       reviewer_notes: reviewerNotes,
+      question_id: questionId,
     }),
   });
   if (!res.ok) throw new Error(`Approve assessment error: ${res.statusText}`);
@@ -207,6 +209,33 @@ export async function reassociateSegment(
     }),
   });
   if (!res.ok) throw new Error(`Reassociate error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function addTranscriptSegment(
+  interviewId: string,
+  segment: {
+    id: string;
+    track_id: string;
+    start_time_ms: number;
+    end_time_ms: number;
+    text: string;
+    is_final?: boolean;
+  }
+): Promise<{ status: string; segment_id: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/segments`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: segment.id,
+      track_id: segment.track_id,
+      start_time_ms: segment.start_time_ms,
+      end_time_ms: segment.end_time_ms,
+      text: segment.text,
+      is_final: segment.is_final ?? true,
+    }),
+  });
+  if (!res.ok) throw new Error(`Add segment error: ${res.statusText}`);
   return res.json();
 }
 
