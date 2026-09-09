@@ -8,6 +8,7 @@ import uuid
 import os
 from typing import Any
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend.core.audio_health import AudioHealthMonitor, ChannelMetrics
@@ -38,6 +39,15 @@ app = FastAPI(
     title="Nebula Backend API",
     version="0.1.0",
     description="Core API for Nebula AI Interview Copilot",
+)
+
+# Enable CORS for desktop UI (localhost:1420, tauri://localhost, etc.)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

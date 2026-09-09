@@ -1,17 +1,21 @@
+import { isTauri, invoke } from '@tauri-apps/api/core';
 import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus } from '../types';
 
 const API_BASE = 'http://127.0.0.1:8000/api/v1';
 
 // Check if running inside Tauri window
 export function isTauriEnvironment(): boolean {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  try {
+    return isTauri();
+  } catch {
+    return typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
+  }
 }
 
 // Dynamically invoke Tauri command or use browser mock
 async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauriEnvironment()) {
     try {
-      const { invoke } = await import('@tauri-apps/api/core');
       return await invoke<T>(cmd, args);
     } catch (e) {
       console.warn(`Tauri invoke ${cmd} failed:`, e);
