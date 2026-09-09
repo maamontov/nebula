@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
-import { InterviewPlan, AssessmentProposal } from '../types';
-import { approveAssessment } from '../services/api';
-import { Check, ShieldCheck, Download, Award, RotateCcw } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { InterviewPlan, AssessmentProposal, TranscriptSegment } from '../types';
+import { approveAssessment, getInterview, exportInterview } from '../services/api';
+import { Check, ShieldCheck, Download, Award, RotateCcw, ExternalLink, FileText, ChevronDown, ChevronUp } from 'lucide-react';
 
 interface ReviewScreenProps {
   interviewId: string;
@@ -14,36 +14,34 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   plan,
   onNewInterview,
 }) => {
-  const [proposals, setProposals] = useState<AssessmentProposal[]>([
-    {
-      id: 'prop-1',
-      interview_id: interviewId,
-      question_id: plan.questions[0]?.id || 'q-saga',
-      model_profile_id: 'google/gemini-3.8-flash',
-      scores: [
-        {
-          criterion_id: 'crit-arch-saga',
-          score: 5.0,
-          explanation: 'Кандидат корректно описывает применение паттерна Saga на основе оркестрации, а также механизм отката через запуск компенсирующих транзакций в обратном порядке.',
-          evidence: [
-            {
-              segment_id: 'seg-2',
-              exact_quote: 'Для распределённых транзакций мы применили паттерн Saga с оркестрацией. В случае сбоя шага оркестратор запускает компенсирующие транзакции в обратном порядке.',
-            },
-          ],
-        },
-      ],
-      critical_errors: [],
-      is_approved: true,
-      created_at: new Date().toISOString(),
-    },
-  ]);
-
-  const [reviewerNotes, setReviewerNotes] = useState<Record<string, string>>({
-    'prop-1': 'Оценка подтверждена. Ответ полный, практический опыт подтвержден.',
-  });
-
+  const [proposals, setProposals] = useState<AssessmentProposal[]>([]);
+  const [segments, setSegments] = useState<TranscriptSegment[]>([]);
+  const [selectedQuote, setSelectedQuote] = useState<{ quote: string; segmentId: string } | null>(null);
+  const [showFullTranscript, setShowFullTranscript] = useState(false);
+  const [reviewerNotes, setReviewerNotes] = useState<Record<string, string>>({});
   const [isExporting, setIsExporting] = useState(false);
+
+  useEffect(() => {
+    async function loadData() {
+      try {
+        const data = await getInterview(interviewId);
+        if (data.assessment_proposals && data.assessment_proposals.length > 0) {
+          setProposals(data.assessment_proposals);
+          const initialNotes: Record<string, string> = {};
+          data.assessment_proposals.forEach((p) => {
+            initialNotes[p.id] = p.reviewer_notes || 'Оценка подтверждена.';
+          });
+          setReviewerNotes(initialNotes);
+        }
+        if (data.transcript_segments) {
+          setSegments(data.transcript_segments);
+        }
+      } catch (err) {
+        console.warn('Failed to load review data from backend:', err);
+      }
+    }
+    loadData();
+  }, [interviewId]);
 
   // Deterministic 100-point score computation
   const calculateFinalScore = () => {
@@ -85,26 +83,36 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     }
   };
 
-  const exportJsonReport = () => {
+  const exportJsonReport = async () => {
     setIsExporting(true);
-    const report = {
-      interview_id: interviewId,
-      exported_at: new Date().toISOString(),
-      candidate_role: plan.role,
-      final_score_100: calculateFinalScore(),
-      questions_count: plan.questions.length,
-      proposals: proposals,
-      reviewer_notes: reviewerNotes,
-    };
+    try {
+      let exportData: Record<string, unknown>;
+      try {
+        exportData = await exportInterview(interviewId);
+      } catch {
+        // Fallback local payload
+        exportData = {
+          interview_id: interviewId,
+          exported_at: new Date().toISOString(),
+          candidate_role: plan.role,
+          final_score_100: calculateFinalScore(),
+          questions_count: plan.questions.length,
+          proposals,
+          transcript_segments: segments,
+          reviewer_notes: reviewerNotes,
+        };
+      }
 
-    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `nebula-report-${interviewId}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    setIsExporting(false);
+      const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `nebula-verified-report-${interviewId}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   const finalScore = calculateFinalScore();
@@ -137,6 +145,55 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           </div>
           <span className="text-[11px] text-slate-400">Взвешенный балл Nebula</span>
         </div>
+      </div>
+
+      {/* Interactive Transcript Drawer / Accordion */}
+      <div className="border border-slate-800 rounded-xl bg-slate-900/40 overflow-hidden">
+        <button
+          onClick={() => setShowFullTranscript(!showFullTranscript)}
+          className="w-full px-5 py-3 flex items-center justify-between text-left hover:bg-slate-900/80 transition"
+        >
+          <div className="flex items-center space-x-2 text-xs font-bold uppercase tracking-wider text-slate-300">
+            <FileText className="w-4 h-4 text-indigo-400" />
+            <span>Полная стенограмма собеседования ({segments.length} сегментов)</span>
+          </div>
+          <div className="flex items-center space-x-2 text-xs text-slate-400">
+            <span>{showFullTranscript ? 'Свернуть' : 'Развернуть'}</span>
+            {showFullTranscript ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+          </div>
+        </button>
+
+        {showFullTranscript && (
+          <div className="p-4 border-t border-slate-800 space-y-3 max-h-80 overflow-y-auto bg-slate-950/70">
+            {segments.map((s) => {
+              const isSelected = selectedQuote?.segmentId === s.id;
+              const isCandidate = s.track_id === 'candidate';
+              return (
+                <div
+                  key={s.id}
+                  id={`review-seg-${s.id}`}
+                  className={`p-3 rounded-lg text-xs leading-relaxed transition-all ${
+                    isSelected
+                      ? 'ring-2 ring-amber-400 bg-amber-950/40 text-amber-100 border border-amber-500'
+                      : isCandidate
+                      ? 'bg-emerald-950/20 text-emerald-100 border border-emerald-900/40'
+                      : 'bg-indigo-950/20 text-indigo-100 border border-indigo-900/40'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1 text-[10px] text-slate-400">
+                    <span className="font-semibold text-slate-300">
+                      {isCandidate ? 'Кандидат' : 'Интервьюер'}
+                    </span>
+                    <span className="font-mono">
+                      {Math.round(s.start_time_ms / 1000)}s - {Math.round(s.end_time_ms / 1000)}s
+                    </span>
+                  </div>
+                  <p>{s.text}</p>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Question Proposals & Human Approval */}
@@ -178,13 +235,29 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 <div className="space-y-3 bg-slate-900/50 p-4 rounded-lg border border-slate-800/80">
                   <p className="text-xs text-slate-300 leading-relaxed">{prop.scores[0]?.explanation}</p>
 
-                  {/* Evidence Quotes */}
+                  {/* Evidence Quotes with Click-to-Inspect */}
                   {prop.scores[0]?.evidence && prop.scores[0].evidence.length > 0 && (
-                    <div className="space-y-1">
-                      <span className="text-[11px] font-semibold text-slate-400">Цитата кандидата:</span>
+                    <div className="space-y-2">
+                      <span className="text-[11px] font-semibold text-slate-400">
+                        Подтверждающий текст кандидата (кликните для проверки):
+                      </span>
                       {prop.scores[0].evidence.map((ev, eIdx) => (
-                        <div key={eIdx} className="p-2 bg-slate-950 border-l-2 border-emerald-500 rounded text-xs italic text-slate-200">
-                          «{ev.exact_quote}»
+                        <div
+                          key={eIdx}
+                          onClick={() => {
+                            setSelectedQuote({ quote: ev.exact_quote, segmentId: ev.segment_id });
+                            setShowFullTranscript(true);
+                            setTimeout(() => {
+                              document.getElementById(`review-seg-${ev.segment_id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            }, 100);
+                          }}
+                          className="group p-2.5 bg-slate-950 hover:bg-indigo-950/30 border-l-2 border-emerald-500 hover:border-amber-400 rounded text-xs italic text-slate-200 cursor-pointer transition flex items-center justify-between"
+                        >
+                          <span>«{ev.exact_quote}»</span>
+                          <span className="text-[10px] text-indigo-400 group-hover:text-amber-300 font-semibold flex items-center space-x-1 pl-2">
+                            <span>Открыть</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </span>
                         </div>
                       ))}
                     </div>
@@ -243,3 +316,4 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     </div>
   );
 };
+

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { InterviewPlan, TranscriptSegment, AssessmentProposal } from '../types';
-import { stopAudioCapture, updateInterviewStatus, getInterview } from '../services/api';
-import { Square, Pause, Play, CheckCircle, MessageSquare, Quote, Sparkles, AlertTriangle } from 'lucide-react';
+import { stopAudioCapture, updateInterviewStatus, getInterview, enqueueJob } from '../services/api';
+import { Square, Pause, Play, CheckCircle, MessageSquare, Quote, Sparkles, AlertTriangle, ExternalLink, Loader2 } from 'lucide-react';
 
 interface LiveSessionScreenProps {
   interviewId: string;
@@ -17,6 +17,10 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   const [elapsedSec, setElapsedSec] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
   const [activeQuestionIdx, setActiveQuestionIdx] = useState(0);
+  const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
+  const [isEvaluating, setIsEvaluating] = useState(false);
+  const [evalSuccessNotice, setEvalSuccessNotice] = useState<string | null>(null);
+
   const [segments, setSegments] = useState<TranscriptSegment[]>([
     {
       id: 'seg-1',
@@ -82,7 +86,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
       } catch (err) {
         // Ignored in offline/local spike
       }
-    }, 2500);
+    }, 2000);
 
     return () => clearInterval(poll);
   }, [interviewId]);
@@ -99,8 +103,43 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
     onFinishSession(interviewId);
   };
 
+  const scrollToSegment = (segmentId: string) => {
+    setSelectedSegmentId(segmentId);
+    const elem = document.getElementById(`segment-${segmentId}`);
+    if (elem) {
+      elem.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  };
+
   const currentQ = plan.questions[activeQuestionIdx] || plan.questions[0];
   const currentProp = proposals.find((p) => p.question_id === currentQ?.id);
+
+  const handleEvaluateCurrent = async () => {
+    if (!currentQ) return;
+    setIsEvaluating(true);
+    setEvalSuccessNotice(null);
+
+    try {
+      // Find candidate speech segments
+      const candidateSegments = segments.filter((s) => s.track_id === 'candidate');
+      const candidateText = candidateSegments.map((s) => s.text).join(' ');
+      const lastSegId = candidateSegments[candidateSegments.length - 1]?.id || 'seg-cand-last';
+
+      await enqueueJob(interviewId, 'EVALUATE_QUESTION', {
+        question_id: currentQ.id,
+        candidate_text: candidateText || 'Кандидат ответил на вопрос по теме.',
+        segment_id: lastSegId,
+        rubric_description: currentQ.criteria.map((c) => c.title).join(', '),
+      });
+
+      setEvalSuccessNotice('Задание на оценку отправлено в очередь!');
+      setTimeout(() => setEvalSuccessNotice(null), 4000);
+    } catch (e) {
+      console.error('Failed to trigger evaluation:', e);
+    } finally {
+      setIsEvaluating(false);
+    }
+  };
 
   return (
     <div className="h-[calc(100vh-4rem)] flex flex-col bg-slate-950 overflow-hidden">
@@ -181,10 +220,14 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
           <div className="flex-1 p-4 space-y-4 overflow-y-auto">
             {segments.map((s) => {
               const isCandidate = s.track_id === 'candidate';
+              const isHighlighted = selectedSegmentId === s.id;
               return (
                 <div
                   key={s.id}
-                  className={`flex flex-col ${isCandidate ? 'items-end' : 'items-start'}`}
+                  id={`segment-${s.id}`}
+                  className={`flex flex-col transition-all duration-300 ${isCandidate ? 'items-end' : 'items-start'} ${
+                    isHighlighted ? 'scale-[1.01]' : ''
+                  }`}
                 >
                   <div className="flex items-center space-x-2 mb-1">
                     <span className={`text-[11px] font-semibold ${isCandidate ? 'text-emerald-400' : 'text-indigo-400'}`}>
@@ -193,10 +236,17 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                     <span className="text-[10px] text-slate-500 font-mono">
                       {Math.round(s.start_time_ms / 1000)}s - {Math.round(s.end_time_ms / 1000)}s
                     </span>
+                    {isHighlighted && (
+                      <span className="text-[10px] text-amber-400 font-semibold bg-amber-950/60 px-1.5 py-0.5 rounded border border-amber-800">
+                        Подтверждающий фрагмент
+                      </span>
+                    )}
                   </div>
                   <div
-                    className={`max-w-[85%] p-3 rounded-xl text-xs leading-relaxed ${
-                      isCandidate
+                    className={`max-w-[85%] p-3 rounded-xl text-xs leading-relaxed transition-all ${
+                      isHighlighted
+                        ? 'ring-2 ring-amber-400 bg-amber-950/40 border border-amber-500 text-amber-100 shadow-lg shadow-amber-950/50'
+                        : isCandidate
                         ? 'bg-emerald-950/30 border border-emerald-800/50 text-emerald-100 rounded-tr-none'
                         : 'bg-indigo-950/30 border border-indigo-800/50 text-indigo-100 rounded-tl-none'
                     }`}
@@ -210,68 +260,108 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
         </div>
 
         {/* Column 3: Live AI Copilot & Evidence (4 cols) */}
-        <div className="col-span-4 p-4 space-y-4 overflow-y-auto bg-slate-950/80">
-          <div className="flex items-center space-x-2">
-            <Sparkles className="w-4 h-4 text-indigo-400" />
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-200">Оперативная оценка</span>
-          </div>
+        <div className="col-span-4 p-4 space-y-4 overflow-y-auto bg-slate-950/80 flex flex-col justify-between">
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <Sparkles className="w-4 h-4 text-indigo-400" />
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-200">Оперативная оценка</span>
+              </div>
+              <span className="text-[10px] text-slate-400 bg-slate-800/80 px-2 py-0.5 rounded">Gemini 3.8 Flash</span>
+            </div>
 
-          {currentProp ? (
-            <div className="space-y-4">
-              {currentProp.scores.map((score, sIdx) => (
-                <div key={sIdx} className="glass-panel p-4 rounded-xl space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-300">Оценка критерия</span>
-                    <span className="px-2.5 py-0.5 text-xs font-bold rounded-full bg-indigo-900/60 text-indigo-300 border border-indigo-700/60">
-                      {score.score} / 5.0
-                    </span>
-                  </div>
+            {/* Quick Action to evaluate current question */}
+            <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-300">Оценить текущий ответ</span>
+                {evalSuccessNotice && (
+                  <span className="text-[10px] text-emerald-400">{evalSuccessNotice}</span>
+                )}
+              </div>
+              <button
+                onClick={handleEvaluateCurrent}
+                disabled={isEvaluating}
+                className="w-full flex items-center justify-center space-x-2 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-950 disabled:text-slate-500 text-white text-xs font-semibold rounded-lg shadow-sm transition"
+              >
+                {isEvaluating ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Обработка оценки...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Запросить оценку вопроса #{activeQuestionIdx + 1}</span>
+                  </>
+                )}
+              </button>
+            </div>
 
-                  <p className="text-xs text-slate-300 leading-relaxed bg-slate-900/60 p-2.5 rounded-lg border border-slate-800">
-                    {score.explanation}
-                  </p>
-
-                  {/* Verbatim Evidence Quotes */}
-                  {score.evidence && score.evidence.length > 0 && (
-                    <div className="space-y-1.5 pt-1">
-                      <div className="flex items-center space-x-1.5 text-[11px] font-semibold text-slate-400">
-                        <Quote className="w-3 h-3 text-indigo-400" />
-                        <span>Дословные подтверждения (Evidence):</span>
-                      </div>
-                      {score.evidence.map((ev, eIdx) => (
-                        <div
-                          key={eIdx}
-                          className="p-2 bg-slate-900/90 border-l-2 border-indigo-500 rounded text-[11px] text-slate-200 italic"
-                        >
-                          «{ev.exact_quote}»
-                        </div>
-                      ))}
+            {currentProp ? (
+              <div className="space-y-4">
+                {currentProp.scores.map((score, sIdx) => (
+                  <div key={sIdx} className="glass-panel p-4 rounded-xl space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-300">Оценка критерия</span>
+                      <span className="px-2.5 py-0.5 text-xs font-bold rounded-full bg-indigo-900/60 text-indigo-300 border border-indigo-700/60">
+                        {score.score} / 5.0
+                      </span>
                     </div>
-                  )}
-                </div>
-              ))}
 
-              {currentProp.critical_errors.length > 0 && (
-                <div className="p-3 bg-rose-950/40 border border-rose-800/80 rounded-xl space-y-1">
-                  <div className="flex items-center space-x-1.5 text-xs font-bold text-rose-300">
-                    <AlertTriangle className="w-3.5 h-3.5" />
-                    <span>Критическая ошибка</span>
-                  </div>
-                  {currentProp.critical_errors.map((err, idx) => (
-                    <p key={idx} className="text-xs text-rose-200">
-                      {err}
+                    <p className="text-xs text-slate-300 leading-relaxed bg-slate-900/60 p-2.5 rounded-lg border border-slate-800">
+                      {score.explanation}
                     </p>
-                  ))}
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="p-6 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl">
-              Ожидание ответа кандидата для запуска оценки Gemini 3.8 Flash...
-            </div>
-          )}
+
+                    {/* Verbatim Evidence Quotes with interactive Jump-to-Transcript */}
+                    {score.evidence && score.evidence.length > 0 && (
+                      <div className="space-y-2 pt-1">
+                        <div className="flex items-center space-x-1.5 text-[11px] font-semibold text-slate-400">
+                          <Quote className="w-3 h-3 text-indigo-400" />
+                          <span>Подтверждающий текст (кликните для перехода):</span>
+                        </div>
+                        {score.evidence.map((ev, eIdx) => (
+                          <div
+                            key={eIdx}
+                            onClick={() => scrollToSegment(ev.segment_id)}
+                            className="group p-2.5 bg-slate-900/90 hover:bg-indigo-950/40 border-l-2 border-indigo-500 hover:border-amber-400 rounded cursor-pointer transition text-[11px] text-slate-200 flex flex-col space-y-1.5"
+                          >
+                            <div className="italic leading-relaxed">
+                              «{ev.exact_quote}»
+                            </div>
+                            <div className="flex items-center space-x-1 text-[10px] text-indigo-400 group-hover:text-amber-300 font-semibold self-end">
+                              <span>Показать в стенограмме</span>
+                              <ExternalLink className="w-2.5 h-2.5" />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+
+                {currentProp.critical_errors.length > 0 && (
+                  <div className="p-3 bg-rose-950/40 border border-rose-800/80 rounded-xl space-y-1">
+                    <div className="flex items-center space-x-1.5 text-xs font-bold text-rose-300">
+                      <AlertTriangle className="w-3.5 h-3.5" />
+                      <span>Критическая ошибка</span>
+                    </div>
+                    {currentProp.critical_errors.map((err, idx) => (
+                      <p key={idx} className="text-xs text-rose-200">
+                        {err}
+                      </p>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="p-6 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl">
+                Ожидание ответа кандидата или нажмите кнопку «Запросить оценку» выше.
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
   );
 };
+

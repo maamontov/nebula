@@ -143,3 +143,31 @@ export async function approveAssessment(
   if (!res.ok) throw new Error(`Approve assessment error: ${res.statusText}`);
   return res.json();
 }
+
+export async function enqueueJob(
+  interviewId: string,
+  jobType: string,
+  payload: Record<string, unknown>,
+  maxAttempts: number = 3
+): Promise<{ status: string; job_id: string }> {
+  const jobId = `job-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/jobs/enqueue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: jobId,
+      type: jobType,
+      payload,
+      max_attempts: maxAttempts,
+    }),
+  });
+  if (!res.ok) throw new Error(`Enqueue job error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function exportInterview(interviewId: string): Promise<Record<string, unknown>> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/export`);
+  if (!res.ok) throw new Error(`Export interview error: ${res.statusText}`);
+  return res.json();
+}
+
