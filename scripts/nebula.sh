@@ -12,8 +12,19 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="$ROOT_DIR/.run"
 LOG_DIR="$RUN_DIR/logs"
 
+# Absolute canonical storage paths (bilingual config contract)
+export NEBULA_DATA_DIR="${NEBULA_DATA_DIR:-$ROOT_DIR/data}"
+export NEBULA_CAPTURE_SPOOL_DIR="${NEBULA_CAPTURE_SPOOL_DIR:-$NEBULA_DATA_DIR/spool_capture}"
+export NEBULA_BACKEND_SPOOL_DIR="${NEBULA_BACKEND_SPOOL_DIR:-$NEBULA_DATA_DIR/spool_backend}"
+export NEBULA_DB_PATH="${NEBULA_DB_PATH:-$NEBULA_DATA_DIR/nebula.db}"
+export NEBULA_BACKUP_DIR="${NEBULA_BACKUP_DIR:-$NEBULA_DATA_DIR/backups}"
+
 mkdir -p "$RUN_DIR"
 mkdir -p "$LOG_DIR"
+mkdir -p "$NEBULA_DATA_DIR"
+mkdir -p "$NEBULA_CAPTURE_SPOOL_DIR"
+mkdir -p "$NEBULA_BACKEND_SPOOL_DIR"
+mkdir -p "$NEBULA_BACKUP_DIR"
 
 # Color definitions
 GREEN='\033[0;32m'

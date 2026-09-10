@@ -7,14 +7,15 @@ pub mod synthetic;
 
 pub use clock::{DriftMetrics, MonotonicInterviewClock};
 pub use resampler::{
-    calculate_rms_f32, calculate_rms_i16, f32_to_pcm_s16le,
+    calculate_rms_f32, calculate_rms_i16, calculate_peak_f32, f32_to_pcm_s16le,
     multi_channel_to_mono_f32, resample_linear_f32, StatefulAudioConverter,
 };
 pub use spool::{AudioSpoolManager, VerificationReport};
 pub use types::{AudioChunkMetadata, AudioFormat, AudioGap, CaptureStats, TrackManifest, TrackType};
 pub use capture::{
     list_input_devices, list_output_devices, start_device_capture,
-    run_capture_worker, CaptureHandle, CaptureWorkerConfig, DeviceInfo,
+    run_capture_worker, run_capture_worker_extended, AudioLevelMetrics,
+    CaptureHandle, CaptureWorkerConfig, DeviceInfo,
 };
 
 

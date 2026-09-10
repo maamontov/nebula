@@ -7,11 +7,14 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from unittest.mock import AsyncMock, MagicMock
+
 from backend.api.app import app
 from backend.core.evidence_validator import validate_proposal
 from backend.core.matcher import QuestionMatcher
 from backend.db.database import Database
 from backend.db.repository import Repository, RepositoryConflictError
+from backend.workers.pipeline import PipelineWorker
 from contracts.audio import TrackType
 from contracts.domain import (
     AssessmentProposal,
@@ -487,3 +490,119 @@ async def test_pipeline_worker_evidence_validation_rejects_hallucination(repo: R
     assert p["is_rejected"] == 1
     assert len(p["validation_errors"]) >= 1
     assert "not found verbatim" in p["validation_errors"][0].lower()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_worker_no_cross_question_leak_and_unanswered(repo: Repository):
+    interview_id = "inv-leak-test"
+    _setup_interview_with_plan(repo, interview_id)
+
+    # Add candidate speech only for q1 (GIL)
+    repo.add_transcript_segment(
+        segment_id="seg-gil-cand",
+        interview_id=interview_id,
+        track_id="candidate",
+        start_time_ms=5000,
+        end_time_ms=10000,
+        text="Мы используем multiprocessing для обхода GIL.",
+        is_final=True,
+    )
+    repo.save_association(
+        assoc_id="assoc-gil-cand",
+        interview_id=interview_id,
+        question_id="q1",
+        segment_id="seg-gil-cand",
+        confidence=0.95,
+        is_ambiguous=False,
+    )
+
+    mock_llm = MagicMock()
+    mock_llm.execute_request = AsyncMock()
+    worker = PipelineWorker(repo, stt_adapter=MagicMock(), llm_adapter=mock_llm)
+
+    # Now evaluate question q2 (PostgreSQL) which has NO candidate speech!
+    repo.enqueue_job(
+        job_id="job-eval-q2",
+        job_type="EVALUATE_QUESTION",
+        interview_id=interview_id,
+        payload={"question_id": "q2"},
+    )
+
+    processed = await worker.process_one_job()
+    assert processed is True
+    # Verify LLM was NOT called because there was no candidate speech for q2
+    mock_llm.execute_request.assert_not_called()
+
+    # Verify an explicit unanswered proposal was saved
+    props = repo.get_assessment_proposals(interview_id)
+    assert len(props) == 1
+    p = props[0]
+    assert p["question_id"] == "q2"
+    assert p["is_rejected"] == 0
+    scores = p["scores"]
+    assert len(scores) == 1
+    assert scores[0]["score"] is None
+    assert "отсутствует" in scores[0]["explanation"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_worker_stale_revision_detected(repo: Repository):
+    interview_id = "inv-stale-test"
+    _setup_interview_with_plan(repo, interview_id)
+
+    repo.add_transcript_segment(
+        segment_id="seg-pg-cand",
+        interview_id=interview_id,
+        track_id="candidate",
+        start_time_ms=5000,
+        end_time_ms=10000,
+        text="В Postgres по умолчанию уровень Read Committed.",
+        is_final=True,
+    )
+    repo.save_association(
+        assoc_id="assoc-pg-cand",
+        interview_id=interview_id,
+        question_id="q2",
+        segment_id="seg-pg-cand",
+        confidence=0.95,
+        is_ambiguous=False,
+    )
+
+    mock_llm = MagicMock()
+    mock_llm.execute_request = AsyncMock(
+        return_value=(
+            {
+                "scores": [
+                    {
+                        "criterion_id": "crit-pg",
+                        "score": 5.0,
+                        "explanation": "Правильный ответ по Read Committed.",
+                        "evidence": [
+                            {"segment_id": "seg-pg-cand", "exact_quote": "В Postgres по умолчанию уровень Read Committed."}
+                        ],
+                    }
+                ],
+                "critical_errors": [],
+            },
+            "test-model",
+        )
+    )
+    worker = PipelineWorker(repo, stt_adapter=MagicMock(), llm_adapter=mock_llm)
+
+    # Enqueue with older transcript revision trans-rev-old
+    repo.enqueue_job(
+        job_id="job-eval-stale",
+        job_type="EVALUATE_QUESTION",
+        interview_id=interview_id,
+        payload={"question_id": "q2", "transcript_revision_id": "trans-rev-old"},
+    )
+
+    # Active transcript revision in interview is trans-rev-1 (or not matching trans-rev-old)
+    processed = await worker.process_one_job()
+    assert processed is True
+
+    props = repo.get_assessment_proposals(interview_id)
+    assert len(props) == 1
+    p = props[0]
+    assert p["is_stale"] == 1
+    assert "Revision" in p["stale_reason"]

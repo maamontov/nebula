@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Header } from './components/Header';
 import { SetupScreen } from './screens/SetupScreen';
 import { LiveSessionScreen } from './screens/LiveSessionScreen';
 import { ReviewScreen } from './screens/ReviewScreen';
 import { InterviewPlan, InterviewStatus } from './types';
+import { getActiveSession, getInterview } from './services/api';
 
 type Screen = 'setup' | 'live' | 'review';
 
@@ -11,6 +12,29 @@ export const App: React.FC = () => {
   const [screen, setScreen] = useState<Screen>('setup');
   const [interviewId, setInterviewId] = useState<string>('');
   const [plan, setPlan] = useState<InterviewPlan | null>(null);
+
+  useEffect(() => {
+    getActiveSession().then(async (activeSessionId) => {
+      if (activeSessionId) {
+        try {
+          const data = await getInterview(activeSessionId);
+          if (data && data.interview) {
+            setInterviewId(activeSessionId);
+            if (data.plan) {
+              setPlan(data.plan);
+            }
+            if (data.interview.status === 'review' || data.interview.status === 'finalized') {
+              setScreen('review');
+            } else {
+              setScreen('live');
+            }
+          }
+        } catch (e) {
+          console.error('Failed to restore active session:', e);
+        }
+      }
+    });
+  }, []);
 
   const getStatus = (): InterviewStatus => {
     switch (screen) {

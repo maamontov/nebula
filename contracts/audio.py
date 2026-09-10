@@ -12,7 +12,9 @@ class TrackType(str, Enum):
 class AudioFormat(str, Enum):
     """Raw or compressed audio chunk format."""
     PCM_S16LE = "pcm_s16le"
+    PCM_S16_LE = "pcm_s16_le"
     PCM_F32LE = "pcm_f32le"
+    PCM_F32_LE = "pcm_f32_le"
     OPUS = "opus"
     WAV = "wav"
 

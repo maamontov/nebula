@@ -67,7 +67,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ onInterviewStarted }) 
       setDevices(devs);
       if (devs.length > 0) {
         setSelectedMic(devs[0].id);
-        setSelectedSpeaker(devs.length > 1 ? devs[1].id : devs[0].id);
+        setSelectedSpeaker(devs.length > 1 ? devs[1].id : '');
       }
     });
   }, []);
@@ -79,6 +79,14 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ onInterviewStarted }) 
     }
     if (!candidateName.trim()) {
       setErrorMsg('Укажите ФИО кандидата.');
+      return;
+    }
+    if (!selectedMic || !selectedSpeaker) {
+      setErrorMsg('Необходимо выбрать аудиоустройства для микрофона и динамиков/встречи.');
+      return;
+    }
+    if (selectedMic === selectedSpeaker) {
+      setErrorMsg('Канал интервьюера и канал кандидата должны использовать разные аудиоустройства.');
       return;
     }
 
@@ -102,8 +110,8 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({ onInterviewStarted }) 
         version: 'consent-v1.0-ru',
       });
 
-      // Start audio capture in background
-      await startAudioCapture(interviewId, selectedMic, selectedSpeaker, './spool', true);
+      // Start audio capture with canonical spool resolution
+      await startAudioCapture(interviewId, selectedMic, selectedSpeaker, undefined, true);
 
       onInterviewStarted(interviewId, plan);
     } catch (err: any) {

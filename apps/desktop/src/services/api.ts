@@ -52,7 +52,30 @@ async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Prom
       return { status: 'resumed', session_id: 'demo', epoch: 2, elapsed_ms: 1000 } as unknown as T;
     }
     if (cmd === 'stop_capture') {
-      return { status: 'stopped', total_chunks: 1, drift_ms: 0 } as unknown as T;
+      return { status: 'stopped', total_chunks: 1, drift_ms: 0, manifests: {} } as unknown as T;
+    }
+    if (cmd === 'get_upload_progress') {
+      return {
+        session_id: (args?.sessionId as string) || 'demo',
+        total_chunks: 10,
+        uploaded_chunks: 10,
+        in_flight_chunks: 0,
+        pending_chunks: 0,
+        is_sealed: true,
+        all_uploaded: true,
+      } as unknown as T;
+    }
+    if (cmd === 'get_active_session') {
+      return null as unknown as T;
+    }
+    if (cmd === 'get_system_config') {
+      return {
+        data_dir: '/tmp/nebula/data',
+        capture_spool_dir: '/tmp/nebula/data/spool',
+        backend_spool_dir: '/tmp/nebula/data/spool',
+        db_path: '/tmp/nebula/data/nebula.db',
+        backup_dir: '/tmp/nebula/data/backups',
+      } as unknown as T;
     }
     return {} as T;
   }
@@ -81,12 +104,65 @@ async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Prom
   if (cmd === 'stop_capture') {
     return { status: 'stopped', total_chunks: 0, drift_ms: 0 } as unknown as T;
   }
+  if (cmd === 'get_upload_progress') {
+    return {
+      session_id: '',
+      total_chunks: 0,
+      uploaded_chunks: 0,
+      in_flight_chunks: 0,
+      pending_chunks: 0,
+      is_sealed: false,
+      all_uploaded: true,
+    } as unknown as T;
+  }
+  if (cmd === 'get_active_session') {
+    return null as unknown as T;
+  }
+  if (cmd === 'get_system_config') {
+    const res = await fetch(`${API_BASE}/system/config`);
+    if (res.ok) return res.json();
+    throw new Error('Failed to load system config');
+  }
   return {} as T;
 }
 
 // -------------------------------------------------------------
 // Audio & Tauri IPC
 // -------------------------------------------------------------
+export interface StopCaptureResult {
+  status: string;
+  session_id: string;
+  total_chunks: number;
+  total_samples_interviewer: number;
+  total_samples_candidate: number;
+  total_duration_ms: number;
+  drift_ms: number;
+  skew_ms: number;
+  dropped_samples: number;
+  manifests?: {
+    interviewer?: Record<string, unknown>;
+    candidate?: Record<string, unknown>;
+  };
+}
+
+export interface SessionUploadProgress {
+  session_id: string;
+  total_chunks: number;
+  uploaded_chunks: number;
+  in_flight_chunks: number;
+  pending_chunks: number;
+  is_sealed: boolean;
+  all_uploaded: boolean;
+}
+
+export interface SystemConfig {
+  data_dir: string;
+  capture_spool_dir: string;
+  backend_spool_dir: string;
+  db_path: string;
+  backup_dir: string;
+}
+
 export async function getAudioDevices(): Promise<AudioDevice[]> {
   return invokeTauri<AudioDevice[]>('list_audio_devices');
 }
@@ -99,14 +175,14 @@ export async function startAudioCapture(
   sessionId: string,
   interviewerDevId: string,
   candidateDevId: string,
-  spoolDir: string,
-  consentGiven: boolean
+  spoolDir?: string,
+  consentGiven: boolean = true
 ): Promise<{ status: string }> {
   return invokeTauri('start_capture', {
     sessionId,
     interviewerDevId,
     candidateDevId,
-    spoolDir,
+    spoolDir: spoolDir || null,
     consentGiven,
   });
 }
@@ -119,18 +195,26 @@ export async function resumeAudioCapture(): Promise<{ status: string; session_id
   return invokeTauri('resume_capture');
 }
 
-export async function stopAudioCapture(): Promise<{
-  status: string;
-  session_id: string;
-  total_chunks: number;
-  total_samples_interviewer: number;
-  total_samples_candidate: number;
-  total_duration_ms: number;
-  drift_ms: number;
-  skew_ms: number;
-  dropped_samples: number;
-}> {
-  return invokeTauri('stop_capture');
+export async function stopAudioCapture(): Promise<StopCaptureResult> {
+  return invokeTauri<StopCaptureResult>('stop_capture');
+}
+
+export async function getUploadProgress(sessionId?: string): Promise<SessionUploadProgress> {
+  return invokeTauri<SessionUploadProgress>('get_upload_progress', { sessionId });
+}
+
+export async function getActiveSession(): Promise<string | null> {
+  return invokeTauri<string | null>('get_active_session');
+}
+
+export async function getSystemConfig(): Promise<SystemConfig> {
+  try {
+    return await invokeTauri<SystemConfig>('get_system_config');
+  } catch {
+    const res = await fetch(`${API_BASE}/system/config`);
+    if (res.ok) return res.json();
+    throw new Error('Failed to load system config');
+  }
 }
 
 // -------------------------------------------------------------
@@ -266,6 +350,21 @@ export async function getInterviewJobsStatus(interviewId: string): Promise<{
 }> {
   const res = await fetch(`${API_BASE}/interviews/${interviewId}/jobs/status`);
   if (!res.ok) throw new Error(`Get jobs status error: ${res.statusText}`);
+  return res.json();
+}
+
+export interface InterviewReadiness {
+  is_ready: boolean;
+  state: string;
+  details: string;
+  missing_chunks?: Record<string, number[]>;
+  stt_jobs?: { completed: number; pending: number; failed: number };
+  manifests?: Record<string, unknown>;
+}
+
+export async function getInterviewReadiness(interviewId: string): Promise<InterviewReadiness> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/readiness`);
+  if (!res.ok) throw new Error(`Get interview readiness error: ${res.statusText}`);
   return res.json();
 }
 

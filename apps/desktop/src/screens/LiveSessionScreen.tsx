@@ -7,7 +7,8 @@ import {
   pauseInterview,
   resumeInterview,
   stopInterview,
-  getInterviewJobsStatus,
+  getInterviewReadiness,
+  getUploadProgress,
   updateInterviewStatus,
   getInterview,
   enqueueJob,
@@ -108,24 +109,52 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
 
     try {
       setStoppingStage('Остановка захвата звука...');
-      await stopAudioCapture();
+      const stopResult = await stopAudioCapture();
 
       setStoppingStage('Фиксация состояния и манифестов сессии...');
-      await stopInterview(interviewId);
+      const manifestsList: Record<string, unknown>[] = [];
+      if (stopResult.manifests?.interviewer) {
+        manifestsList.push(stopResult.manifests.interviewer);
+      }
+      if (stopResult.manifests?.candidate) {
+        manifestsList.push(stopResult.manifests.candidate);
+      }
+      await stopInterview(interviewId, manifestsList);
 
-      setStoppingStage('Ожидание завершения обработки пайплайна...');
-      const maxWaitMs = 15000;
-      const startTime = Date.now();
-      while (Date.now() - startTime < maxWaitMs) {
+      setStoppingStage('Ожидание передачи аудио и завершения транскрибации...');
+      let isReady = false;
+      let attempts = 0;
+      const maxAttempts = 120; // up to 60s
+      while (!isReady && attempts < maxAttempts) {
+        attempts++;
         try {
-          const jobsStatus = await getInterviewJobsStatus(interviewId);
-          if (jobsStatus.is_pipeline_idle) {
+          const uploadProgress = await getUploadProgress(interviewId).catch(() => null);
+          const readiness = await getInterviewReadiness(interviewId);
+          if (readiness.is_ready) {
+            isReady = true;
             break;
+          } else {
+            const incompleteCount = readiness.stt_jobs?.pending ?? 0;
+            const missingChunksCount = readiness.missing_chunks
+              ? Object.values(readiness.missing_chunks).reduce((acc, curr) => acc + curr.length, 0)
+              : 0;
+            const uploadInfo = uploadProgress
+              ? ` (выгружено ${uploadProgress.uploaded_chunks}/${uploadProgress.total_chunks})`
+              : missingChunksCount > 0
+              ? ` (ожидание ${missingChunksCount} фрагментов)`
+              : '';
+            setStoppingStage(`Обработка аудио${uploadInfo}: ${readiness.details} (осталось задач: ${incompleteCount})...`);
           }
         } catch {
-          // Brief wait before retry
+          // brief retry
         }
         await new Promise((r) => setTimeout(r, 500));
+      }
+
+      if (!isReady) {
+        const finalReadiness = await getInterviewReadiness(interviewId).catch(() => null);
+        const reasons = finalReadiness?.details || 'Превышено время ожидания готовности данных';
+        throw new Error(`Данные интервью не полностью готовы к оценке: ${reasons}`);
       }
 
       setStoppingStage('Переход к ревью сессии...');

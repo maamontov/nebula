@@ -67,8 +67,8 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 
 ### Статус верификации и границы готовности
 - **Автоматически проверено (100% Green)**:
-  - 107 тестов Python/pytest (FastAPI эндпоинты, изоляция SQLite, детерминированный скоринг, валидатор доказательств, optimistic concurrency control, конечный автомат сессий, атомарный лизинг воркера и полная сквозная регрессионная матрица из 14 сценариев).
-  - 19 тестов Rust (`cargo test --workspace`), включая lock-free ringbuffer, WAV spooling и синтетическую часовую 2-канальную запись с компенсацией дрейфа тактовых генераторов (3600с симулированы за 41.8с без потерь).
+  - 110 тестов Python/pytest (FastAPI эндпоинты, изоляция SQLite, детерминированный скоринг, валидатор доказательств, optimistic concurrency control, конечный автомат сессий, атомарный лизинг воркера, полная сквозная регрессионная матрица из 14 сценариев и сквозной тест десктопного пайплайна `test_desktop_pipeline_e2e.py`).
+  - 19 тестов Rust (`cargo test --workspace`), включая lock-free ringbuffer, WAV spooling и синтетическую часовую 2-канальную запись с компенсацией дрейфа тактовых генераторов (3600с симулированы за 42с без потерь).
   - Production-сборка десктопного фронтенда (`tsc && vite build` — 0 ошибок сборки и типизации).
 - **Проверено на физическом окружении**:
   - macOS Sonoma/Sequoia (Apple Silicon, нативный CoreAudio capture).
@@ -81,6 +81,8 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 - [Концепция продукта](docs/product-concept.md)
 - [План реализации](docs/implementation-plan.md)
 - [План исправлений по результатам ревью](docs/remediation-plan.md)
+- [Доработка рабочего пути Desktop → STT](docs/desktop-pipeline-remediation-plan.md)
+- [Отчёт об устранении дефектов десктопного пайплайна (Этапы A-G)](docs/desktop-pipeline-remediation-report.md)
 - [Отчёт о сквозной верификации, матрице регрессий и аудите (Этап 9)](docs/stage9-verification-and-audit.md)
 - [Спецификация контрактов и доменной модели](docs/contracts-spec.md)
 - [Спецификация аудиозахвата и spooling](docs/audio-capture-spec.md)
@@ -154,8 +156,8 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 
 ### Verification Status & Readiness Boundaries
 - **Automated Verification (100% Green)**:
-  - 107 Python/pytest tests (FastAPI endpoints, SQLite isolation, deterministic scoring engine, evidence validator, optimistic concurrency control, session state machine, atomic worker lease/lock handling, and full 14-scenario end-to-end regression matrix).
-  - 19 Rust tests (`cargo test --workspace`), covering lock-free ringbuffer, WAV spooling, and synthetic 1-hour 2-channel recording with clock drift compensation (3600s simulated in 41.8s without sample loss).
+  - 110 Python/pytest tests (FastAPI endpoints, SQLite isolation, deterministic scoring engine, evidence validator, optimistic concurrency control, session state machine, atomic worker lease/lock handling, full 14-scenario end-to-end regression matrix, and `test_desktop_pipeline_e2e.py`).
+  - 19 Rust tests (`cargo test --workspace`), covering lock-free ringbuffer, WAV spooling, and synthetic 1-hour 2-channel recording with clock drift compensation (3600s simulated in 42s without sample loss).
   - Desktop frontend production build verified (`tsc && vite build` — 0 errors, full TypeScript type safety).
 - **Physical Environment Verification**:
   - macOS Sonoma/Sequoia (Apple Silicon, native CoreAudio capture).
@@ -168,6 +170,8 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 - [Product Concept](docs/product-concept.md)
 - [Implementation Plan](docs/implementation-plan.md)
 - [Remediation Plan (Russian)](docs/remediation-plan.md)
+- [Desktop → STT Integration Remediation (Russian)](docs/desktop-pipeline-remediation-plan.md)
+- [Desktop Pipeline Remediation Report (Stages A-G)](docs/desktop-pipeline-remediation-report.md)
 - [End-to-End Verification, Regression Matrix & Audit Report (Stage 9)](docs/stage9-verification-and-audit.md)
 - [Contracts & Domain Model Specification](docs/contracts-spec.md)
 - [Audio Capture & Spooling Specification](docs/audio-capture-spec.md)

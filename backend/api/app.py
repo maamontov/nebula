@@ -82,15 +82,22 @@ def validate_safe_id(identifier: str, field_name: str = "id") -> str:
     return identifier
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
 def get_trusted_spool_dir() -> Path:
-    spool_path = os.getenv("NEBULA_SPOOL_DIR", "./spool")
+    spool_path = os.getenv("NEBULA_BACKEND_SPOOL_DIR") or os.getenv("NEBULA_SPOOL_DIR")
+    if not spool_path:
+        spool_path = PROJECT_ROOT / "data" / "spool_backend"
     path = Path(spool_path).resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def get_trusted_backup_dir() -> Path:
-    backup_path = os.getenv("NEBULA_BACKUP_DIR", "./backups")
+    backup_path = os.getenv("NEBULA_BACKUP_DIR")
+    if not backup_path:
+        backup_path = PROJECT_ROOT / "data" / "backups"
     path = Path(backup_path).resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -372,15 +379,211 @@ async def delete_interview_endpoint(
     return {"status": "deleted", "interview_id": interview_id, "success": True}
 
 
+def check_interview_readiness(
+    interview_id: str,
+    repo: Repository,
+    spool_dir: Path,
+) -> tuple[bool, dict[str, Any]]:
+    """
+    Evaluates server-side pipeline readiness gate for transitioning to REVIEW:
+    1. Inspects track manifests in spool_dir / interview_id.
+    2. Verifies that all expected chunk sequences from manifests are ingested into audio_chunks.
+    3. Verifies that all STT transcription jobs for this interview are completed.
+    4. Detects failed STT jobs or missing chunks and provides granular diagnostics.
+    """
+    interview_path = spool_dir / interview_id
+    manifests_found: dict[str, dict[str, Any]] = {}
+
+    if interview_path.exists():
+        for track in ("candidate", "interviewer"):
+            m_path = interview_path / track / "manifest.json"
+            if m_path.exists():
+                try:
+                    with open(m_path, "r", encoding="utf-8") as f:
+                        manifests_found[track] = json.load(f)
+                except Exception:
+                    pass
+
+    # Check database records
+    db_chunks = repo.get_audio_chunks(interview_id)
+    chunks_by_track: dict[str, set[int]] = {}
+    for c in db_chunks:
+        t_id = str(c.get("track_id", "")).lower()
+        if "candidate" in t_id:
+            key = "candidate"
+        elif "interviewer" in t_id:
+            key = "interviewer"
+        else:
+            key = t_id
+        chunks_by_track.setdefault(key, set()).add(c["sequence"])
+
+    # Query jobs
+    with repo.db.transaction() as conn:
+        job_rows = conn.execute(
+            "SELECT id, type, status FROM jobs WHERE interview_id = ?",
+            (interview_id,),
+        ).fetchall()
+
+    stt_jobs = [r for r in job_rows if r["type"] == "TRANSCRIBE_AUDIO"]
+    pending_jobs = [r for r in stt_jobs if r["status"] in ("PENDING", "PROCESSING")]
+    failed_jobs = [r for r in stt_jobs if r["status"] == "FAILED"]
+    completed_jobs = [r for r in stt_jobs if r["status"] == "COMPLETED"]
+
+    missing_chunks: dict[str, list[int]] = {}
+    total_expected_chunks = 0
+
+    for track, m in manifests_found.items():
+        total_c = m.get("total_chunks", 0)
+        total_expected_chunks += total_c
+        ingested = chunks_by_track.get(track, set())
+        expected = set(range(total_c))
+        diff = sorted(list(expected - ingested))
+        if diff:
+            missing_chunks[track] = diff
+
+    # If manifests exist:
+    if manifests_found:
+        if missing_chunks:
+            return (
+                False,
+                {
+                    "is_ready": False,
+                    "state": "AWAITING_CHUNKS",
+                    "details": f"Missing chunks for tracks: {', '.join(f'{t}: {len(seqs)} chunks' for t, seqs in missing_chunks.items())}",
+                    "missing_chunks": missing_chunks,
+                    "stt_jobs": {"completed": len(completed_jobs), "pending": len(pending_jobs), "failed": len(failed_jobs)},
+                    "manifests": manifests_found,
+                },
+            )
+
+        if failed_jobs:
+            return (
+                False,
+                {
+                    "is_ready": False,
+                    "state": "STT_FAILED",
+                    "details": f"{len(failed_jobs)} audio transcription jobs failed.",
+                    "missing_chunks": {},
+                    "stt_jobs": {"completed": len(completed_jobs), "pending": len(pending_jobs), "failed": len(failed_jobs)},
+                    "manifests": manifests_found,
+                },
+            )
+
+        if pending_jobs:
+            return (
+                False,
+                {
+                    "is_ready": False,
+                    "state": "STT_IN_PROGRESS",
+                    "details": f"STT transcription in progress ({len(completed_jobs)}/{len(stt_jobs)} completed, {len(pending_jobs)} pending).",
+                    "missing_chunks": {},
+                    "stt_jobs": {"completed": len(completed_jobs), "pending": len(pending_jobs), "failed": len(failed_jobs)},
+                    "manifests": manifests_found,
+                },
+            )
+
+        if total_expected_chunks > 0 and len(completed_jobs) < len(db_chunks):
+            return (
+                False,
+                {
+                    "is_ready": False,
+                    "state": "STT_IN_PROGRESS",
+                    "details": f"Awaiting STT job execution for {len(db_chunks) - len(completed_jobs)} chunks.",
+                    "missing_chunks": {},
+                    "stt_jobs": {"completed": len(completed_jobs), "pending": len(pending_jobs), "failed": len(failed_jobs)},
+                    "manifests": manifests_found,
+                },
+            )
+
+        return (
+            True,
+            {
+                "is_ready": True,
+                "state": "READY_FOR_REVIEW",
+                "details": "All manifests sealed, chunks ingested and transcribed.",
+                "missing_chunks": {},
+                "stt_jobs": {"completed": len(completed_jobs), "pending": 0, "failed": 0},
+                "manifests": manifests_found,
+            },
+        )
+
+    # If no manifests found on disk:
+    # If chunks were ingested into database, an unsealed session cannot transition to review
+    if db_chunks:
+        return (
+            False,
+            {
+                "is_ready": False,
+                "state": "AWAITING_MANIFEST",
+                "details": f"Found {len(db_chunks)} audio chunks in database, but track manifests have not been sealed yet.",
+                "missing_chunks": {},
+                "stt_jobs": {"completed": len(completed_jobs), "pending": len(pending_jobs), "failed": len(failed_jobs)},
+                "manifests": {},
+            },
+        )
+
+    # If any pending jobs exist (e.g. batch transcription or other async processing):
+    if pending_jobs:
+        return (
+            False,
+            {
+                "is_ready": False,
+                "state": "PROCESSING",
+                "details": f"{len(pending_jobs)} jobs are still in progress.",
+                "missing_chunks": {},
+                "stt_jobs": {"completed": len(completed_jobs), "pending": len(pending_jobs), "failed": len(failed_jobs)},
+                "manifests": {},
+            },
+        )
+
+    # Synthetic or text-only interviews (e.g. in unit test fixtures):
+    return (
+        True,
+        {
+            "is_ready": True,
+            "state": "READY_FOR_REVIEW",
+            "details": "No pending audio processing.",
+            "missing_chunks": {},
+            "stt_jobs": {"completed": len(completed_jobs), "pending": 0, "failed": 0},
+            "manifests": {},
+        },
+    )
+
+
+@app.get("/api/v1/interviews/{interview_id}/readiness")
+async def get_interview_readiness_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+    spool_dir: Path = Depends(get_trusted_spool_dir),
+):
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    _is_ready, report = check_interview_readiness(interview_id, repo, spool_dir)
+    return report
+
+
 @app.post("/api/v1/interviews/{interview_id}/status")
 async def update_status_endpoint(
     interview_id: str,
     payload: TransitionStateRequest,
     repo: Repository = Depends(get_repository),
+    spool_dir: Path = Depends(get_trusted_spool_dir),
 ):
+    validate_safe_id(interview_id, "interview_id")
     inv = repo.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
+
+    if payload.target_status == InterviewStatus.REVIEW:
+        is_ready, report = check_interview_readiness(interview_id, repo, spool_dir)
+        if not is_ready:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Interview readiness gate failed: {report['details']} (state: {report['state']})",
+            )
 
     try:
         current_status = InterviewStatus(inv["status"])
@@ -1255,4 +1458,25 @@ async def check_database_integrity_endpoint(
 ):
     is_ok = repo.db.verify_integrity()
     return {"status": "ok" if is_ok else "corrupted", "integrity_ok": is_ok}
+
+
+@app.get("/api/v1/system/config")
+async def get_system_config_endpoint(
+    spool_dir: Path = Depends(get_trusted_spool_dir),
+    backup_dir: Path = Depends(get_trusted_backup_dir),
+):
+    """
+    Returns canonical server storage paths and configuration.
+    Возвращает канонические пути хранения и конфигурацию сервера.
+    """
+    capture_spool = os.getenv("NEBULA_CAPTURE_SPOOL_DIR") or str(PROJECT_ROOT / "data" / "spool_capture")
+    data_dir = os.getenv("NEBULA_DATA_DIR") or str(PROJECT_ROOT / "data")
+    db_path = os.getenv("NEBULA_DB_PATH") or str(PROJECT_ROOT / "data" / "nebula.db")
+    return {
+        "data_dir": str(Path(data_dir).resolve()),
+        "backend_spool_dir": str(spool_dir.resolve()),
+        "capture_spool_dir": str(Path(capture_spool).resolve()),
+        "backup_dir": str(backup_dir.resolve()),
+        "db_path": str(Path(db_path).resolve()),
+    }
 

@@ -8,11 +8,14 @@ pub enum TrackType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum AudioFormat {
+    #[serde(rename = "pcm_s16le", alias = "pcm_s16_le")]
     PcmS16Le,
+    #[serde(rename = "pcm_f32le", alias = "pcm_f32_le")]
     PcmF32Le,
+    #[serde(rename = "opus")]
     Opus,
+    #[serde(rename = "wav")]
     Wav,
 }
 

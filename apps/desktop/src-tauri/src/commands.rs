@@ -4,17 +4,20 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use cpal::traits::{DeviceTrait, HostTrait};
 use audio_capture::{
-    start_device_capture, CaptureHandle, CaptureStats, MonotonicInterviewClock,
-    TrackType, AudioSpoolManager,
+    start_device_capture, AudioSpoolManager, CaptureHandle, CaptureStats, MonotonicInterviewClock,
+    TrackManifest, TrackType,
 };
+use crate::uploader::{SessionUploader, UploadProgress};
 
 pub struct ActiveSession {
     pub session_id: String,
     pub interviewer_handle: Option<CaptureHandle>,
     pub candidate_handle: Option<CaptureHandle>,
     pub clock: MonotonicInterviewClock,
-    pub _spool_dir: PathBuf,
+    pub spool_dir: PathBuf,
     pub is_paused: Arc<AtomicBool>,
+    pub uploader: Option<SessionUploader>,
+    pub uploader_progress: Option<Arc<tokio::sync::Mutex<UploadProgress>>>,
 }
 
 pub struct AppState {
@@ -59,6 +62,7 @@ pub struct SessionCaptureResult {
     pub drift_ms: i64,
     pub skew_ms: i64,
     pub dropped_samples: u64,
+    pub manifests: Vec<TrackManifest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +78,55 @@ pub struct ResumeResult {
     pub session_id: String,
     pub epoch: u32,
     pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveSessionInfo {
+    pub is_recording: bool,
+    pub is_paused: bool,
+    pub session_id: Option<String>,
+    pub elapsed_ms: u64,
+    pub epoch: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemConfigInfo {
+    pub capture_spool_dir: String,
+    pub backend_url: String,
+}
+
+pub fn resolve_capture_spool_dir(spool_dir_arg: &str) -> PathBuf {
+    if !spool_dir_arg.trim().is_empty() && spool_dir_arg != "./spool" {
+        return PathBuf::from(spool_dir_arg);
+    }
+    if let Ok(val) = std::env::var("NEBULA_CAPTURE_SPOOL_DIR") {
+        if !val.trim().is_empty() {
+            return PathBuf::from(val);
+        }
+    }
+    if let Ok(val) = std::env::var("NEBULA_DATA_DIR") {
+        if !val.trim().is_empty() {
+            return PathBuf::from(val).join("spool_capture");
+        }
+    }
+    let repo_data = PathBuf::from("../../../data/spool_capture");
+    if repo_data.parent().map(|p| p.exists()).unwrap_or(false) {
+        return repo_data;
+    }
+    PathBuf::from("./data/spool_capture")
+}
+
+pub fn get_backend_url() -> String {
+    std::env::var("NEBULA_BACKEND_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
+}
+
+#[tauri::command]
+pub fn get_system_config() -> Result<SystemConfigInfo, String> {
+    let spool_dir = resolve_capture_spool_dir("");
+    Ok(SystemConfigInfo {
+        capture_spool_dir: spool_dir.to_string_lossy().to_string(),
+        backend_url: get_backend_url(),
+    })
 }
 
 #[tauri::command]
@@ -118,6 +171,14 @@ pub fn start_capture(
         return Err("Consent verification failed: Participant consent is strictly mandatory prior to recording.".into());
     }
 
+    if state.is_recording.load(Ordering::SeqCst) {
+        return Err("Запись уже активна. Остановите текущую сессию перед началом новой.".into());
+    }
+
+    if interviewer_dev_id == candidate_dev_id && !interviewer_dev_id.is_empty() {
+        return Err("Для двухканального сценария требуется настроить отдельный вход кандидата (например, Loopback / BlackHole). Выбор одного и того же микрофона для обоих каналов запрещён.".into());
+    }
+
     let host = cpal::default_host();
     let mut dev_inv: Option<cpal::Device> = None;
     let mut dev_cand: Option<cpal::Device> = None;
@@ -134,23 +195,21 @@ pub fn start_capture(
         }
     }
 
-    // If exact name didn't match, fallback to default input if requested
-    if dev_inv.is_none() {
-        dev_inv = host.default_input_device();
-    }
-    if dev_cand.is_none() {
-        // Look for alternate device or default
-        dev_cand = host.default_input_device();
-    }
+    // No silent fallback to default input
+    let dev_inv = dev_inv.ok_or_else(|| {
+        format!("Устройство аудиовхода интервьюера '{}' не найдено или недоступно. Выберите устройство повторно.", interviewer_dev_id)
+    })?;
+    let dev_cand = dev_cand.ok_or_else(|| {
+        format!("Устройство аудиовхода кандидата '{}' не найдено или недоступно. Выберите устройство повторно.", candidate_dev_id)
+    })?;
 
-    let dev_inv = dev_inv.ok_or_else(|| "Interviewer audio input device could not be opened".to_string())?;
-    let dev_cand = dev_cand.ok_or_else(|| "Candidate audio input device could not be opened".to_string())?;
+    let spool_path = resolve_capture_spool_dir(&spool_dir);
+    std::fs::create_dir_all(&spool_path)
+        .map_err(|e| format!("Не удалось создать директорию capture spool {:?}: {}", spool_path, e))?;
 
-    let spool_path = PathBuf::from(&spool_dir);
     let spool_mgr = Arc::new(AudioSpoolManager::new(&spool_path));
     let mut clock = MonotonicInterviewClock::new(1);
 
-    // Track start offsets
     clock.mark_track_start(TrackType::Interviewer);
 
     // 1. Start interviewer track
@@ -175,20 +234,26 @@ pub fn start_capture(
     ) {
         Ok(h) => h,
         Err(e) => {
-            // Cleanly abort interviewer handle so no dangling streams or partial states remain
             let _ = inv_handle.stop();
             state.is_recording.store(false, Ordering::SeqCst);
             return Err(format!("Failed to open candidate capture stream (interviewer stream cleanly aborted): {}", e));
         }
     };
 
+    // 3. Start durable chunk uploader
+    let mut uploader = SessionUploader::new(session_id.clone(), spool_path.clone(), get_backend_url());
+    let uploader_progress = uploader.progress_handle();
+    uploader.start();
+
     let session = ActiveSession {
         session_id: session_id.clone(),
         interviewer_handle: Some(inv_handle),
         candidate_handle: Some(cand_handle),
         clock,
-        _spool_dir: spool_path,
+        spool_dir: spool_path,
         is_paused: Arc::new(AtomicBool::new(false)),
+        uploader: Some(uploader),
+        uploader_progress: Some(uploader_progress),
     };
 
     if let Ok(mut guard) = state.active_session.lock() {
@@ -196,12 +261,12 @@ pub fn start_capture(
     }
     state.is_recording.store(true, Ordering::SeqCst);
 
-    println!("[Nebula Tauri] 2-Track Capture started successfully for session: {}", session_id);
+    println!("[Nebula Tauri] 2-Track Capture and Uploader started successfully for session: {}", session_id);
     Ok("Capture started successfully".into())
 }
 
 #[tauri::command]
-pub fn stop_capture(state: tauri::State<AppState>) -> Result<SessionCaptureResult, String> {
+pub async fn stop_capture(state: tauri::State<'_, AppState>) -> Result<SessionCaptureResult, String> {
     state.is_recording.store(false, Ordering::SeqCst);
 
     let session = {
@@ -212,7 +277,6 @@ pub fn stop_capture(state: tauri::State<AppState>) -> Result<SessionCaptureResul
     let mut session = match session {
         Some(s) => s,
         None => {
-            // If already stopped or no active session, return a stopped response
             return Ok(SessionCaptureResult {
                 status: "stopped".into(),
                 session_id: "".into(),
@@ -223,6 +287,7 @@ pub fn stop_capture(state: tauri::State<AppState>) -> Result<SessionCaptureResul
                 drift_ms: 0,
                 skew_ms: 0,
                 dropped_samples: 0,
+                manifests: Vec::new(),
             });
         }
     };
@@ -237,6 +302,11 @@ pub fn stop_capture(state: tauri::State<AppState>) -> Result<SessionCaptureResul
     }
     if let Some(cand_handle) = session.candidate_handle.take() {
         stats_cand = Some(cand_handle.stop().map_err(|e| format!("Candidate stop failed: {}", e))?);
+    }
+
+    // Stop uploader with final drain
+    if let Some(mut uploader) = session.uploader.take() {
+        uploader.stop().await;
     }
 
     let inv = stats_inv.unwrap_or_else(|| CaptureStats {
@@ -278,6 +348,16 @@ pub fn stop_capture(state: tauri::State<AppState>) -> Result<SessionCaptureResul
         16000,
     );
 
+    // Load actual sealed manifests from spool
+    let spool_mgr = AudioSpoolManager::new(&session.spool_dir);
+    let mut manifests = Vec::new();
+    if let Ok(m) = spool_mgr.load_manifest(&session.session_id, TrackType::Interviewer) {
+        manifests.push(m);
+    }
+    if let Ok(m) = spool_mgr.load_manifest(&session.session_id, TrackType::Candidate) {
+        manifests.push(m);
+    }
+
     Ok(SessionCaptureResult {
         status: "stopped".into(),
         session_id: session.session_id,
@@ -288,27 +368,120 @@ pub fn stop_capture(state: tauri::State<AppState>) -> Result<SessionCaptureResul
         drift_ms,
         skew_ms,
         dropped_samples,
+        manifests,
     })
 }
 
 #[tauri::command]
 pub fn get_audio_levels(state: tauri::State<AppState>) -> Result<AudioLevels, String> {
-    let is_rec = state.is_recording.load(Ordering::Relaxed);
-    if !is_rec {
+    let guard = state.active_session.lock().map_err(|_| "Failed to lock active session state")?;
+    if let Some(ref session) = *guard {
+        let (interviewer_rms, interviewer_peak) = session
+            .interviewer_handle
+            .as_ref()
+            .map(|h| h.audio_levels())
+            .unwrap_or((0.0, 0.0));
+        let (candidate_rms, candidate_peak) = session
+            .candidate_handle
+            .as_ref()
+            .map(|h| h.audio_levels())
+            .unwrap_or((0.0, 0.0));
         return Ok(AudioLevels {
-            interviewer_rms: 0.0,
-            interviewer_peak: 0.0,
-            candidate_rms: 0.0,
-            candidate_peak: 0.0,
+            interviewer_rms,
+            interviewer_peak,
+            candidate_rms,
+            candidate_peak,
         });
     }
 
-    // Telemetry from active session
     Ok(AudioLevels {
-        interviewer_rms: 0.08,
-        interviewer_peak: 0.22,
-        candidate_rms: 0.12,
-        candidate_peak: 0.38,
+        interviewer_rms: 0.0,
+        interviewer_peak: 0.0,
+        candidate_rms: 0.0,
+        candidate_peak: 0.0,
+    })
+}
+
+#[tauri::command]
+pub async fn get_upload_progress(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<UploadProgress, String> {
+    let progress_arc = {
+        let guard = state.active_session.lock().map_err(|_| "Failed to lock active session state")?;
+        if let Some(ref s) = *guard {
+            if s.session_id == session_id {
+                s.uploader_progress.clone()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some(arc) = progress_arc {
+        let p = arc.lock().await;
+        return Ok(p.clone());
+    }
+
+    // If not actively recording, count files on disk in capture spool
+    let spool_dir = resolve_capture_spool_dir("");
+    let session_dir = spool_dir.join(&session_id);
+    let mut total_discovered = 0u64;
+    let mut total_acked = 0u64;
+    let mut total_failed = 0u64;
+
+    for track in &["candidate", "interviewer"] {
+        let td = session_dir.join(track);
+        if let Ok(entries) = std::fs::read_dir(td) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".chunk") {
+                    total_discovered += 1;
+                } else if name.ends_with(".ack") {
+                    total_acked += 1;
+                } else if name.ends_with(".err") {
+                    total_failed += 1;
+                }
+            }
+        }
+    }
+
+    Ok(UploadProgress {
+        session_id,
+        total_discovered,
+        total_acked,
+        total_failed,
+        in_flight: 0,
+        is_active: false,
+        last_error: None,
+    })
+}
+
+#[tauri::command]
+pub fn get_active_session(state: tauri::State<AppState>) -> Result<ActiveSessionInfo, String> {
+    let is_rec = state.is_recording.load(Ordering::SeqCst);
+    let guard = state.active_session.lock().map_err(|_| "Failed to lock active session state")?;
+    if let Some(ref session) = *guard {
+        let is_paused = session.is_paused.load(Ordering::SeqCst);
+        let elapsed_ms = session.clock.elapsed_ms();
+        let epoch = session.clock.epoch();
+        return Ok(ActiveSessionInfo {
+            is_recording: is_rec,
+            is_paused,
+            session_id: Some(session.session_id.clone()),
+            elapsed_ms,
+            epoch,
+        });
+    }
+
+    Ok(ActiveSessionInfo {
+        is_recording: false,
+        is_paused: false,
+        session_id: None,
+        elapsed_ms: 0,
+        epoch: 0,
     })
 }
 
@@ -320,7 +493,8 @@ pub fn verify_spool(spool_dir: String, interview_id: String, track: String) -> R
         TrackType::Interviewer
     };
 
-    let spool = AudioSpoolManager::new(&spool_dir);
+    let spool_path = resolve_capture_spool_dir(&spool_dir);
+    let spool = AudioSpoolManager::new(&spool_path);
     let report = spool.verify_track_spool(&interview_id, track_type).map_err(|e| e.to_string())?;
     Ok(report.is_valid)
 }
@@ -392,5 +566,3 @@ pub fn resume_capture(state: tauri::State<AppState>) -> Result<ResumeResult, Str
         elapsed_ms,
     })
 }
-
-

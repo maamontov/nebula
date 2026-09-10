@@ -151,6 +151,16 @@ impl AudioSpoolManager {
         Ok(manifest)
     }
 
+    /// Loads a sealed track manifest from disk.
+    pub fn load_manifest(&self, interview_id: &str, track_id: TrackType) -> Result<TrackManifest> {
+        let manifest_path = self.get_track_dir(interview_id, track_id).join("manifest.json");
+        if !manifest_path.exists() {
+            bail!("Manifest does not exist at {:?}", manifest_path);
+        }
+        let data = fs::read_to_string(&manifest_path)?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
 
     /// Verifies all chunks in a track directory against their metadata and checksums.
     pub fn verify_track_spool(

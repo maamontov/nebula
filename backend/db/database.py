@@ -10,7 +10,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
 
-DEFAULT_DB_PATH = os.getenv("NEBULA_DB_PATH", "data/nebula.db")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_DB_PATH = os.getenv("NEBULA_DB_PATH", str(PROJECT_ROOT / "data" / "nebula.db"))
 
 
 class Database:

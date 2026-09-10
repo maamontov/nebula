@@ -51,16 +51,56 @@ pub struct CaptureWorkerConfig {
     pub start_offset_ms: u64,
 }
 
+#[derive(Debug, Default)]
+pub struct AudioLevelMetrics {
+    rms_bits: std::sync::atomic::AtomicU32,
+    peak_bits: std::sync::atomic::AtomicU32,
+}
+
+impl AudioLevelMetrics {
+    pub fn update(&self, rms: f32, peak: f32) {
+        self.rms_bits.store(rms.to_bits(), Ordering::Relaxed);
+        self.peak_bits.store(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.rms_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.peak_bits.load(Ordering::Relaxed)),
+        )
+    }
+}
+
 /// Drains audio samples from lock-free consumer, downsamples with state preservation,
 /// writes chunks to spool atomically, flushes trailing partial chunks on stop,
 /// and seals the track manifest with exact duration and sample counts.
 pub fn run_capture_worker<C: Consumer<Item = f32>>(
+    consumer: C,
+    spool_manager: Arc<AudioSpoolManager>,
+    clock: MonotonicInterviewClock,
+    config: CaptureWorkerConfig,
+    is_running: Arc<AtomicBool>,
+    dropped_samples: Arc<AtomicU64>,
+) -> Result<CaptureStats> {
+    run_capture_worker_extended(
+        consumer,
+        spool_manager,
+        clock,
+        config,
+        is_running,
+        dropped_samples,
+        None,
+    )
+}
+
+pub fn run_capture_worker_extended<C: Consumer<Item = f32>>(
     mut consumer: C,
     spool_manager: Arc<AudioSpoolManager>,
     clock: MonotonicInterviewClock,
     config: CaptureWorkerConfig,
     is_running: Arc<AtomicBool>,
     dropped_samples: Arc<AtomicU64>,
+    level_metrics: Option<Arc<AudioLevelMetrics>>,
 ) -> Result<CaptureStats> {
     let target_sample_rate = 16000u32;
     let samples_per_chunk = ((target_sample_rate as u64 * config.chunk_duration_ms) / 1000) as usize;
@@ -78,6 +118,12 @@ pub fn run_capture_worker<C: Consumer<Item = f32>>(
         }
 
         if !raw_samples_buf.is_empty() {
+            if let Some(ref lm) = level_metrics {
+                let rms = crate::resampler::calculate_rms_f32(&raw_samples_buf);
+                let peak = crate::resampler::calculate_peak_f32(&raw_samples_buf);
+                lm.update(rms, peak);
+            }
+
             let converted = converter.process_input(&raw_samples_buf);
             chunk_accumulator.extend(converted);
 
@@ -112,6 +158,10 @@ pub fn run_capture_worker<C: Consumer<Item = f32>>(
         }
 
         std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+
+    if let Some(ref lm) = level_metrics {
+        lm.update(0.0, 0.0);
     }
 
     // 1. Drain all remaining samples in ring buffer
@@ -239,9 +289,17 @@ pub struct CaptureHandle {
     worker_thread: Option<std::thread::JoinHandle<Result<CaptureStats>>>,
     dropped_samples: Arc<AtomicU64>,
     stream_error: Arc<std::sync::Mutex<Option<String>>>,
+    level_metrics: Arc<AudioLevelMetrics>,
 }
 
 impl CaptureHandle {
+    pub fn audio_levels(&self) -> (f32, f32) {
+        if !self.is_running.load(Ordering::Relaxed) {
+            return (0.0, 0.0);
+        }
+        self.level_metrics.get()
+    }
+
     pub fn pause(&self) -> Result<()> {
         if let Some(ref ctrl) = self.stream_ctrl {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -424,15 +482,18 @@ pub fn start_device_capture(
         start_offset_ms,
     };
 
+    let level_metrics = Arc::new(AudioLevelMetrics::default());
+    let level_metrics_worker = level_metrics.clone();
     let dropped_worker = dropped_samples.clone();
     let worker_thread = std::thread::spawn(move || {
-        run_capture_worker(
+        run_capture_worker_extended(
             consumer,
             spool_manager,
             clock,
             config,
             is_running_clone,
             dropped_worker,
+            Some(level_metrics_worker),
         )
     });
 
@@ -443,6 +504,7 @@ pub fn start_device_capture(
         worker_thread: Some(worker_thread),
         dropped_samples,
         stream_error,
+        level_metrics,
     })
 }
 

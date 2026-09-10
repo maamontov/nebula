@@ -18,6 +18,7 @@ from backend.adapters.stt import OpenAICompatibleSTTAdapter
 from backend.core.audio_utils import pcm_s16le_to_wav_bytes
 from backend.core.evidence_validator import validate_proposal
 
+from backend.core.matcher import QuestionMatcher
 from backend.core.revisions import TranscriptDiffEngine
 from backend.core.summary_generator import ExecutiveSummaryGenerator
 from backend.core.profiles import (
@@ -150,23 +151,25 @@ class PipelineWorker:
 
 
     async def _handle_evaluate(self, interview_id: str, payload: dict[str, Any]) -> None:
-        if not self.repo.get_interview(interview_id):
+        inv = self.repo.get_interview(interview_id)
+        if not inv:
             logger.warning("Interview %s was deleted before evaluation. Discarding.", interview_id)
             return
 
         question_id = payload["question_id"]
-        rubric_rev = payload.get("rubric_revision_id", "rub-rev-1")
-        trans_rev = payload.get("transcript_revision_id", "trans-rev-1")
+        rubric_rev = payload.get("rubric_revision_id") or inv.get("active_rubric_revision_id") or "rub-rev-1"
+        trans_rev = payload.get("transcript_revision_id") or inv.get("active_transcript_revision_id") or "trans-rev-1"
 
         # 1. Fetch Question details and criteria from latest interview plan
         plan_dict = self.repo.get_latest_plan(interview_id)
         question_text = ""
         criteria = []
+        questions = []
         if plan_dict and "payload" in plan_dict:
             questions = plan_dict["payload"].get("questions", [])
             for q in questions:
                 if q.get("id") == question_id:
-                    question_text = q.get("text", "")
+                    question_text = q.get("prompt") or q.get("text", "")
                     criteria = q.get("criteria", [])
                     break
 
@@ -178,7 +181,9 @@ class PipelineWorker:
                 rubric_description = "Technical depth & correctness"
 
         # 2. Fetch transcript segments and associations for this interview
-        all_segments = self.repo.get_transcript_segments(interview_id)
+        all_segments = self.repo.get_transcript_segments(interview_id, revision_id=trans_rev)
+        if not all_segments:
+            all_segments = self.repo.get_transcript_segments(interview_id)
         assocs = self.repo.get_associations(interview_id)
 
         # Identify candidate speech segments associated with this question
@@ -188,16 +193,30 @@ class PipelineWorker:
             if s["id"] in associated_seg_ids and str(s.get("track_id", "")).lower() in ("candidate", "tracktype.candidate")
         ]
 
-        # If no associated segments found, look for candidate segments or payload fallback
-        if not candidate_segments_data:
-            cand_all = [
+        # If no associations for this question, run QuestionMatcher across all plan questions
+        if not candidate_segments_data and questions and all_segments:
+            matcher = QuestionMatcher()
+            match_results = matcher.associate_segments(questions, all_segments, existing_associations=assocs)
+            for r in match_results:
+                assoc_id = f"assoc-{uuid.uuid4().hex[:8]}"
+                self.repo.save_association(
+                    assoc_id=assoc_id,
+                    interview_id=interview_id,
+                    question_id=r.question_id,
+                    segment_id=r.segment_id,
+                    confidence=r.confidence,
+                    is_ambiguous=r.is_ambiguous,
+                    is_manually_adjusted=False,
+                    notes=r.notes,
+                )
+            assocs = self.repo.get_associations(interview_id)
+            associated_seg_ids = {a["segment_id"] for a in assocs if a.get("question_id") == question_id}
+            candidate_segments_data = [
                 s for s in all_segments
-                if str(s.get("track_id", "")).lower() in ("candidate", "tracktype.candidate")
+                if s["id"] in associated_seg_ids and str(s.get("track_id", "")).lower() in ("candidate", "tracktype.candidate")
             ]
-            if cand_all and not payload.get("candidate_text"):
-                candidate_segments_data = cand_all
 
-        # Backwards-compatibility fallback if no segments in DB (e.g. from direct payload)
+        # Backwards-compatibility fallback if provided in payload directly (e.g. mock unit tests)
         if not candidate_segments_data and payload.get("candidate_text"):
             candidate_segments_data = [
                 {
@@ -209,18 +228,49 @@ class PipelineWorker:
                 }
             ]
 
-        # 3. Build candidate speech text with explicit individual segment IDs
-        if candidate_segments_data:
-            transcript_content = "\n".join(
-                f"[{s['id']}]: \"{s.get('text', '').strip()}\""
-                for s in candidate_segments_data
-            )
-            primary_seg_id = candidate_segments_data[0]["id"]
-        else:
-            transcript_content = "(Кандидат не дал ответа на этот вопрос)"
-            primary_seg_id = "seg-none"
-
         first_crit_id = criteria[0]["id"] if criteria else "criterion-core"
+
+        # If STILL no candidate speech segments for this question, record explicit unanswered proposal
+        if not candidate_segments_data:
+            logger.info("No candidate speech found for question %s in interview %s. Creating unanswered proposal.", question_id, interview_id)
+            empty_scores = [
+                {
+                    "criterion_id": c.get("id", first_crit_id),
+                    "score": None,
+                    "explanation": "Ответ кандидата отсутствует (нет сопоставленных сегментов речи).",
+                    "evidence": [],
+                }
+                for c in (criteria if criteria else [{"id": first_crit_id}])
+            ]
+            prop_id = f"prop-{uuid.uuid4().hex[:8]}"
+            provider_val = getattr(self.provider, "id", None)
+            prov_id = provider_val if isinstance(provider_val, str) else "system"
+            model_val = getattr(getattr(self.llm_adapter, "model", None), "upstream_model_id", None)
+            if not isinstance(model_val, str):
+                model_val = getattr(self.llm_adapter, "model_id", None)
+            mod_id = model_val if isinstance(model_val, str) else "system-no-answer"
+
+            self.repo.save_assessment_proposal(
+                proposal_id=prop_id,
+                interview_id=interview_id,
+                question_id=question_id,
+                model_profile_id=mod_id,
+                scores=empty_scores,
+                critical_errors=[],
+                rubric_revision_id=rubric_rev,
+                transcript_revision_id=trans_rev,
+                is_rejected=False,
+                validation_errors=[],
+                provider_id=prov_id,
+            )
+            return
+
+        # 3. Build candidate speech text with explicit individual segment IDs
+        transcript_content = "\n".join(
+            f"[{s['id']}]: \"{s.get('text', '').strip()}\""
+            for s in candidate_segments_data
+        )
+        primary_seg_id = candidate_segments_data[0]["id"]
 
         schema_desc = f"""
 Respond strictly with a JSON object conforming to:
@@ -377,22 +427,38 @@ Respond strictly with a JSON object conforming to:
         if is_rejected:
             logger.warning("Evidence validation failed for proposal %s: %s", proposal.id, validation.errors)
 
-        if not self.repo.get_interview(interview_id):
+        current_inv = self.repo.get_interview(interview_id)
+        if not current_inv:
             logger.warning("Interview %s was deleted before saving evaluation proposal.", interview_id)
             return
+
+        is_stale = False
+        stale_reason = None
+        curr_rub = current_inv.get("active_rubric_revision_id") or "rub-rev-1"
+        curr_trans = current_inv.get("active_transcript_revision_id") or "trans-rev-1"
+        if curr_rub != rubric_rev or curr_trans != trans_rev:
+            is_stale = True
+            stale_reason = f"Revisions changed during evaluation (eval: {rubric_rev}/{trans_rev}, current: {curr_rub}/{curr_trans})"
+            logger.warning("Proposal %s is stale: %s", proposal.id, stale_reason)
+
+        provider_val = getattr(self.provider, "id", None)
+        prov_id = provider_val if isinstance(provider_val, str) else "system"
+        mod_id = actual_model_id if isinstance(actual_model_id, str) else str(actual_model_id)
 
         self.repo.save_assessment_proposal(
             proposal_id=proposal.id,
             interview_id=interview_id,
             question_id=question_id,
-            model_profile_id=actual_model_id,
+            model_profile_id=mod_id,
             scores=scores,
             critical_errors=critical_errors,
             rubric_revision_id=rubric_rev,
             transcript_revision_id=trans_rev,
+            is_stale=is_stale,
+            stale_reason=stale_reason,
             is_rejected=is_rejected,
             validation_errors=validation_errors,
-            provider_id=self.provider.id if hasattr(self.provider, "id") else str(self.provider),
+            provider_id=prov_id,
             fallback_metadata=fallback_metadata,
         )
 

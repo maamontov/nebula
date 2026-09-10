@@ -7,6 +7,11 @@ pub fn calculate_rms_f32(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f32).sqrt()
 }
 
+/// Calculates peak amplitude of audio samples in range [0.0, 1.0].
+pub fn calculate_peak_f32(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()))
+}
+
 /// Calculates RMS level for PCM 16-bit signed integer samples.
 pub fn calculate_rms_i16(samples: &[i16]) -> f32 {
     if samples.is_empty() {
