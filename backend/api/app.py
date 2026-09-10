@@ -157,7 +157,8 @@ class ReassociateSegmentRequest(BaseModel):
 class BatchRetranscribeRequest(BaseModel):
     new_revision_id: str = "trans-rev-2"
     old_revision_id: str = "trans-rev-1"
-    segments: list[dict[str, Any]] = Field(default_factory=list)
+    segments: list[dict[str, Any]] | None = None
+    provenance: str = "batch_stt"
 
 
 class ReviewAssessmentWithRevisionRequest(BaseModel):
@@ -174,6 +175,7 @@ class ConfirmSummaryRequest(BaseModel):
     reviewer_id: str
     confirmed_markdown: str
     confirmed_recommendation: str
+    expected_transcript_revision: str | None = None
 
 
 class FinalizeReportRequest(BaseModel):
@@ -181,6 +183,7 @@ class FinalizeReportRequest(BaseModel):
     summary_markdown: str
     hiring_recommendation: str
     audio_limitations: list[str] | None = None
+    expected_transcript_revision: str | None = None
 
 
 class ReopenRevisionRequest(BaseModel):
@@ -281,6 +284,8 @@ def compute_interview_scoring(
 
         domain_assessments = []
         for ha in human_assessments:
+            if ha.get("is_stale"):
+                continue  # Stale human assessments do not contribute to active score
             crit_scores = []
             for sc in ha.get("scores", []):
                 crit_scores.append(
@@ -316,6 +321,7 @@ def compute_interview_scoring(
 @app.get("/api/v1/interviews/{interview_id}")
 async def get_interview_endpoint(
     interview_id: str,
+    revision_id: str | None = None,
     repo: Repository = Depends(get_repository),
 ):
     validate_safe_id(interview_id, "interview_id")
@@ -323,8 +329,11 @@ async def get_interview_endpoint(
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
 
+    target_rev = revision_id or inv.get("active_transcript_revision_id") or "trans-rev-1"
     plan = repo.get_latest_plan(interview_id)
-    segments = repo.get_transcript_segments(interview_id)
+    segments = repo.get_transcript_segments(interview_id, revision_id=target_rev)
+    if not segments and not revision_id:
+        segments = repo.get_transcript_segments(interview_id)
     proposals = repo.get_assessment_proposals(interview_id)
     human_assessments = repo.get_human_assessments(interview_id)
     plan_payload = plan["payload"] if plan else None
@@ -834,6 +843,42 @@ async def get_transcript_diff_endpoint(
     }
 
 
+@app.get("/api/v1/interviews/{interview_id}/revisions/transcript")
+async def get_transcript_revisions_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    revs = repo.get_transcript_revisions(interview_id)
+    active_rev = inv.get("active_transcript_revision_id") or "trans-rev-1"
+    return {
+        "interview_id": interview_id,
+        "active_revision_id": active_rev,
+        "revisions": revs,
+    }
+
+
+@app.get("/api/v1/interviews/{interview_id}/revisions/transcript/{revision_id}/segments")
+async def get_revision_segments_endpoint(
+    interview_id: str,
+    revision_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    segments = repo.get_transcript_segments(interview_id, revision_id=revision_id)
+    return {
+        "interview_id": interview_id,
+        "revision_id": revision_id,
+        "segments": segments,
+    }
+
+
 @app.post("/api/v1/interviews/{interview_id}/assessments/{question_id}/review")
 async def review_assessment_endpoint(
     interview_id: str,
@@ -847,15 +892,15 @@ async def review_assessment_endpoint(
     if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
         raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
 
-    # Conflict check: verify expected transcript revision against latest revision
+    # Conflict check: verify expected transcript revision against active revision
     revs = repo.get_transcript_revisions(interview_id)
-    latest_rev = revs[-1]["id"] if revs else "trans-rev-1"
+    active_rev = inv.get("active_transcript_revision_id") or (revs[-1]["id"] if revs else "trans-rev-1")
 
-    if payload.expected_transcript_revision != latest_rev:
+    if payload.expected_transcript_revision != active_rev:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Revision conflict: active transcript revision is '{latest_rev}', "
+                f"Revision conflict: active transcript revision is '{active_rev}', "
                 f"but review was submitted for '{payload.expected_transcript_revision}'. "
                 "Please refresh and review the updated transcript before submitting."
             ),
@@ -940,6 +985,18 @@ async def confirm_summary_endpoint(
     if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
         raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
 
+    # Validate optimistic concurrency against active transcript revision
+    active_rev = inv.get("active_transcript_revision_id") or "trans-rev-1"
+    if payload.expected_transcript_revision and payload.expected_transcript_revision != active_rev:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Revision conflict: active transcript revision is '{active_rev}', "
+                f"but summary confirmation was submitted for '{payload.expected_transcript_revision}'. "
+                "Please review the updated transcript before confirming summary."
+            ),
+        )
+
     try:
         repo.confirm_summary(
             interview_id=interview_id,
@@ -969,13 +1026,27 @@ async def finalize_report_endpoint(
     payload: FinalizeReportRequest,
     repo: Repository = Depends(get_repository),
 ):
-    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    active_rev = inv.get("active_transcript_revision_id") or "trans-rev-1"
+    if payload.expected_transcript_revision and payload.expected_transcript_revision != active_rev:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Revision conflict: active transcript revision is '{active_rev}', "
+                f"but finalization was submitted for '{payload.expected_transcript_revision}'. "
+                "Please review the updated transcript before finalizing."
+            ),
+        )
+
     try:
         return repo.finalize_interview(
             interview_id=interview_id,
+            confirmed_by=payload.confirmed_by,
             summary_markdown=payload.summary_markdown,
             hiring_recommendation=payload.hiring_recommendation,
-            confirmed_by=payload.confirmed_by,
             audio_limitations=payload.audio_limitations,
         )
     except KeyError as e:
@@ -986,6 +1057,8 @@ async def finalize_report_endpoint(
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/v1/interviews/{interview_id}/revisions/reopen")

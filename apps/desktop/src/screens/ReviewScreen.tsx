@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { InterviewPlan, AssessmentProposal, TranscriptSegment, HumanAssessment } from '../types';
 import {
   reviewAssessment,
@@ -8,6 +8,9 @@ import {
   getSummary,
   confirmSummary,
   finalizeInterviewReport,
+  startBatchRetranscribe,
+  getTranscriptDiff,
+  getTranscriptRevisions,
 } from '../services/api';
 import {
   Check,
@@ -27,6 +30,9 @@ import {
   AlertTriangle,
   XCircle,
   FileCheck2,
+  RefreshCw,
+  GitCompare,
+  X,
 } from 'lucide-react';
 
 interface ReviewScreenProps {
@@ -46,6 +52,17 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [criterionScores, setCriterionScores] = useState<Record<string, Record<string, number>>>({});
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [activeRevisionId, setActiveRevisionId] = useState<string>('trans-rev-1');
+  const [availableRevisions, setAvailableRevisions] = useState<Array<{
+    revision_id: string;
+    segment_count: number;
+    is_active: boolean;
+  }>>([]);
+  const [isRetranscribing, setIsRetranscribing] = useState(false);
+  const [retranscribeSuccess, setRetranscribeSuccess] = useState<string | null>(null);
+  const [retranscribeError, setRetranscribeError] = useState<string | null>(null);
+  const [diffData, setDiffData] = useState<any | null>(null);
+  const [showDiffModal, setShowDiffModal] = useState(false);
+  const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [serverScoring, setServerScoring] = useState<{
     final_score_100: number | null;
     coverage_percentage: number;
@@ -77,92 +94,106 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [exportError, setExportError] = useState<string | null>(null);
   const [evalWarning, setEvalWarning] = useState<string | null>(null);
 
-  useEffect(() => {
-    async function loadData() {
-      try {
-        const data = await getInterview(interviewId);
-        const existingProps: AssessmentProposal[] = data.assessment_proposals || [];
-        const existingHuman: HumanAssessment[] = (data.human_assessments as HumanAssessment[]) || [];
-        const initialScores: Record<string, number> = {};
-        const initialCritScores: Record<string, Record<string, number>> = {};
-        const initialNotes: Record<string, string> = {};
-        const exclusionsMap: Record<string, { isExcluded: boolean; reason: string }> = {};
+  const loadData = useCallback(async () => {
+    try {
+      const data = await getInterview(interviewId);
+      const existingProps: AssessmentProposal[] = data.assessment_proposals || [];
+      const existingHuman: HumanAssessment[] = (data.human_assessments as HumanAssessment[]) || [];
+      const initialScores: Record<string, number> = {};
+      const initialCritScores: Record<string, Record<string, number>> = {};
+      const initialNotes: Record<string, string> = {};
+      const exclusionsMap: Record<string, { isExcluded: boolean; reason: string }> = {};
 
-        if (data.interview?.status) {
-          setInterviewStatus(data.interview.status);
-        }
-
-        // Baseline proposals from AI
-        existingProps.forEach((p) => {
-          if (p.scores && p.scores.length > 0) {
-            initialCritScores[p.question_id] = {};
-            p.scores.forEach((sc) => {
-              initialCritScores[p.question_id][sc.criterion_id] = sc.score;
-            });
-            initialScores[p.question_id] = p.scores[0].score;
-          }
-        });
-
-        // Authoritative human assessments take precedence
-        existingHuman.forEach((ha) => {
-          if (ha.is_excluded) {
-            exclusionsMap[ha.question_id] = {
-              isExcluded: true,
-              reason: ha.exclusion_reason || '',
-            };
-          }
-          if (ha.scores && ha.scores.length > 0) {
-            if (!initialCritScores[ha.question_id]) initialCritScores[ha.question_id] = {};
-            let sum = 0;
-            ha.scores.forEach((sc) => {
-              initialCritScores[ha.question_id][sc.criterion_id] = sc.score;
-              sum += sc.score;
-            });
-            initialScores[ha.question_id] = Math.round(sum / ha.scores.length);
-          }
-          if (ha.reviewer_notes) {
-            initialNotes[ha.question_id] = ha.reviewer_notes;
-          }
-        });
-
-        setProposals(existingProps);
-        setHumanAssessments(existingHuman);
-        setQuestionScores(initialScores);
-        setCriterionScores(initialCritScores);
-        setReviewerNotes(initialNotes);
-        setExcludedQuestions(exclusionsMap);
-        setSegments(data.transcript_segments || []);
-
-        if (data.interview?.active_transcript_revision_id) {
-          setActiveRevisionId(data.interview.active_transcript_revision_id);
-        }
-        if (data.scoring) {
-          setServerScoring(data.scoring);
-        }
-
-        // Load Executive Summary
-        try {
-          const sumData = await getSummary(interviewId);
-          if (sumData.has_summary) {
-            setIsSummaryConfirmed(Boolean(sumData.is_confirmed));
-            if (sumData.confirmed_markdown) {
-              setSummaryMarkdown(sumData.confirmed_markdown);
-            } else if (sumData.summary?.overview) {
-              setSummaryMarkdown(sumData.summary.overview);
-            }
-            if (sumData.confirmed_recommendation) {
-              setHiringRecommendation(sumData.confirmed_recommendation);
-            }
-          }
-        } catch (sumErr) {
-          console.warn('Failed to load executive summary:', sumErr);
-        }
-      } catch (err) {
-        console.warn('Failed to load review data from backend:', err);
+      if (data.interview?.status) {
+        setInterviewStatus(data.interview.status);
       }
+
+      // Baseline proposals from AI
+      existingProps.forEach((p) => {
+        if (p.scores && p.scores.length > 0) {
+          initialCritScores[p.question_id] = {};
+          p.scores.forEach((sc) => {
+            initialCritScores[p.question_id][sc.criterion_id] = sc.score;
+          });
+          initialScores[p.question_id] = p.scores[0].score;
+        }
+      });
+
+      // Authoritative human assessments take precedence
+      existingHuman.forEach((ha) => {
+        if (ha.is_excluded) {
+          exclusionsMap[ha.question_id] = {
+            isExcluded: true,
+            reason: ha.exclusion_reason || '',
+          };
+        }
+        if (ha.scores && ha.scores.length > 0) {
+          if (!initialCritScores[ha.question_id]) initialCritScores[ha.question_id] = {};
+          let sum = 0;
+          ha.scores.forEach((sc) => {
+            initialCritScores[ha.question_id][sc.criterion_id] = sc.score;
+            sum += sc.score;
+          });
+          initialScores[ha.question_id] = Math.round(sum / ha.scores.length);
+        }
+        if (ha.reviewer_notes) {
+          initialNotes[ha.question_id] = ha.reviewer_notes;
+        }
+      });
+
+      setProposals(existingProps);
+      setHumanAssessments(existingHuman);
+      setQuestionScores(initialScores);
+      setCriterionScores(initialCritScores);
+      setReviewerNotes(initialNotes);
+      setExcludedQuestions(exclusionsMap);
+      setSegments(data.transcript_segments || []);
+
+      if (data.interview?.active_transcript_revision_id) {
+        setActiveRevisionId(data.interview.active_transcript_revision_id);
+      }
+      if (data.scoring) {
+        setServerScoring(data.scoring);
+      }
+
+      // Load Executive Summary
+      try {
+        const sumData = await getSummary(interviewId);
+        if (sumData.has_summary) {
+          setIsSummaryConfirmed(Boolean(sumData.is_confirmed));
+          if (sumData.confirmed_markdown) {
+            setSummaryMarkdown(sumData.confirmed_markdown);
+          } else if (sumData.summary?.overview) {
+            setSummaryMarkdown(sumData.summary.overview);
+          }
+          if (sumData.confirmed_recommendation) {
+            setHiringRecommendation(sumData.confirmed_recommendation);
+          }
+        }
+      } catch (sumErr) {
+        console.warn('Failed to load executive summary:', sumErr);
+      }
+
+      // Load Transcript Revisions
+      try {
+        const revsData = await getTranscriptRevisions(interviewId);
+        if (revsData.revisions) {
+          setAvailableRevisions(revsData.revisions);
+        }
+        if (revsData.active_revision_id) {
+          setActiveRevisionId(revsData.active_revision_id);
+        }
+      } catch (revErr) {
+        console.warn('Failed to load transcript revisions:', revErr);
+      }
+    } catch (err) {
+      console.warn('Failed to load review data from backend:', err);
     }
+  }, [interviewId]);
+
+  useEffect(() => {
     loadData();
-  }, [interviewId, plan]);
+  }, [loadData]);
 
   const isFinalized = interviewStatus === 'finalized';
 
@@ -227,6 +258,36 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     }
   };
 
+  const handleBatchRetranscribe = async () => {
+    if (isFinalized || isRetranscribing) return;
+    setIsRetranscribing(true);
+    setRetranscribeError(null);
+    setRetranscribeSuccess(null);
+    try {
+      const nextRev = activeRevisionId === 'trans-rev-1' ? 'trans-rev-2' : `trans-rev-${Date.now().toString().slice(-4)}`;
+      const res = await startBatchRetranscribe(interviewId, nextRev);
+      setRetranscribeSuccess(`Пакетная перестенограмма успешно завершена! Активная ревизия переключена на: ${res.new_revision_id}`);
+      await loadData();
+    } catch (err: any) {
+      setRetranscribeError(err?.message || 'Ошибка запуска пакетной перестенограммы');
+    } finally {
+      setIsRetranscribing(false);
+    }
+  };
+
+  const handleLoadDiff = async () => {
+    setIsLoadingDiff(true);
+    try {
+      const diff = await getTranscriptDiff(interviewId, 'trans-rev-1', activeRevisionId);
+      setDiffData(diff);
+      setShowDiffModal(true);
+    } catch (err: any) {
+      alert(`Ошибка загрузки различий ревизий: ${err?.message || err}`);
+    } finally {
+      setIsLoadingDiff(false);
+    }
+  };
+
   const handleSaveApproval = async (questionId: string) => {
     if (isFinalized) return;
     const q = plan.questions.find((x) => x.id === questionId);
@@ -259,14 +320,12 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         setSavedSuccess((prev) => ({ ...prev, [questionId]: false }));
       }, 3000);
 
-      // Refresh data to update server scoring
-      const updated = await getInterview(interviewId);
-      if (updated.scoring) setServerScoring(updated.scoring);
-      if (updated.human_assessments) setHumanAssessments(updated.human_assessments as HumanAssessment[]);
+      await loadData();
     } catch (e: any) {
       console.error('Save review error:', e);
       if (e?.message?.includes('409')) {
-        alert('Конфликт версий: стенограмма собеседования была изменена или интервью финализировано.');
+        alert('Конфликт версий (409): стенограмма собеседования была изменена в новой ревизии. Данные страницы будут обновлены.');
+        await loadData();
       } else {
         alert(`Ошибка при сохранении оценки: ${e?.message || e}`);
       }
@@ -302,9 +361,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           is_excluded: true,
           exclusion_reason: reason.trim(),
         });
-        const updated = await getInterview(interviewId);
-        if (updated.scoring) setServerScoring(updated.scoring);
-        if (updated.human_assessments) setHumanAssessments(updated.human_assessments as HumanAssessment[]);
+        await loadData();
       } catch (err: any) {
         alert(`Ошибка при исключении вопроса: ${err?.message || err}`);
       }
@@ -328,12 +385,18 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         reviewer_id: 'lead-interviewer',
         confirmed_markdown: summaryMarkdown.trim(),
         confirmed_recommendation: hiringRecommendation,
+        expected_transcript_revision: activeRevisionId,
       });
       setIsSummaryConfirmed(true);
       setSummarySavedSuccess(true);
       setTimeout(() => setSummarySavedSuccess(false), 3000);
     } catch (err: any) {
-      alert(`Ошибка при сохранении резюме: ${err?.message || err}`);
+      if (err?.message?.includes('409') || err?.message?.includes('Конфликт')) {
+        alert('Конфликт версий (409): стенограмма собеседования была обновлена. Страница перезагрузит актуальную ревизию.');
+        await loadData();
+      } else {
+        alert(`Ошибка при сохранении резюме: ${err?.message || err}`);
+      }
     } finally {
       setIsSavingSummary(false);
     }
@@ -352,11 +415,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         }
         continue;
       }
-      const hasHuman = humanAssessments.some(
-        (ha) => ha.question_id === q.id && !ha.is_stale && !ha.is_excluded && ha.scores && ha.scores.length > 0
-      );
-      if (!hasHuman) {
+      const human = humanAssessments.find((ha) => ha.question_id === q.id);
+      if (!human || !human.scores || human.scores.length === 0) {
         blockers.push(`Вопрос «${q.title || q.text}» не оценен человеком (требуется подтверждение оценки или явное исключение).`);
+      } else if (human.is_stale || human.transcript_revision_id !== activeRevisionId) {
+        blockers.push(`Вопрос «${q.title || q.text}»: оценка устарела после обновления стенограммы (ревизия ${human.transcript_revision_id || 'старая'} != актуальная ${activeRevisionId}). Сохраните оценку повторно.`);
       }
     }
 
@@ -386,14 +449,19 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         summary_markdown: summaryMarkdown.trim(),
         hiring_recommendation: hiringRecommendation,
         confirmed_by: 'lead-interviewer',
+        expected_transcript_revision: activeRevisionId,
       });
       setInterviewStatus('finalized');
       setFinalizedChecksum(res.sha256_checksum);
       setFinalizeSuccess(true);
-      const updated = await getInterview(interviewId);
-      if (updated.scoring) setServerScoring(updated.scoring);
+      await loadData();
     } catch (err: any) {
-      setFinalizeError(err?.message || 'Ошибка финализации отчёта');
+      if (err?.message?.includes('409') || err?.message?.includes('Конфликт')) {
+        setFinalizeError('Конфликт финализации (409): обнаружены устаревшие оценки или несовпадение ревизии стенограммы. Данные обновлены, проверьте решения.');
+        await loadData();
+      } else {
+        setFinalizeError(err?.message || 'Ошибка финализации отчёта');
+      }
     } finally {
       setIsFinalizing(false);
     }
@@ -536,6 +604,187 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         </div>
       </div>
 
+      {/* Revision Control & Batch Retranscribe Bar */}
+      <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 flex flex-wrap items-center justify-between gap-3 shadow-md">
+        <div className="flex items-center space-x-3">
+          <span className="text-xs font-semibold text-slate-300">Активная стенограмма:</span>
+          <span className="px-2.5 py-1 text-xs font-mono font-bold text-indigo-300 bg-indigo-950/80 border border-indigo-700/80 rounded-lg shadow-inner">
+            {activeRevisionId}
+          </span>
+          {availableRevisions.length > 0 && (
+            <span className="text-[11px] text-slate-400">
+              (версий в базе: {availableRevisions.length})
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center space-x-2">
+          {!isFinalized && (
+            <button
+              type="button"
+              onClick={handleBatchRetranscribe}
+              disabled={isRetranscribing}
+              className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-medium rounded-lg transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Запустить повторное STT-распознавание аудиосессии с фиксацией новой ревизии"
+            >
+              {isRetranscribing ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+              ) : (
+                <RefreshCw className="w-3.5 h-3.5 text-indigo-400" />
+              )}
+              <span>{isRetranscribing ? 'Пакетная STT...' : 'Пакетная перестенограмма'}</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={handleLoadDiff}
+            disabled={isLoadingDiff}
+            className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-medium rounded-lg transition cursor-pointer disabled:opacity-50"
+            title="Просмотреть анализ изменений между ревизиями стенограммы"
+          >
+            {isLoadingDiff ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+            ) : (
+              <GitCompare className="w-3.5 h-3.5 text-amber-400" />
+            )}
+            <span>Анализ изменений (Diff)</span>
+          </button>
+        </div>
+      </div>
+
+      {retranscribeSuccess && (
+        <div className="p-3 bg-emerald-950/60 border border-emerald-800 text-emerald-300 text-xs rounded-lg flex items-center justify-between">
+          <div className="flex items-center space-x-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span>{retranscribeSuccess}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRetranscribeSuccess(null)}
+            className="text-emerald-400 hover:text-emerald-200 text-xs cursor-pointer"
+          >
+            Закрыть
+          </button>
+        </div>
+      )}
+
+      {retranscribeError && (
+        <div className="p-3 bg-rose-950/60 border border-rose-800 text-rose-300 text-xs rounded-lg flex items-center justify-between">
+          <div className="flex items-center space-x-2">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{retranscribeError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRetranscribeError(null)}
+            className="text-rose-400 hover:text-rose-200 text-xs cursor-pointer"
+          >
+            Закрыть
+          </button>
+        </div>
+      )}
+
+      {/* Diff Inspection Modal */}
+      {showDiffModal && diffData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4">
+          <div className="glass-panel w-full max-w-2xl bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 space-y-4 max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center space-x-2">
+                <GitCompare className="w-5 h-5 text-amber-400" />
+                <h3 className="text-base font-bold text-slate-100">
+                  Сравнение ревизий стенограммы
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowDiffModal(false)}
+                className="p-1 text-slate-400 hover:text-slate-200 rounded-lg hover:bg-slate-800 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="text-xs text-slate-300 space-y-2">
+              <div className="grid grid-cols-3 gap-2 bg-slate-950/80 p-3 rounded-lg border border-slate-800 text-center">
+                <div>
+                  <span className="text-[10px] text-slate-500 uppercase font-semibold block">Базовая ревизия</span>
+                  <span className="font-mono text-indigo-300 font-bold">{diffData.from_revision}</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-500 uppercase font-semibold block">Сравниваемая</span>
+                  <span className="font-mono text-emerald-300 font-bold">{diffData.to_revision}</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-500 uppercase font-semibold block">Изменено сегментов</span>
+                  <span className="font-mono text-amber-300 font-bold">{diffData.total_segment_diffs}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="overflow-y-auto space-y-3 flex-1 pr-1">
+              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block">
+                Влияние на вопросы ({diffData.question_reports?.length || 0}):
+              </span>
+              {diffData.question_reports && diffData.question_reports.length > 0 ? (
+                diffData.question_reports.map((qr: any) => {
+                  const q = plan.questions.find((x) => x.id === qr.question_id);
+                  return (
+                    <div
+                      key={qr.question_id}
+                      className={`p-3 rounded-lg border text-xs space-y-1.5 ${
+                        qr.is_modified
+                          ? 'bg-amber-950/30 border-amber-800/60 text-amber-200'
+                          : 'bg-slate-950/40 border-slate-800 text-slate-300'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-slate-200">
+                          {q ? q.title || q.text : qr.question_id}
+                        </span>
+                        {qr.is_modified ? (
+                          <span className="px-2 py-0.5 text-[10px] font-bold text-amber-400 bg-amber-950/80 border border-amber-800 rounded">
+                            Изменено (Ratio: {Math.round((qr.diff_ratio || 0) * 100)}%)
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 text-[10px] font-semibold text-slate-400 bg-slate-800 rounded">
+                            Без изменений
+                          </span>
+                        )}
+                      </div>
+                      {qr.stale_reason && (
+                        <p className="text-[11px] text-amber-300/90 italic">
+                          Причина инвалидации: {qr.stale_reason}
+                        </p>
+                      )}
+                      <div className="flex items-center space-x-3 text-[10px] text-slate-400 font-mono">
+                        <span>Сломанных цитат: {qr.broken_evidence_count || 0}</span>
+                        <span>•</span>
+                        <span>Измененных сегментов: {qr.changed_segments_count || 0}</span>
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                <p className="text-xs text-slate-500 italic py-2">
+                  Изменений, влияющих на вопросы, не зафиксировано.
+                </p>
+              )}
+            </div>
+
+            <div className="flex justify-end pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setShowDiffModal(false)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg transition cursor-pointer"
+              >
+                Закрыть
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Interactive Transcript Drawer / Accordion */}
       <div className="border border-slate-800 rounded-xl bg-slate-900/40 overflow-hidden">
         <button
@@ -624,7 +873,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           const isSaved = savedSuccess[q.id];
           const isExcluded = excludedQuestions[q.id]?.isExcluded;
           const exclusionReason = excludedQuestions[q.id]?.reason;
-          const hasHuman = humanAssessments.some((ha) => ha.question_id === q.id && !ha.is_stale);
+          const humanAssessment = humanAssessments.find((ha) => ha.question_id === q.id);
+          const isHumanStale = Boolean(
+            humanAssessment && (humanAssessment.is_stale || (humanAssessment.transcript_revision_id && humanAssessment.transcript_revision_id !== activeRevisionId))
+          );
+          const hasHuman = Boolean(humanAssessment && !isHumanStale && !humanAssessment.is_excluded && humanAssessment.scores && humanAssessment.scores.length > 0);
 
           return (
             <div key={q.id} className={`glass-panel p-6 rounded-xl space-y-4 ${isExcluded ? 'opacity-60 bg-slate-900/30' : ''}`}>
@@ -636,6 +889,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                       <span className="px-2 py-0.5 text-[10px] font-semibold text-rose-400 bg-rose-950/60 border border-rose-800/60 rounded flex items-center space-x-1">
                         <XCircle className="w-3 h-3" />
                         <span>Исключён из оценки</span>
+                      </span>
+                    ) : isHumanStale ? (
+                      <span className="px-2 py-0.5 text-[10px] font-semibold text-amber-400 bg-amber-950/60 border border-amber-800/60 rounded flex items-center space-x-1">
+                        <AlertTriangle className="w-3 h-3" />
+                        <span>Оценка устарела (Stale)</span>
                       </span>
                     ) : hasHuman ? (
                       <span className="px-2 py-0.5 text-[10px] font-semibold text-emerald-400 bg-emerald-950/60 border border-emerald-800/60 rounded flex items-center space-x-1">
@@ -702,6 +960,22 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
               {!isExcluded && (
                 <div className="space-y-3 bg-slate-900/50 p-4 rounded-lg border border-slate-800/80">
+                  {isHumanStale && (
+                    <div className="p-3 bg-amber-950/60 border border-amber-800 rounded-lg text-amber-200 text-xs space-y-1.5">
+                      <div className="font-bold flex items-center space-x-1.5 text-amber-300">
+                        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                        <span>Оценка устарела (Stale): стенограмма была обновлена</span>
+                      </div>
+                      <p className="text-[11px] text-amber-300/90 leading-relaxed">
+                        {humanAssessment?.stale_reason ||
+                          'Стенограмма собеседования была обновлена новой ревизией. Пожалуйста, проверьте актуальные цитаты кандидата и нажмите «Сохранить» для повторного подтверждения оценки.'}
+                      </p>
+                      <p className="text-[10px] text-amber-400/80 font-mono">
+                        Ревизия оценки: {humanAssessment?.transcript_revision_id || 'предыдущая'} • Активная стенограмма: {activeRevisionId}
+                      </p>
+                    </div>
+                  )}
+
                   {prop?.is_rejected && (
                     <div className="p-3 bg-rose-950/60 border border-rose-800 rounded-lg text-rose-200 text-xs space-y-1.5">
                       <div className="font-bold flex items-center space-x-1.5 text-rose-300">

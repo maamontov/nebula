@@ -284,6 +284,18 @@ class Repository:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def set_active_transcript_revision(self, interview_id: str, revision_id: str) -> None:
+        with self.db.transaction() as conn:
+            inv = conn.execute("SELECT id, status FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+            if not inv or inv["status"] == "deleted":
+                raise ValueError(f"Interview {interview_id} not found or deleted")
+            if inv["status"] == "finalized":
+                raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+            conn.execute(
+                "UPDATE interviews SET active_transcript_revision_id = ? WHERE id = ?",
+                (revision_id, interview_id),
+            )
+
     # -------------------------------------------------------------
     # Assessment Proposals
     # -------------------------------------------------------------
@@ -467,6 +479,15 @@ class Repository:
                     """,
                     (stale_reason, interview_id, q_id),
                 )
+            # Invalidate dependent confirmed summary if interview transcript changed
+            conn.execute(
+                """
+                UPDATE summary_proposals
+                SET is_confirmed = 0
+                WHERE interview_id = ?
+                """,
+                (interview_id,),
+            )
 
     # -------------------------------------------------------------
     # Human Assessments (Confirmed/Overridden Decisions)
@@ -819,7 +840,7 @@ class Repository:
                 ha = ha_map[q_id]
                 if ha.get("is_stale"):
                     stale_reason = ha.get("stale_reason") or "transcript revision changed"
-                    raise ValueError(
+                    raise RepositoryConflictError(
                         f"Human assessment for question '{q_id}' is stale: {stale_reason}. "
                         "Please re-confirm review against the latest transcript before finalizing."
                     )

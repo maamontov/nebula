@@ -336,6 +336,7 @@ export async function confirmSummary(
     reviewer_id: string;
     confirmed_markdown: string;
     confirmed_recommendation: string;
+    expected_transcript_revision?: string;
   }
 ): Promise<{ status: string; interview_id: string }> {
   const res = await fetch(`${API_BASE}/interviews/${interviewId}/summary/confirm`, {
@@ -344,6 +345,10 @@ export async function confirmSummary(
     body: JSON.stringify(data),
   });
   if (!res.ok) {
+    if (res.status === 409) {
+      const errBody = await res.json().catch(() => ({ detail: 'Конфликт ревизий: стенограмма была обновлена' }));
+      throw new Error(`409: ${errBody.detail || 'Конфликт ревизий'}`);
+    }
     const errBody = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(errBody.detail || `Confirm summary error: ${res.statusText}`);
   }
@@ -357,6 +362,7 @@ export async function finalizeInterviewReport(
     hiring_recommendation: string;
     confirmed_by: string;
     audio_limitations?: string[];
+    expected_transcript_revision?: string;
   }
 ): Promise<{
   status: string;
@@ -373,9 +379,40 @@ export async function finalizeInterviewReport(
     body: JSON.stringify(data),
   });
   if (!res.ok) {
+    if (res.status === 409) {
+      const errBody = await res.json().catch(() => ({ detail: 'Конфликт финализации: обнаружены устаревшие данные или несовпадение ревизий' }));
+      throw new Error(`409: ${errBody.detail || 'Конфликт финализации'}`);
+    }
     const errBody = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(errBody.detail || `Finalize report error: ${res.statusText}`);
   }
+  return res.json();
+}
+
+export async function getTranscriptRevisions(interviewId: string): Promise<{
+  interview_id: string;
+  active_revision_id: string;
+  revisions: Array<{
+    revision_id: string;
+    segment_count: number;
+    is_active: boolean;
+  }>;
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/revisions/transcript`);
+  if (!res.ok) throw new Error(`Get transcript revisions error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getTranscriptSegmentsByRevision(
+  interviewId: string,
+  revisionId: string
+): Promise<{
+  interview_id: string;
+  revision_id: string;
+  segments: TranscriptSegment[];
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/revisions/transcript/${revisionId}/segments`);
+  if (!res.ok) throw new Error(`Get transcript segments by revision error: ${res.statusText}`);
   return res.json();
 }
 

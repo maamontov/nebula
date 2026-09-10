@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 import uuid
 from typing import Any
 
@@ -412,7 +413,38 @@ Respond strictly with a JSON object conforming to:
         )
 
         # Ingest new segments
-        new_segments = payload.get("segments", [])
+        new_segments = payload.get("segments")
+        provenance = payload.get("provenance") or ("manual_import" if new_segments is not None else "batch_stt")
+        if new_segments is None:
+            chunks = self.repo.get_audio_chunks(interview_id)
+            new_segments = []
+            for c in chunks:
+                fp_str = c.get("file_path")
+                if fp_str and Path(fp_str).exists():
+                    raw_bytes = Path(fp_str).read_bytes()
+                    sr = c.get("sample_rate", 16000)
+                    ch = c.get("channels", 1)
+                    fmt = c.get("format", "pcm_s16le")
+                    if fmt == "pcm_s16le" or not raw_bytes.startswith(b"RIFF"):
+                        wav_bytes = pcm_s16le_to_wav_bytes(raw_bytes, sr, ch)
+                    else:
+                        wav_bytes = raw_bytes
+
+                    res = await self.stt_adapter.transcribe_audio(
+                        wav_bytes,
+                        filename=f"batch_{c['track_id']}_{c['sequence']}.wav",
+                        content_type="audio/wav",
+                    )
+                    text_val = res.text.strip()
+                    if text_val:
+                        new_segments.append({
+                            "id": f"seg-b-{c['track_id']}-{c['sequence']}",
+                            "track_id": c["track_id"],
+                            "start_time_ms": c["start_time_ms"],
+                            "end_time_ms": c["end_time_ms"],
+                            "text": text_val,
+                        })
+
         for seg in new_segments:
             self.repo.add_transcript_segment(
                 segment_id=seg["id"],
@@ -443,6 +475,12 @@ Respond strictly with a JSON object conforming to:
             if q_id and s_id:
                 questions_map.setdefault(q_id, []).append(s_id)
 
+        if not questions_map:
+            plan = self.repo.get_latest_plan(interview_id)
+            if plan and "payload" in plan:
+                for q in plan["payload"].get("questions", []):
+                    questions_map[q["id"]] = [s["id"] for s in old_segs]
+
         modified_questions = set()
         question_diff_reports = []
 
@@ -472,11 +510,19 @@ Respond strictly with a JSON object conforming to:
                 stale_reason=f"Стенограмма обновлена до {new_rev_id}. Обнаружены расхождения в тексте.",
             )
 
+        if not self.repo.get_interview(interview_id):
+            logger.warning("Interview %s deleted during retranscribe. Aborting activation.", interview_id)
+            return
+
+        # ONLY AFTER ALL DATA AND STATUSES ARE SAVED, ACTIVATE NEW REVISION!
+        self.repo.set_active_transcript_revision(interview_id, new_rev_id)
+
         self.repo.record_audit_event(
             event_id=f"audit-{uuid.uuid4().hex[:8]}",
             interview_id=interview_id,
             event_type="BATCH_RETRANSCRIPTION_COMPLETED",
             payload={
+                "provenance": provenance,
                 "old_revision_id": old_rev_id,
                 "new_revision_id": new_rev_id,
                 "modified_questions": list(modified_questions),
