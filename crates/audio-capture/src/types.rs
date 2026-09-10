@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum TrackType {
     Interviewer,
     Candidate,
+    Shared,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

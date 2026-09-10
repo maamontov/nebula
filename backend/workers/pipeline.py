@@ -9,12 +9,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+import struct
 import uuid
 from typing import Any
 
-from backend.adapters.llm import OpenAICompatibleAdapter
+from dotenv import load_dotenv
+
+# Ensure environment variables (.env) are loaded
+load_dotenv()
+
+from backend.adapters.llm import LLMRateLimitError, OpenAICompatibleAdapter
 from backend.adapters.resilient_llm import ResilientLLMAdapter
-from backend.adapters.stt import OpenAICompatibleSTTAdapter
+from backend.adapters.stt import OpenAICompatibleSTTAdapter, STTRateLimitError
 from backend.core.audio_utils import pcm_s16le_to_wav_bytes
 from backend.core.evidence_validator import validate_proposal
 
@@ -37,6 +43,16 @@ from contracts.domain import (
 )
 
 logger = logging.getLogger("nebula.pipeline")
+
+
+def is_pcm_silence(audio_bytes: bytes, threshold_mean_abs: float = 12.0) -> bool:
+    """Returns True if audio chunk is silence or quiet ambient noise below threshold."""
+    if len(audio_bytes) < 2:
+        return True
+    sample_count = len(audio_bytes) // 2
+    samples = struct.unpack(f"<{sample_count}h", audio_bytes[: sample_count * 2])
+    mean_abs = sum(abs(s) for s in samples) / sample_count
+    return mean_abs < threshold_mean_abs
 
 
 class PipelineWorker:
@@ -75,7 +91,9 @@ class PipelineWorker:
 
         try:
             if job_type == "TRANSCRIBE_AUDIO":
-                await self._handle_transcribe(interview_id, payload)
+                grouped_ids = await self._handle_transcribe(interview_id, payload, owner_token=owner_token)
+                for gid in grouped_ids:
+                    self.repo.complete_job(gid, owner_token=owner_token)
             elif job_type == "EVALUATE_QUESTION":
                 await self._handle_evaluate(interview_id, payload)
             elif job_type == "BATCH_RETRANSCRIBE":
@@ -108,9 +126,18 @@ class PipelineWorker:
                 event_type=f"JOB_FAILED_{job_type}",
                 payload={"job_id": job_id, "error": str(exc)},
             )
+            if isinstance(exc, (STTRateLimitError, LLMRateLimitError)):
+                retry_wait = min(getattr(exc, "retry_after", 5.0) or 5.0, 30.0)
+                logger.info("Pacing worker loop due to rate limit: sleeping %.1fs", retry_wait)
+                await asyncio.sleep(retry_wait)
             return False
 
-    async def _handle_transcribe(self, interview_id: str, payload: dict[str, Any]) -> None:
+    async def _handle_transcribe(
+        self,
+        interview_id: str,
+        payload: dict[str, Any],
+        owner_token: str | None = None,
+    ) -> list[str]:
         audio_bytes = bytes.fromhex(payload["audio_hex"])
         track_id = payload.get("track_id", "candidate")
         start_ms = payload.get("start_ms", 0)
@@ -119,6 +146,39 @@ class PipelineWorker:
         channels = payload.get("channels", 1)
         format_val = payload.get("format", "pcm_s16le")
         language = payload.get("language", "ru")
+
+        is_real_stt = (
+            isinstance(self.stt_adapter, OpenAICompatibleSTTAdapter)
+            and self.stt_adapter._external_client is None
+        )
+
+        # 1. Skip single silence chunks for real remote STT to prevent 502 upstream errors and unnecessary API calls
+        if is_real_stt and (format_val == "pcm_s16le" or not audio_bytes.startswith(b"RIFF")) and is_pcm_silence(audio_bytes):
+            logger.debug("Skipping silence chunk for interview %s (track %s, %d-%d ms)", interview_id, track_id, start_ms, end_ms)
+            return []
+
+        # 2. Dynamic batch grouping: combine waiting consecutive chunks into a coherent 3-4s phrase
+        grouped_job_ids: list[str] = []
+        if is_real_stt and format_val == "pcm_s16le":
+            adjacent = self.repo.claim_adjacent_transcribe_jobs(
+                interview_id=interview_id,
+                track_id=track_id,
+                max_additional=3,
+                owner_token=owner_token,
+            )
+            for adj_job in adjacent:
+                adj_payload = adj_job.get("payload", {})
+                adj_hex = adj_payload.get("audio_hex", "")
+                if not adj_hex:
+                    continue
+                adj_bytes = bytes.fromhex(adj_hex)
+                # If an adjacent chunk is silence, complete it and stop grouping at natural speech pause
+                if is_pcm_silence(adj_bytes):
+                    grouped_job_ids.append(adj_job["id"])
+                    break
+                audio_bytes += adj_bytes
+                end_ms = adj_payload.get("end_ms", end_ms)
+                grouped_job_ids.append(adj_job["id"])
 
         # If audio payload is raw PCM, wrap it into a compliant WAV container before STT
         if format_val == "pcm_s16le" or not audio_bytes.startswith(b"RIFF"):
@@ -134,20 +194,46 @@ class PipelineWorker:
             language=language,
         )
 
+        cleaned_text = res.text.strip()
+        # Filter out empty text, punctuation, and known Whisper silence hallucinations
+        WHISPER_HALLUCINATIONS = {
+            "продолжение следует...",
+            "продолжение следует",
+            "субтитры сделал",
+            "спасибо за просмотр",
+            "спасибо за просмотр!",
+            "до скорых встреч!",
+            "до скорых встреч",
+            "редактор субтитров",
+        }
+        if (
+            not cleaned_text
+            or cleaned_text in (".", "...", ",", "!", "?", "—", "-")
+            or cleaned_text.lower() in WHISPER_HALLUCINATIONS
+        ):
+            logger.debug("Transcribed chunk %s produced empty/hallucination text, skipping segment.", filename)
+            return grouped_job_ids
+
         if not self.repo.get_interview(interview_id):
             logger.warning("Interview %s was deleted before saving transcript segment.", interview_id)
-            return
+            return grouped_job_ids
 
         segment_id = payload.get("segment_id", f"seg-{uuid.uuid4().hex[:8]}")
+        speaker_role = payload.get("speaker_role")
+        if not speaker_role:
+            speaker_role = "unknown" if str(track_id).lower() == "shared" else str(track_id).lower()
+
         self.repo.add_transcript_segment(
             segment_id=segment_id,
             interview_id=interview_id,
             track_id=track_id,
             start_time_ms=start_ms,
             end_time_ms=end_ms,
-            text=res.text.strip(),
+            text=cleaned_text,
             is_final=True,
+            speaker_role=speaker_role,
         )
+        return grouped_job_ids
 
 
     async def _handle_evaluate(self, interview_id: str, payload: dict[str, Any]) -> None:
@@ -155,6 +241,15 @@ class PipelineWorker:
         if not inv:
             logger.warning("Interview %s was deleted before evaluation. Discarding.", interview_id)
             return
+
+        def is_candidate_segment(s: dict[str, Any]) -> bool:
+            role = str(s.get("speaker_role", "")).lower()
+            if role == "candidate":
+                return True
+            if role in ("interviewer", "unknown"):
+                return False
+            track = str(s.get("track_id", "")).lower()
+            return track in ("candidate", "tracktype.candidate")
 
         question_id = payload["question_id"]
         rubric_rev = payload.get("rubric_revision_id") or inv.get("active_rubric_revision_id") or "rub-rev-1"
@@ -186,11 +281,11 @@ class PipelineWorker:
             all_segments = self.repo.get_transcript_segments(interview_id)
         assocs = self.repo.get_associations(interview_id)
 
-        # Identify candidate speech segments associated with this question
+        # Identify candidate speech segments associated with this question (strictly exclude interviewer/unknown)
         associated_seg_ids = {a["segment_id"] for a in assocs if a.get("question_id") == question_id}
         candidate_segments_data: list[dict[str, Any]] = [
             s for s in all_segments
-            if s["id"] in associated_seg_ids and str(s.get("track_id", "")).lower() in ("candidate", "tracktype.candidate")
+            if s["id"] in associated_seg_ids and is_candidate_segment(s)
         ]
 
         # If no associations for this question, run QuestionMatcher across all plan questions
@@ -208,12 +303,13 @@ class PipelineWorker:
                     is_ambiguous=r.is_ambiguous,
                     is_manually_adjusted=False,
                     notes=r.notes,
+                    revision_id=trans_rev,
                 )
             assocs = self.repo.get_associations(interview_id)
             associated_seg_ids = {a["segment_id"] for a in assocs if a.get("question_id") == question_id}
             candidate_segments_data = [
                 s for s in all_segments
-                if s["id"] in associated_seg_ids and str(s.get("track_id", "")).lower() in ("candidate", "tracktype.candidate")
+                if s["id"] in associated_seg_ids and is_candidate_segment(s)
             ]
 
         # Backwards-compatibility fallback if provided in payload directly (e.g. mock unit tests)
@@ -398,11 +494,8 @@ Respond strictly with a JSON object conforming to:
         transcript_segment_objs: list[TranscriptSegment] = []
         source_segments = all_segments if all_segments else candidate_segments_data
         for s in source_segments:
-            track = (
-                TrackType.CANDIDATE
-                if str(s.get("track_id", "")).lower() in ("candidate", "tracktype.candidate")
-                else TrackType.INTERVIEWER
-            )
+            cand = is_candidate_segment(s)
+            track = TrackType.CANDIDATE if cand else TrackType.INTERVIEWER
             transcript_segment_objs.append(
                 TranscriptSegment(
                     id=s["id"],
@@ -410,6 +503,7 @@ Respond strictly with a JSON object conforming to:
                     start_time_ms=s.get("start_time_ms", 0),
                     end_time_ms=s.get("end_time_ms", 0),
                     text=s.get("text", "").strip(),
+                    speaker_role="candidate" if cand else str(s.get("speaker_role", "unknown")),
                 )
             )
 
@@ -463,9 +557,19 @@ Respond strictly with a JSON object conforming to:
         )
 
     async def _handle_batch_retranscribe(self, interview_id: str, payload: dict[str, Any]) -> None:
-        new_rev_id = payload.get("new_revision_id", "trans-rev-2")
+        existing_revs = self.repo.get_transcript_revisions(interview_id)
+        existing_rev_ids = {r["id"] for r in existing_revs}
+        new_rev_id = payload.get("new_revision_id")
+        if not new_rev_id or new_rev_id in existing_rev_ids:
+            next_num = len(existing_revs) + 1
+            while f"trans-rev-{next_num}" in existing_rev_ids:
+                next_num += 1
+            new_rev_id = f"trans-rev-{next_num}"
+            revision_number = next_num
+        else:
+            revision_number = payload.get("revision_number", len(existing_revs) + 1)
+
         old_rev_id = payload.get("old_revision_id", "trans-rev-1")
-        revision_number = payload.get("revision_number", 2)
 
         if not self.repo.get_interview(interview_id):
             logger.warning("Interview %s was deleted before batch retranscribe.", interview_id)
@@ -480,8 +584,10 @@ Respond strictly with a JSON object conforming to:
 
         # Ingest new segments
         new_segments = payload.get("segments")
-        provenance = payload.get("provenance") or ("manual_import" if new_segments is not None else "batch_stt")
-        if new_segments is None:
+        provenance = payload.get("provenance") or (
+            "manual_import" if (new_segments is not None and len(new_segments) > 0) else "batch_stt"
+        )
+        if not new_segments:
             chunks = self.repo.get_audio_chunks(interview_id)
             new_segments = []
             for c in chunks:
@@ -511,7 +617,32 @@ Respond strictly with a JSON object conforming to:
                             "text": text_val,
                         })
 
+        old_segs = self.repo.get_transcript_segments(interview_id, revision_id=old_rev_id)
+        if not old_segs:
+            old_segs = self.repo.get_transcript_segments(interview_id)
+
         for seg in new_segments:
+            assigned_role = seg.get("speaker_role")
+            if not assigned_role or assigned_role == "unknown":
+                t_id = seg.get("track_id", "candidate")
+                if t_id in ("candidate", "interviewer"):
+                    assigned_role = t_id
+                else:
+                    seg_start = seg.get("start_time_ms", 0)
+                    seg_end = seg.get("end_time_ms", 0)
+                    best_overlap = 0
+                    inherited_role = "unknown"
+                    for old_s in old_segs:
+                        old_role = old_s.get("speaker_role")
+                        if old_role in ("candidate", "interviewer"):
+                            o_start = max(seg_start, old_s.get("start_time_ms", 0))
+                            o_end = min(seg_end, old_s.get("end_time_ms", 0))
+                            overlap = max(0, o_end - o_start)
+                            if overlap > best_overlap:
+                                best_overlap = overlap
+                                inherited_role = old_role
+                    assigned_role = inherited_role if best_overlap > 0 else "unknown"
+
             self.repo.add_transcript_segment(
                 segment_id=seg["id"],
                 interview_id=interview_id,
@@ -521,11 +652,11 @@ Respond strictly with a JSON object conforming to:
                 text=seg.get("text", "").strip(),
                 is_final=True,
                 revision_id=new_rev_id,
+                speaker_role=assigned_role,
             )
 
         # Run TranscriptDiffEngine
         diff_engine = TranscriptDiffEngine()
-        old_segs = self.repo.get_transcript_segments(interview_id, revision_id=old_rev_id)
         new_segs = self.repo.get_transcript_segments(interview_id, revision_id=new_rev_id)
         segment_diffs = diff_engine.compare_revisions(old_segs, new_segs)
 
@@ -578,6 +709,14 @@ Respond strictly with a JSON object conforming to:
 
         if not self.repo.get_interview(interview_id):
             logger.warning("Interview %s deleted during retranscribe. Aborting activation.", interview_id)
+            return
+
+        committed_new_segs = self.repo.get_transcript_segments(interview_id, revision_id=new_rev_id)
+        if not committed_new_segs:
+            logger.warning(
+                "Retranscription for interview %s yielded 0 segments. Aborting activation to prevent empty transcript.",
+                interview_id,
+            )
             return
 
         # ONLY AFTER ALL DATA AND STATUSES ARE SAVED, ACTIVATE NEW REVISION!
@@ -647,6 +786,8 @@ Respond strictly with a JSON object conforming to:
             did_work = await self.process_one_job()
             if not did_work:
                 await asyncio.sleep(poll_interval_sec)
+            else:
+                await asyncio.sleep(0.3)
 
     def stop(self) -> None:
         self._running = False

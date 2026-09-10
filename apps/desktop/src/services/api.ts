@@ -1,5 +1,5 @@
 import { isTauri, invoke } from '@tauri-apps/api/core';
-import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus } from '../types';
+import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus, SpeakerRole, CaptureMode, TrackManifest } from '../types';
 
 const API_BASE = 'http://127.0.0.1:8000/api/v1';
 
@@ -43,7 +43,7 @@ async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Prom
       } as unknown as T;
     }
     if (cmd === 'start_capture') {
-      return { status: 'started', session_id: args?.session_id } as unknown as T;
+      return { status: 'started', session_id: args?.sessionId || args?.session_id || 'demo' } as unknown as T;
     }
     if (cmd === 'pause_capture') {
       return { status: 'paused', session_id: 'demo', elapsed_ms: 1000 } as unknown as T;
@@ -52,27 +52,47 @@ async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Prom
       return { status: 'resumed', session_id: 'demo', epoch: 2, elapsed_ms: 1000 } as unknown as T;
     }
     if (cmd === 'stop_capture') {
-      return { status: 'stopped', total_chunks: 1, drift_ms: 0, manifests: {} } as unknown as T;
+      return {
+        status: 'stopped',
+        session_id: 'demo',
+        total_chunks: 1,
+        total_samples_interviewer: 16000,
+        total_samples_candidate: 16000,
+        total_duration_ms: 1000,
+        drift_ms: 0,
+        skew_ms: 0,
+        dropped_samples: 0,
+        manifests: [],
+      } as unknown as T;
     }
     if (cmd === 'get_upload_progress') {
       return {
         session_id: (args?.sessionId as string) || 'demo',
+        total_discovered: 10,
+        total_acked: 10,
+        total_failed: 0,
+        in_flight: 0,
+        is_active: true,
+        last_error: null,
         total_chunks: 10,
         uploaded_chunks: 10,
-        in_flight_chunks: 0,
-        pending_chunks: 0,
-        is_sealed: true,
-        all_uploaded: true,
       } as unknown as T;
     }
     if (cmd === 'get_active_session') {
-      return null as unknown as T;
+      return {
+        is_recording: false,
+        is_paused: false,
+        session_id: null,
+        elapsed_ms: 0,
+        epoch: 0,
+      } as unknown as T;
     }
     if (cmd === 'get_system_config') {
       return {
         data_dir: '/tmp/nebula/data',
         capture_spool_dir: '/tmp/nebula/data/spool',
         backend_spool_dir: '/tmp/nebula/data/spool',
+        backend_url: 'http://127.0.0.1:8000',
         db_path: '/tmp/nebula/data/nebula.db',
         backup_dir: '/tmp/nebula/data/backups',
       } as unknown as T;
@@ -90,6 +110,8 @@ async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Prom
       interviewer_peak: 0,
       candidate_rms: 0,
       candidate_peak: 0,
+      shared_rms: 0,
+      shared_peak: 0,
     } as unknown as T;
   }
   if (cmd === 'start_capture') {
@@ -102,21 +124,40 @@ async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Prom
     return { status: 'resumed', session_id: '', epoch: 1, elapsed_ms: 0 } as unknown as T;
   }
   if (cmd === 'stop_capture') {
-    return { status: 'stopped', total_chunks: 0, drift_ms: 0 } as unknown as T;
+    return {
+      status: 'stopped',
+      session_id: '',
+      total_chunks: 0,
+      total_samples_interviewer: 0,
+      total_samples_candidate: 0,
+      total_duration_ms: 0,
+      drift_ms: 0,
+      skew_ms: 0,
+      dropped_samples: 0,
+      manifests: [],
+    } as unknown as T;
   }
   if (cmd === 'get_upload_progress') {
     return {
-      session_id: '',
+      session_id: (args?.sessionId as string) || '',
+      total_discovered: 0,
+      total_acked: 0,
+      total_failed: 0,
+      in_flight: 0,
+      is_active: false,
+      last_error: null,
       total_chunks: 0,
       uploaded_chunks: 0,
-      in_flight_chunks: 0,
-      pending_chunks: 0,
-      is_sealed: false,
-      all_uploaded: true,
     } as unknown as T;
   }
   if (cmd === 'get_active_session') {
-    return null as unknown as T;
+    return {
+      is_recording: false,
+      is_paused: false,
+      session_id: null,
+      elapsed_ms: 0,
+      epoch: 0,
+    } as unknown as T;
   }
   if (cmd === 'get_system_config') {
     const res = await fetch(`${API_BASE}/system/config`);
@@ -129,6 +170,13 @@ async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Prom
 // -------------------------------------------------------------
 // Audio & Tauri IPC
 // -------------------------------------------------------------
+export interface StartCaptureResult {
+  status: string;
+  session_id: string;
+}
+
+export type { TrackManifest };
+
 export interface StopCaptureResult {
   status: string;
   session_id: string;
@@ -139,28 +187,36 @@ export interface StopCaptureResult {
   drift_ms: number;
   skew_ms: number;
   dropped_samples: number;
-  manifests?: {
-    interviewer?: Record<string, unknown>;
-    candidate?: Record<string, unknown>;
-  };
+  manifests: TrackManifest[];
 }
 
 export interface SessionUploadProgress {
   session_id: string;
+  total_discovered: number;
+  total_acked: number;
+  total_failed: number;
+  in_flight: number;
+  is_active: boolean;
+  last_error: string | null;
   total_chunks: number;
   uploaded_chunks: number;
-  in_flight_chunks: number;
-  pending_chunks: number;
-  is_sealed: boolean;
-  all_uploaded: boolean;
+}
+
+export interface ActiveSessionInfo {
+  is_recording: boolean;
+  is_paused: boolean;
+  session_id: string | null;
+  elapsed_ms: number;
+  epoch: number;
 }
 
 export interface SystemConfig {
-  data_dir: string;
   capture_spool_dir: string;
-  backend_spool_dir: string;
-  db_path: string;
-  backup_dir: string;
+  backend_url: string;
+  data_dir?: string;
+  backend_spool_dir?: string;
+  db_path?: string;
+  backup_dir?: string;
 }
 
 export async function getAudioDevices(): Promise<AudioDevice[]> {
@@ -171,19 +227,62 @@ export async function getAudioLevels(): Promise<AudioLevels> {
   return invokeTauri<AudioLevels>('get_audio_levels');
 }
 
+export interface StartAudioCaptureOptions {
+  sessionId: string;
+  interviewerDevId?: string;
+  candidateDevId?: string;
+  sharedDevId?: string;
+  spoolDir?: string;
+  consentGiven?: boolean;
+  captureMode?: 'single_source' | 'dual_source';
+}
+
 export async function startAudioCapture(
-  sessionId: string,
-  interviewerDevId: string,
-  candidateDevId: string,
-  spoolDir?: string,
-  consentGiven: boolean = true
-): Promise<{ status: string }> {
-  return invokeTauri('start_capture', {
-    sessionId,
-    interviewerDevId,
-    candidateDevId,
-    spoolDir: spoolDir || null,
-    consentGiven,
+  optionsOrSessionId: StartAudioCaptureOptions | string,
+  interviewerDevId?: string,
+  candidateDevId?: string,
+  sharedDevIdOrSpoolDir?: string,
+  consentGiven: boolean = true,
+  captureMode?: 'single_source' | 'dual_source',
+  sharedDevId?: string
+): Promise<StartCaptureResult> {
+  let opts: StartAudioCaptureOptions;
+  if (typeof optionsOrSessionId === 'object') {
+    opts = optionsOrSessionId;
+  } else {
+    if (captureMode === 'single_source' && !sharedDevId && sharedDevIdOrSpoolDir) {
+      opts = {
+        sessionId: optionsOrSessionId,
+        interviewerDevId,
+        candidateDevId,
+        sharedDevId: sharedDevIdOrSpoolDir,
+        consentGiven,
+        captureMode,
+      };
+    } else {
+      opts = {
+        sessionId: optionsOrSessionId,
+        interviewerDevId,
+        candidateDevId,
+        sharedDevId,
+        spoolDir: sharedDevIdOrSpoolDir,
+        consentGiven,
+        captureMode,
+      };
+    }
+  }
+
+  const effectiveShared = opts.sharedDevId || (opts.captureMode === 'single_source' ? (opts.interviewerDevId || opts.candidateDevId) : undefined);
+  const effectiveInterviewer = opts.captureMode === 'single_source' ? (opts.interviewerDevId || effectiveShared) : opts.interviewerDevId;
+
+  return invokeTauri<StartCaptureResult>('start_capture', {
+    sessionId: opts.sessionId,
+    interviewerDevId: effectiveInterviewer || undefined,
+    candidateDevId: opts.candidateDevId || undefined,
+    sharedDevId: effectiveShared || undefined,
+    spoolDir: opts.spoolDir || undefined,
+    consentGiven: opts.consentGiven !== undefined ? opts.consentGiven : true,
+    captureMode: opts.captureMode || 'dual_source',
   });
 }
 
@@ -199,12 +298,25 @@ export async function stopAudioCapture(): Promise<StopCaptureResult> {
   return invokeTauri<StopCaptureResult>('stop_capture');
 }
 
-export async function getUploadProgress(sessionId?: string): Promise<SessionUploadProgress> {
-  return invokeTauri<SessionUploadProgress>('get_upload_progress', { sessionId });
+export async function getUploadProgress(sessionId: string): Promise<SessionUploadProgress> {
+  const res = await invokeTauri<any>('get_upload_progress', { sessionId });
+  const totalDiscovered = res?.total_discovered ?? res?.total_chunks ?? 0;
+  const totalAcked = res?.total_acked ?? res?.uploaded_chunks ?? 0;
+  return {
+    session_id: res?.session_id || sessionId,
+    total_discovered: totalDiscovered,
+    total_acked: totalAcked,
+    total_failed: res?.total_failed ?? 0,
+    in_flight: res?.in_flight ?? res?.in_flight_chunks ?? 0,
+    is_active: res?.is_active ?? false,
+    last_error: res?.last_error ?? null,
+    total_chunks: totalDiscovered,
+    uploaded_chunks: totalAcked,
+  };
 }
 
-export async function getActiveSession(): Promise<string | null> {
-  return invokeTauri<string | null>('get_active_session');
+export async function getActiveSession(): Promise<ActiveSessionInfo> {
+  return invokeTauri<ActiveSessionInfo>('get_active_session');
 }
 
 export async function getSystemConfig(): Promise<SystemConfig> {
@@ -226,6 +338,7 @@ export async function createInterview(data: {
   candidate_name: string;
   role: string;
   plan?: InterviewPlan;
+  capture_mode?: CaptureMode;
 }): Promise<InterviewDetails> {
   const res = await fetch(`${API_BASE}/interviews`, {
     method: 'POST',
@@ -331,7 +444,7 @@ export async function resumeInterview(interviewId: string): Promise<{ status: st
 
 export async function stopInterview(
   interviewId: string,
-  manifests?: Array<Record<string, unknown>>
+  manifests?: Array<TrackManifest | Record<string, unknown>>
 ): Promise<{ status: string }> {
   const res = await fetch(`${API_BASE}/interviews/${interviewId}/stop`, {
     method: 'POST',
@@ -591,16 +704,20 @@ export async function getInterviewHealth(interviewId: string): Promise<{
 export async function startBatchRetranscribe(
   interviewId: string,
   newRevisionId: string = 'trans-rev-2',
-  segments: unknown[] = []
+  oldRevisionId: string = 'trans-rev-1',
+  segments?: unknown[]
 ): Promise<{ status: string; job_id: string; new_revision_id: string }> {
+  const payload: Record<string, unknown> = {
+    new_revision_id: newRevisionId,
+    old_revision_id: oldRevisionId,
+  };
+  if (segments && segments.length > 0) {
+    payload.segments = segments;
+  }
   const res = await fetch(`${API_BASE}/interviews/${interviewId}/batch-retranscribe`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      new_revision_id: newRevisionId,
-      old_revision_id: 'trans-rev-1',
-      segments,
-    }),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) throw new Error(`Batch retranscribe error: ${res.statusText}`);
   return res.json();
@@ -742,6 +859,40 @@ export async function checkDatabaseIntegrity(): Promise<{
 }> {
   const res = await fetch(`${API_BASE}/system/integrity`);
   if (!res.ok) throw new Error(`Check integrity error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function setSegmentSpeakerRole(
+  interviewId: string,
+  segmentId: string,
+  speakerRole: SpeakerRole
+): Promise<{ status: string; segment: TranscriptSegment }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/segments/${segmentId}/speaker-role`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ speaker_role: speakerRole }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function splitSegment(
+  interviewId: string,
+  segmentId: string,
+  payload: {
+    split_time_ms: number;
+    text_part1: string;
+    text_part2: string;
+    role_part1: SpeakerRole;
+    role_part2: SpeakerRole;
+  }
+): Promise<{ status: string; segment_part1: TranscriptSegment; segment_part2: TranscriptSegment }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/segments/${segmentId}/split`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 

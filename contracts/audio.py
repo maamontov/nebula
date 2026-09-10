@@ -7,6 +7,7 @@ class TrackType(str, Enum):
     """Audio track identification."""
     INTERVIEWER = "interviewer"
     CANDIDATE = "candidate"
+    SHARED = "shared"
 
 
 class AudioFormat(str, Enum):

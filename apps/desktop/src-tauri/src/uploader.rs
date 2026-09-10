@@ -37,7 +37,7 @@ pub struct SessionUploader {
     spool_dir: PathBuf,
     backend_url: String,
     is_running: Arc<AtomicBool>,
-    handle: Option<tokio::task::JoinHandle<()>>,
+    handle: Option<tauri::async_runtime::JoinHandle<()>>,
     progress: Arc<Mutex<UploadProgress>>,
 }
 
@@ -78,7 +78,7 @@ impl SessionUploader {
         let is_running = self.is_running.clone();
         let progress = self.progress.clone();
 
-        let handle = tokio::spawn(async move {
+        let task = async move {
             {
                 let mut p = progress.lock().await;
                 p.is_active = true;
@@ -130,8 +130,9 @@ impl SessionUploader {
 
             let mut p = progress.lock().await;
             p.is_active = false;
-        });
+        };
 
+        let handle = tauri::async_runtime::spawn(task);
         self.handle = Some(handle);
     }
 
@@ -153,7 +154,7 @@ impl SessionUploader {
             return Some(false);
         }
 
-        let tracks = ["candidate", "interviewer"];
+        let tracks = ["candidate", "interviewer", "shared"];
         let mut any_uploaded = false;
         let mut total_discovered = 0u64;
         let mut total_acked = 0u64;

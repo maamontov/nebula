@@ -8,6 +8,7 @@ pub struct MonotonicInterviewClock {
     last_resume_instant: Option<Instant>,
     interviewer_offset_ms: Option<u64>,
     candidate_offset_ms: Option<u64>,
+    shared_offset_ms: Option<u64>,
 }
 
 impl MonotonicInterviewClock {
@@ -19,6 +20,7 @@ impl MonotonicInterviewClock {
             last_resume_instant: Some(now),
             interviewer_offset_ms: None,
             candidate_offset_ms: None,
+            shared_offset_ms: None,
         }
     }
 
@@ -56,6 +58,7 @@ impl MonotonicInterviewClock {
         match track {
             TrackType::Interviewer => self.interviewer_offset_ms = Some(offset_ms),
             TrackType::Candidate => self.candidate_offset_ms = Some(offset_ms),
+            TrackType::Shared => self.shared_offset_ms = Some(offset_ms),
         }
     }
 
@@ -69,6 +72,7 @@ impl MonotonicInterviewClock {
         match track {
             TrackType::Interviewer => self.interviewer_offset_ms,
             TrackType::Candidate => self.candidate_offset_ms,
+            TrackType::Shared => self.shared_offset_ms,
         }
     }
 

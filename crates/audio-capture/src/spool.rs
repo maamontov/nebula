@@ -21,6 +21,7 @@ impl AudioSpoolManager {
         let track_name = match track_id {
             TrackType::Interviewer => "interviewer",
             TrackType::Candidate => "candidate",
+            TrackType::Shared => "shared",
         };
         self.base_dir.join(interview_id).join(track_name)
     }

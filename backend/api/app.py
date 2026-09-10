@@ -7,6 +7,10 @@ import json
 import uuid
 import os
 from typing import Any
+from dotenv import load_dotenv
+
+# Ensure environment variables (.env) are loaded
+load_dotenv()
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -115,6 +119,7 @@ class CreateInterviewRequest(BaseModel):
     candidate_name: str
     role: str
     plan: dict[str, Any] | None = None
+    capture_mode: str = "dual_source"
 
 
 class AddSegmentRequest(BaseModel):
@@ -124,6 +129,20 @@ class AddSegmentRequest(BaseModel):
     end_time_ms: int
     text: str
     is_final: bool = True
+    speaker_role: str = "unknown"
+    parent_segment_id: str | None = None
+
+
+class UpdateSpeakerRoleRequest(BaseModel):
+    speaker_role: str
+
+
+class SplitSegmentRequest(BaseModel):
+    split_time_ms: int
+    text_part1: str
+    text_part2: str
+    role_part1: str = "interviewer"
+    role_part2: str = "candidate"
 
 
 class ApproveAssessmentRequest(BaseModel):
@@ -232,6 +251,7 @@ async def create_interview_endpoint(
         candidate_name=payload.candidate_name,
         role=payload.role,
         status=InterviewStatus.DRAFT,
+        capture_mode=payload.capture_mode,
     )
     if payload.plan:
         repo.save_plan(f"plan-{payload.id}", payload.id, payload.plan, version=1)
@@ -340,7 +360,17 @@ async def get_interview_endpoint(
     plan = repo.get_latest_plan(interview_id)
     segments = repo.get_transcript_segments(interview_id, revision_id=target_rev)
     if not segments and not revision_id:
-        segments = repo.get_transcript_segments(interview_id)
+        all_segs = repo.get_transcript_segments(interview_id)
+        if all_segs:
+            segments = all_segs
+            actual_rev = all_segs[0].get("revision_id")
+            if actual_rev and actual_rev != target_rev:
+                try:
+                    repo.set_active_transcript_revision(interview_id, actual_rev)
+                    inv["active_transcript_revision_id"] = actual_rev
+                    target_rev = actual_rev
+                except Exception:
+                    pass
     proposals = repo.get_assessment_proposals(interview_id)
     human_assessments = repo.get_human_assessments(interview_id)
     plan_payload = plan["payload"] if plan else None
@@ -394,8 +424,19 @@ def check_interview_readiness(
     interview_path = spool_dir / interview_id
     manifests_found: dict[str, dict[str, Any]] = {}
 
+    inv = repo.get_interview(interview_id)
+    expected_tracks = ["candidate", "interviewer"]
+    if inv:
+        if inv.get("expected_tracks_json"):
+            try:
+                expected_tracks = json.loads(inv["expected_tracks_json"])
+            except Exception:
+                pass
+        elif inv.get("capture_mode") == "single_source":
+            expected_tracks = ["shared"]
+
     if interview_path.exists():
-        for track in ("candidate", "interviewer"):
+        for track in expected_tracks:
             m_path = interview_path / track / "manifest.json"
             if m_path.exists():
                 try:
@@ -413,6 +454,8 @@ def check_interview_readiness(
             key = "candidate"
         elif "interviewer" in t_id:
             key = "interviewer"
+        elif "shared" in t_id:
+            key = "shared"
         else:
             key = t_id
         chunks_by_track.setdefault(key, set()).add(c["sequence"])
@@ -786,8 +829,70 @@ async def add_segment_endpoint(
             end_time_ms=payload.end_time_ms,
             text=payload.text,
             is_final=payload.is_final,
+            speaker_role=payload.speaker_role,
+            parent_segment_id=payload.parent_segment_id,
         )
         return {"status": "ok", "segment_id": payload.id}
+    except RepositoryConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/v1/interviews/{interview_id}/segments/{segment_id}/speaker-role")
+async def update_segment_speaker_role_endpoint(
+    interview_id: str,
+    segment_id: str,
+    payload: UpdateSpeakerRoleRequest,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
+        raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
+
+    role = payload.speaker_role.lower()
+    if role not in ("candidate", "interviewer", "unknown"):
+        raise HTTPException(status_code=422, detail="Invalid speaker_role. Must be 'candidate', 'interviewer', or 'unknown'")
+
+    try:
+        updated = repo.update_segment_speaker_role(
+            interview_id=interview_id,
+            segment_id=segment_id,
+            speaker_role=role,
+        )
+        return {"status": "ok", "segment": updated}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RepositoryConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/v1/interviews/{interview_id}/segments/{segment_id}/split")
+async def split_segment_endpoint(
+    interview_id: str,
+    segment_id: str,
+    payload: SplitSegmentRequest,
+    repo: Repository = Depends(get_repository),
+):
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
+        raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
+
+    try:
+        seg1, seg2 = repo.split_transcript_segment(
+            interview_id=interview_id,
+            segment_id=segment_id,
+            split_time_ms=payload.split_time_ms,
+            text_part1=payload.text_part1,
+            text_part2=payload.text_part2,
+            role_part1=payload.role_part1,
+            role_part2=payload.role_part2,
+        )
+        return {"status": "ok", "segment_part1": seg1, "segment_part2": seg2}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RepositoryConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
 

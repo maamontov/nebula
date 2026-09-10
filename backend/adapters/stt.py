@@ -55,7 +55,15 @@ class OpenAICompatibleSTTAdapter:
         self._external_client = http_client
 
     def _get_api_key(self) -> str:
-        return os.getenv(self.api_key_env, "")
+        key = os.getenv(self.api_key_env, "")
+        if not key:
+            try:
+                from dotenv import load_dotenv
+                load_dotenv()
+                key = os.getenv(self.api_key_env, "")
+            except Exception:
+                pass
+        return key
 
     async def transcribe_audio(
         self,
@@ -73,6 +81,10 @@ class OpenAICompatibleSTTAdapter:
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        elif self._external_client is None:
+            raise STTAuthenticationError(
+                f"Missing API key: environment variable '{self.api_key_env}' is not set or empty."
+            )
 
         client = self._external_client or httpx.AsyncClient(timeout=self.profile.timeout_seconds)
         close_client = self._external_client is None
@@ -111,15 +123,26 @@ class OpenAICompatibleSTTAdapter:
                     if resp.status_code == 429:
                         retry_h = resp.headers.get("Retry-After")
                         retry_sec = float(retry_h) if retry_h and retry_h.isdigit() else backoff
-                        if attempt >= max_retries:
+                        if retry_sec > 15.0 or attempt >= max_retries:
                             raise STTRateLimitError(
-                                f"STT Rate limit exceeded after {attempt} attempts: {resp.text}",
+                                f"STT Rate limit exceeded (retry_after={retry_sec}s): {resp.text}",
                                 retry_after=retry_sec,
                             )
                         logger.warning("STT Rate limit hit, sleeping for %.2fs", retry_sec)
                         await asyncio.sleep(retry_sec)
                         backoff *= 2.0
                         continue
+
+                    if resp.status_code == 502 and "media_submit_failed" in resp.text:
+                        logger.info(
+                            "STT upstream returned media_submit_failed on silent/unsegmentable audio chunk, treating as empty speech."
+                        )
+                        return STTTranscriptionResult(
+                            text="",
+                            model_id=self.profile.model_id,
+                            latency_seconds=time.perf_counter() - t0,
+                            raw_response={"text": "", "note": "media_submit_failed"},
+                        )
 
                     if resp.status_code >= 500:
                         if attempt >= max_retries:

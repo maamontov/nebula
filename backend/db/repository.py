@@ -51,15 +51,22 @@ class Repository:
         status: InterviewStatus = InterviewStatus.DRAFT,
         consent_confirmed_at: str | None = None,
         consent_version: str | None = None,
+        capture_mode: str = "dual_source",
+        expected_tracks: list[str] | None = None,
     ) -> dict[str, Any]:
         now = utc_now_iso()
+        if expected_tracks is None:
+            expected_tracks = ["shared"] if capture_mode == "single_source" else ["interviewer", "candidate"]
+        expected_tracks_json = json.dumps(expected_tracks)
+
         with self.db.transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO interviews (
                     id, title, candidate_name, role, status,
-                    consent_confirmed_at, consent_version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    consent_confirmed_at, consent_version, capture_mode, expected_tracks_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     interview_id,
@@ -69,6 +76,8 @@ class Repository:
                     status.value,
                     consent_confirmed_at,
                     consent_version,
+                    capture_mode,
+                    expected_tracks_json,
                     now,
                     now,
                 ),
@@ -203,7 +212,14 @@ class Repository:
         text: str,
         is_final: bool = True,
         revision_id: str = "trans-rev-1",
+        speaker_role: str | None = None,
+        parent_segment_id: str | None = None,
     ) -> None:
+        if speaker_role is None:
+            if track_id in ("candidate", "interviewer"):
+                speaker_role = track_id
+            else:
+                speaker_role = "unknown"
         now = utc_now_iso()
         with self.db.transaction() as conn:
             inv = conn.execute("SELECT id, status FROM interviews WHERE id = ?", (interview_id,)).fetchone()
@@ -215,14 +231,21 @@ class Repository:
             conn.execute(
                 """
                 INSERT INTO transcript_segments (
-                    id, interview_id, track_id, start_time_ms, end_time_ms, text, is_final, revision_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, interview_id, track_id, start_time_ms, end_time_ms, text, is_final, revision_id,
+                    speaker_role, parent_segment_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(interview_id, revision_id, id) DO UPDATE SET
                     track_id = excluded.track_id,
                     start_time_ms = excluded.start_time_ms,
                     end_time_ms = excluded.end_time_ms,
                     text = excluded.text,
-                    is_final = excluded.is_final
+                    is_final = excluded.is_final,
+                    speaker_role = CASE
+                        WHEN transcript_segments.speaker_role IN ('candidate', 'interviewer') AND excluded.speaker_role = 'unknown'
+                        THEN transcript_segments.speaker_role
+                        ELSE excluded.speaker_role
+                    END,
+                    parent_segment_id = excluded.parent_segment_id
                 """,
                 (
                     segment_id,
@@ -233,9 +256,149 @@ class Repository:
                     text,
                     1 if is_final else 0,
                     revision_id,
+                    speaker_role,
+                    parent_segment_id,
                     now,
                 ),
             )
+
+    def update_segment_speaker_role(
+        self,
+        interview_id: str,
+        segment_id: str,
+        speaker_role: str,
+        revision_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Updates speaker_role ('candidate', 'interviewer', 'unknown') for a transcript segment."""
+        inv = self.get_interview(interview_id)
+        if not inv or inv["status"] == "deleted":
+            raise ValueError(f"Interview {interview_id} not found or deleted")
+        if inv["status"] == "finalized":
+            raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+        rev = revision_id or inv.get("active_transcript_revision_id") or "trans-rev-1"
+        with self.db.transaction() as conn:
+            # Check if segment exists in the target revision
+            row = conn.execute(
+                "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
+                (interview_id, rev, segment_id),
+            ).fetchone()
+            if not row:
+                # Fallback: find segment in any revision of this interview
+                any_row = conn.execute(
+                    "SELECT * FROM transcript_segments WHERE interview_id = ? AND id = ?",
+                    (interview_id, segment_id),
+                ).fetchone()
+                if any_row:
+                    rev = any_row["revision_id"]
+                    row = any_row
+
+            if not row:
+                raise ValueError(f"Segment {segment_id} not found in interview {interview_id}")
+
+            conn.execute(
+                """
+                UPDATE transcript_segments
+                SET speaker_role = ?
+                WHERE interview_id = ? AND revision_id = ? AND id = ?
+                """,
+                (speaker_role, interview_id, rev, segment_id),
+            )
+            updated_row = conn.execute(
+                "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
+                (interview_id, rev, segment_id),
+            ).fetchone()
+            return dict(updated_row)
+
+    def split_transcript_segment(
+        self,
+        interview_id: str,
+        segment_id: str,
+        split_time_ms: int,
+        text_part1: str,
+        text_part2: str,
+        role_part1: str = "interviewer",
+        role_part2: str = "candidate",
+        revision_id: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Splits a single mixed speech segment into two sequential segments with assigned speaker roles."""
+        inv = self.get_interview(interview_id)
+        if not inv or inv["status"] == "deleted":
+            raise ValueError(f"Interview {interview_id} not found or deleted")
+        if inv["status"] == "finalized":
+            raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+        rev = revision_id or inv.get("active_transcript_revision_id") or "trans-rev-1"
+        now = utc_now_iso()
+
+        with self.db.transaction() as conn:
+            orig = conn.execute(
+                "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
+                (interview_id, rev, segment_id),
+            ).fetchone()
+            if not orig:
+                any_orig = conn.execute(
+                    "SELECT * FROM transcript_segments WHERE interview_id = ? AND id = ?",
+                    (interview_id, segment_id),
+                ).fetchone()
+                if any_orig:
+                    rev = any_orig["revision_id"]
+                    orig = any_orig
+
+            if not orig:
+                raise ValueError(f"Original segment {segment_id} not found")
+
+            orig_dict = dict(orig)
+            start_ms = orig_dict["start_time_ms"]
+            end_ms = orig_dict["end_time_ms"]
+            track_id = orig_dict["track_id"]
+
+            if not (start_ms < split_time_ms < end_ms):
+                raise ValueError(f"Split time {split_time_ms} must be strictly between {start_ms} and {end_ms}")
+
+            # Update first part in-place
+            conn.execute(
+                """
+                UPDATE transcript_segments
+                SET end_time_ms = ?, text = ?, speaker_role = ?
+                WHERE interview_id = ? AND revision_id = ? AND id = ?
+                """,
+                (split_time_ms, text_part1.strip(), role_part1, interview_id, rev, segment_id),
+            )
+
+            # Insert second part with parent_segment_id tracking provenance
+            part2_id = f"seg-{uuid.uuid4().hex[:8]}"
+            conn.execute(
+                """
+                INSERT INTO transcript_segments (
+                    id, interview_id, track_id, start_time_ms, end_time_ms, text,
+                    is_final, revision_id, speaker_role, parent_segment_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    part2_id,
+                    interview_id,
+                    track_id,
+                    split_time_ms,
+                    end_ms,
+                    text_part2.strip(),
+                    rev,
+                    role_part2,
+                    segment_id,
+                    now,
+                ),
+            )
+
+            row1 = conn.execute(
+                "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
+                (interview_id, rev, segment_id),
+            ).fetchone()
+            row2 = conn.execute(
+                "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
+                (interview_id, rev, part2_id),
+            ).fetchone()
+
+            return dict(row1), dict(row2)
 
     def get_transcript_segments(self, interview_id: str, revision_id: str | None = None) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
@@ -272,6 +435,8 @@ class Repository:
                 """
                 INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
                 VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    is_batch_final = excluded.is_batch_final
                 """,
                 (revision_id, interview_id, revision_number, 1 if is_batch_final else 0, now),
             )
@@ -1139,12 +1304,16 @@ class Repository:
         now = utc_now_iso()
         owner_token = f"worker-{uuid.uuid4().hex}"
         with self.db.transaction() as conn:
-            # Find eligible job
+            # Find eligible job (prioritizing actively recording interviews to eliminate live delay)
             row = conn.execute(
                 """
-                SELECT * FROM jobs
-                WHERE status = 'PENDING' OR (status = 'PROCESSING' AND locked_until < ?)
-                ORDER BY created_at ASC LIMIT 1
+                SELECT j.* FROM jobs j
+                LEFT JOIN interviews i ON j.interview_id = i.id
+                WHERE j.status = 'PENDING' OR (j.status = 'PROCESSING' AND j.locked_until < ?)
+                ORDER BY
+                    CASE WHEN i.status = 'recording' THEN 0 ELSE 1 END ASC,
+                    j.created_at ASC
+                LIMIT 1
                 """,
                 (now,),
             ).fetchone()
@@ -1175,6 +1344,57 @@ class Repository:
             job["attempts"] += 1
             job["locked_by"] = owner_token
             return job
+
+    def claim_adjacent_transcribe_jobs(
+        self,
+        interview_id: str,
+        track_id: str,
+        max_additional: int = 3,
+        owner_token: str | None = None,
+        lock_duration_sec: int = 60,
+    ) -> list[dict[str, Any]]:
+        """Claims up to max_additional pending TRANSCRIBE_AUDIO jobs for the same interview and track."""
+        if max_additional <= 0:
+            return []
+        now = utc_now_iso()
+        lock_until_dt = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() + lock_duration_sec, tz=timezone.utc
+        )
+        lock_until_str = lock_until_dt.isoformat()
+        results = []
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE interview_id = ? AND type = 'TRANSCRIBE_AUDIO' AND status = 'PENDING'
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (interview_id, max_additional),
+            ).fetchall()
+            for r in rows:
+                j = dict(r)
+                p = json.loads(j["payload_json"])
+                if p.get("track_id") != track_id:
+                    continue
+                cursor = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'PROCESSING',
+                        attempts = attempts + 1,
+                        locked_until = ?,
+                        locked_by = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'PENDING'
+                    """,
+                    (lock_until_str, owner_token, now, j["id"]),
+                )
+                if cursor.rowcount > 0:
+                    j["payload"] = p
+                    j["attempts"] += 1
+                    j["locked_by"] = owner_token
+                    results.append(j)
+        return results
 
     def renew_job_lease(self, job_id: str, owner_token: str, extension_sec: int = 60) -> bool:
         """Extends the lease duration for an actively executing job if owner token matches."""
@@ -1308,16 +1528,42 @@ class Repository:
         is_ambiguous: bool = False,
         is_manually_adjusted: bool = False,
         notes: str = "",
+        revision_id: str | None = None,
     ) -> None:
         now = utc_now_iso()
         with self.db.transaction() as conn:
+            rev = revision_id
+            if not rev:
+                inv_row = conn.execute(
+                    "SELECT active_transcript_revision_id FROM interviews WHERE id = ?",
+                    (interview_id,),
+                ).fetchone()
+                active_rev = inv_row["active_transcript_revision_id"] if inv_row and inv_row["active_transcript_revision_id"] else "trans-rev-1"
+                seg_row = conn.execute(
+                    "SELECT revision_id FROM transcript_segments WHERE interview_id = ? AND id = ? AND revision_id = ?",
+                    (interview_id, segment_id, active_rev),
+                ).fetchone()
+                if not seg_row:
+                    seg_row = conn.execute(
+                        "SELECT revision_id FROM transcript_segments WHERE interview_id = ? AND id = ?",
+                        (interview_id, segment_id),
+                    ).fetchone()
+                rev = seg_row["revision_id"] if seg_row else active_rev
+
+            existing_row = conn.execute(
+                "SELECT id FROM question_associations WHERE interview_id = ? AND revision_id = ? AND segment_id = ?",
+                (interview_id, rev, segment_id),
+            ).fetchone()
+            target_assoc_id = existing_row["id"] if existing_row else assoc_id
+
             conn.execute(
                 """
                 INSERT INTO question_associations (
-                    id, interview_id, question_id, segment_id, confidence,
+                    id, interview_id, revision_id, question_id, segment_id, confidence,
                     is_ambiguous, is_manually_adjusted, notes, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
+                    revision_id = excluded.revision_id,
                     question_id = excluded.question_id,
                     confidence = excluded.confidence,
                     is_ambiguous = excluded.is_ambiguous,
@@ -1325,8 +1571,9 @@ class Repository:
                     notes = excluded.notes
                 """,
                 (
-                    assoc_id,
+                    target_assoc_id,
                     interview_id,
+                    rev,
                     question_id,
                     segment_id,
                     confidence,

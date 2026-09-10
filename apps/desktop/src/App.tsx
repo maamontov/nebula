@@ -14,8 +14,9 @@ export const App: React.FC = () => {
   const [plan, setPlan] = useState<InterviewPlan | null>(null);
 
   useEffect(() => {
-    getActiveSession().then(async (activeSessionId) => {
-      if (activeSessionId) {
+    getActiveSession().then(async (sessionInfo) => {
+      if (sessionInfo && sessionInfo.is_recording && sessionInfo.session_id) {
+        const activeSessionId = sessionInfo.session_id;
         try {
           const data = await getInterview(activeSessionId);
           if (data && data.interview) {
@@ -23,7 +24,7 @@ export const App: React.FC = () => {
             if (data.plan) {
               setPlan(data.plan);
             }
-            if (data.interview.status === 'review' || data.interview.status === 'finalized') {
+            if (data.interview.status === 'review' || data.interview.status === 'finalized' || data.interview.status === 'processing') {
               setScreen('review');
             } else {
               setScreen('live');
@@ -33,6 +34,8 @@ export const App: React.FC = () => {
           console.error('Failed to restore active session:', e);
         }
       }
+    }).catch((e) => {
+      console.warn('getActiveSession failed or running outside Tauri:', e);
     });
   }, []);
 

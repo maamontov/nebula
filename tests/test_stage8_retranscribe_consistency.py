@@ -461,3 +461,154 @@ async def test_failed_batch_does_not_switch_active_transcript(repo: Repository):
     # CRITICAL INVARIANT: active_transcript_revision_id must still be trans-rev-1!
     inv = repo.get_interview(interview_id)
     assert inv["active_transcript_revision_id"] == "trans-rev-1"
+
+
+@pytest.mark.asyncio
+async def test_batch_retranscribe_with_empty_segments_preserves_active_revision_if_no_audio(repo: Repository):
+    """
+    Passing segments=[] with no audio chunks must not activate an empty revision.
+    """
+    interview_id = "inv-empty-batch-guard"
+    _setup_interview_stage8(repo, interview_id)
+
+    repo.add_transcript_segment(
+        segment_id="seg-orig-1",
+        interview_id=interview_id,
+        track_id="shared",
+        start_time_ms=0,
+        end_time_ms=3000,
+        text="Исходный текст до пакетной перестенограммы",
+        revision_id="trans-rev-1",
+    )
+
+    worker = PipelineWorker(repo, stt_adapter=MagicMock())
+
+    repo.enqueue_job(
+        job_id="job-empty-segments",
+        job_type="BATCH_RETRANSCRIBE",
+        interview_id=interview_id,
+        payload={
+            "new_revision_id": "trans-rev-2",
+            "old_revision_id": "trans-rev-1",
+            "segments": [],  # Empty list sent by client
+        },
+    )
+
+    processed = await worker.process_one_job()
+    assert processed is True
+
+    # Active revision must remain trans-rev-1 because 0 segments were produced
+    inv = repo.get_interview(interview_id)
+    assert inv["active_transcript_revision_id"] == "trans-rev-1"
+
+
+def test_update_segment_speaker_role_fallback_to_actual_revision(client: TestClient, repo: Repository):
+    """
+    If active_transcript_revision_id points to another revision, updating role
+    for a segment located in an earlier revision must find it and succeed.
+    """
+    interview_id = "inv-role-fallback"
+    _setup_interview_stage8(repo, interview_id)
+
+    repo.add_transcript_segment(
+        segment_id="seg-target-1",
+        interview_id=interview_id,
+        track_id="shared",
+        start_time_ms=1000,
+        end_time_ms=4000,
+        text="Проверка роли спикера",
+        revision_id="trans-rev-1",
+        speaker_role="unknown",
+    )
+
+    # Artificially switch active revision to an empty trans-rev-2
+    repo.create_transcript_revision(
+        revision_id="trans-rev-2",
+        interview_id=interview_id,
+        revision_number=2,
+    )
+    repo.set_active_transcript_revision(interview_id, "trans-rev-2")
+
+    # Call speaker-role endpoint without specifying revision_id
+    resp = client.post(
+        f"/api/v1/interviews/{interview_id}/segments/seg-target-1/speaker-role",
+        json={"speaker_role": "candidate"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["segment"]["speaker_role"] == "candidate"
+    assert data["segment"]["revision_id"] == "trans-rev-1"
+
+
+@pytest.mark.asyncio
+async def test_batch_retranscribe_preserves_human_assigned_roles(repo: Repository, tmp_path):
+    """
+    When batch retranscription runs on a shared track, segments overlapping
+    with human-assigned roles in old_rev must inherit those roles.
+    """
+    interview_id = "inv-role-preserve"
+    _setup_interview_stage8(repo, interview_id)
+
+    # Human-labeled segments in trans-rev-1
+    repo.add_transcript_segment(
+        segment_id="seg-h-1",
+        interview_id=interview_id,
+        track_id="shared",
+        start_time_ms=0,
+        end_time_ms=5000,
+        text="Вопрос интервьюера",
+        revision_id="trans-rev-1",
+        speaker_role="interviewer",
+    )
+    repo.add_transcript_segment(
+        segment_id="seg-h-2",
+        interview_id=interview_id,
+        track_id="shared",
+        start_time_ms=5000,
+        end_time_ms=10000,
+        text="Ответ кандидата",
+        revision_id="trans-rev-1",
+        speaker_role="candidate",
+    )
+
+    worker = PipelineWorker(repo, stt_adapter=MagicMock())
+
+    # Retranscribe passing manual segments or chunks
+    new_segs = [
+        {
+            "id": "seg-new-1",
+            "track_id": "shared",
+            "start_time_ms": 500,
+            "end_time_ms": 4500,
+            "text": "Вопрос интервьюера перераспознанный точнее",
+        },
+        {
+            "id": "seg-new-2",
+            "track_id": "shared",
+            "start_time_ms": 5200,
+            "end_time_ms": 9800,
+            "text": "Ответ кандидата перераспознанный точнее",
+        },
+    ]
+
+    repo.enqueue_job(
+        job_id="job-preserve-roles",
+        job_type="BATCH_RETRANSCRIBE",
+        interview_id=interview_id,
+        payload={
+            "new_revision_id": "trans-rev-2",
+            "old_revision_id": "trans-rev-1",
+            "segments": new_segs,
+        },
+    )
+
+    processed = await worker.process_one_job()
+    assert processed is True
+
+    # Check that new segments in trans-rev-2 inherited roles from trans-rev-1
+    rev2_segs = repo.get_transcript_segments(interview_id, revision_id="trans-rev-2")
+    assert len(rev2_segs) == 2
+    assert rev2_segs[0]["speaker_role"] == "interviewer"
+    assert rev2_segs[1]["speaker_role"] == "candidate"
+

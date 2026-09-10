@@ -1,4 +1,8 @@
-export type TrackType = 'interviewer' | 'candidate';
+export type TrackType = 'interviewer' | 'candidate' | 'shared';
+
+export type CaptureMode = 'single_source' | 'dual_source';
+
+export type SpeakerRole = 'candidate' | 'interviewer' | 'unknown';
 
 export type InterviewStatus =
   | 'draft'
@@ -23,6 +27,25 @@ export interface AudioLevels {
   interviewer_peak: number;
   candidate_rms: number;
   candidate_peak: number;
+  shared_rms?: number;
+  shared_peak?: number;
+}
+
+export interface TrackManifest {
+  interview_id: string;
+  track_id: TrackType | string;
+  capture_epoch: number;
+  total_chunks: number;
+  total_duration_ms: number;
+  is_sealed: boolean;
+  gaps?: Array<{
+    track_id: TrackType | string;
+    start_time_ms: number;
+    end_time_ms: number;
+    reason: string;
+  }>;
+  total_samples?: number;
+  dropped_samples?: number;
 }
 
 export interface RubricCriterion {
@@ -58,6 +81,8 @@ export interface TranscriptSegment {
   end_time_ms: number;
   text: string;
   is_final: boolean;
+  speaker_role?: SpeakerRole;
+  parent_segment_id?: string | null;
 }
 
 export interface EvidenceQuote {
@@ -117,6 +142,8 @@ export interface InterviewDetails {
   candidate_name: string;
   role: string;
   status: InterviewStatus;
+  capture_mode?: CaptureMode;
+  expected_tracks?: string[];
   active_rubric_revision_id?: string;
   active_transcript_revision_id?: string;
   consent_confirmed_at?: string;

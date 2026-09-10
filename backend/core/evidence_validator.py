@@ -131,9 +131,17 @@ def validate_proposal(
                 )
                 continue
 
-            # Ensure evidence comes from candidate speech track!
+            # Ensure evidence comes from candidate speech track or role!
             track_str = seg.track_id.value if hasattr(seg.track_id, "value") else str(seg.track_id).lower()
-            if track_str != "candidate":
+            role_str = getattr(seg, "speaker_role", "unknown").lower()
+            if track_str == "candidate":
+                is_cand = (role_str != "interviewer")
+            elif track_str == "shared":
+                is_cand = (role_str == "candidate")
+            else:
+                is_cand = (role_str == "candidate")
+
+            if not is_cand:
                 errors.append(
                     f"Evidence for criterion '{score_item.criterion_id}' references {track_str} track segment '{ev.segment_id}'. Evidence quotes must strictly come from candidate track."
                 )

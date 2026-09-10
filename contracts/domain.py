@@ -108,6 +108,7 @@ class TranscriptSegment(BaseModel):
     text: str = Field(..., min_length=1)
     is_final: bool = Field(default=True, description="False for UI partials; only True segments enter assessment")
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    speaker_role: str = Field(default="unknown")
 
 
 class TranscriptRevision(BaseModel):

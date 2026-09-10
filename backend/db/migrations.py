@@ -41,16 +41,18 @@ def run_migrations(db: Database) -> int:
     finally:
         conn.close()
 
-    if current_version < 1:
+    TARGET_VERSION = 6
+    if current_version < TARGET_VERSION:
         # Make verified pre-migration backup if not in-memory
         if db.db_path != ":memory:" and Path(db.db_path).exists():
             backup_dir = Path(os.getenv("NEBULA_BACKUP_DIR", "data/backups")).resolve()
             backup_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            backup_path = backup_dir / f"pre_migration_v0_to_v1_{timestamp}.db"
+            backup_path = backup_dir / f"pre_migration_v{current_version}_to_v{TARGET_VERSION}_{timestamp}.db"
             db.backup(str(backup_path))
             logger.info("Created pre-migration backup at %s", backup_path)
 
+    if current_version < 1:
         with db.transaction() as tx_conn:
             tx_conn.execute("PRAGMA foreign_keys = OFF;")
 
@@ -270,6 +272,111 @@ def run_migrations(db: Database) -> int:
         if not db.verify_integrity():
             raise RuntimeError("Database integrity check failed after running migration 004!")
         current_version = 4
+
+    if current_version < 5:
+        # Migration 5: Single source capture mode, expected tracks, and speaker role provenance
+        with db.transaction() as tx_conn:
+            # 1. Update interviews table
+            int_cols = [row["name"] for row in tx_conn.execute("PRAGMA table_info(interviews)").fetchall()]
+            if "capture_mode" not in int_cols:
+                tx_conn.execute("ALTER TABLE interviews ADD COLUMN capture_mode TEXT NOT NULL DEFAULT 'dual_source';")
+            if "expected_tracks_json" not in int_cols:
+                tx_conn.execute("ALTER TABLE interviews ADD COLUMN expected_tracks_json TEXT NOT NULL DEFAULT '[\"interviewer\", \"candidate\"]';")
+
+            # 2. Update transcript_segments table
+            seg_cols = [row["name"] for row in tx_conn.execute("PRAGMA table_info(transcript_segments)").fetchall()]
+            if "speaker_role" not in seg_cols:
+                tx_conn.execute("ALTER TABLE transcript_segments ADD COLUMN speaker_role TEXT NOT NULL DEFAULT 'unknown';")
+            if "parent_segment_id" not in seg_cols:
+                tx_conn.execute("ALTER TABLE transcript_segments ADD COLUMN parent_segment_id TEXT;")
+
+            # 3. For existing dual-source segments, populate speaker_role from track_id
+            tx_conn.execute("""
+                UPDATE transcript_segments
+                SET speaker_role = track_id
+                WHERE track_id IN ('interviewer', 'candidate') AND (speaker_role IS NULL OR speaker_role = 'unknown');
+            """)
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (5, '005_single_source_and_speaker_roles', ?)",
+                (now_iso,),
+            )
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 005!")
+        current_version = 5
+
+    if current_version < 6:
+        # Migration 6: Align question_associations foreign key with composite transcript_segments (interview_id, revision_id, id)
+        with db.transaction() as tx_conn:
+            tx_conn.execute("PRAGMA foreign_keys = OFF;")
+            tx_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS question_associations_v6 (
+                    id TEXT PRIMARY KEY,
+                    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+                    revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
+                    question_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    is_ambiguous INTEGER NOT NULL DEFAULT 0,
+                    is_manually_adjusted INTEGER NOT NULL DEFAULT 0,
+                    notes TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (interview_id, revision_id, segment_id)
+                        REFERENCES transcript_segments(interview_id, revision_id, id) ON DELETE CASCADE
+                );
+                """
+            )
+            # Copy existing data if question_associations table exists
+            table_exists = bool(
+                tx_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='question_associations'"
+                ).fetchone()
+            )
+            if table_exists:
+                existing_cols = [row["name"] for row in tx_conn.execute("PRAGMA table_info(question_associations)").fetchall()]
+                if "revision_id" in existing_cols:
+                    tx_conn.execute(
+                        """
+                        INSERT OR IGNORE INTO question_associations_v6 (
+                            id, interview_id, revision_id, question_id, segment_id,
+                            confidence, is_ambiguous, is_manually_adjusted, notes, created_at
+                        )
+                        SELECT id, interview_id, revision_id, question_id, segment_id,
+                               confidence, is_ambiguous, is_manually_adjusted, notes, created_at
+                        FROM question_associations;
+                        """
+                    )
+                else:
+                    tx_conn.execute(
+                        """
+                        INSERT OR IGNORE INTO question_associations_v6 (
+                            id, interview_id, revision_id, question_id, segment_id,
+                            confidence, is_ambiguous, is_manually_adjusted, notes, created_at
+                        )
+                        SELECT qa.id, qa.interview_id,
+                               COALESCE(ts.revision_id, 'trans-rev-1'),
+                               qa.question_id, qa.segment_id,
+                               qa.confidence, qa.is_ambiguous, qa.is_manually_adjusted, qa.notes, qa.created_at
+                        FROM question_associations qa
+                        LEFT JOIN transcript_segments ts ON ts.interview_id = qa.interview_id AND ts.id = qa.segment_id;
+                        """
+                    )
+                tx_conn.execute("DROP TABLE question_associations;")
+            tx_conn.execute("ALTER TABLE question_associations_v6 RENAME TO question_associations;")
+            tx_conn.execute("CREATE INDEX IF NOT EXISTS idx_assoc_interview_question ON question_associations(interview_id, question_id);")
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (6, '006_question_associations_composite_fk', ?)",
+                (now_iso,),
+            )
+            tx_conn.execute("PRAGMA foreign_keys = ON;")
+
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 006!")
+        current_version = 6
 
     logger.info("Successfully ensured database schema up to version %d", current_version)
     return current_version

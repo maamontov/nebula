@@ -11,8 +11,10 @@ use crate::uploader::{SessionUploader, UploadProgress};
 
 pub struct ActiveSession {
     pub session_id: String,
+    pub capture_mode: String,
     pub interviewer_handle: Option<CaptureHandle>,
     pub candidate_handle: Option<CaptureHandle>,
+    pub shared_handle: Option<CaptureHandle>,
     pub clock: MonotonicInterviewClock,
     pub spool_dir: PathBuf,
     pub is_paused: Arc<AtomicBool>,
@@ -34,7 +36,7 @@ impl Default for AppState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeviceInfo {
     pub id: String,
     pub name: String,
@@ -43,12 +45,20 @@ pub struct DeviceInfo {
     pub sample_rate: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioLevels {
     pub interviewer_rms: f32,
     pub interviewer_peak: f32,
     pub candidate_rms: f32,
     pub candidate_peak: f32,
+    pub shared_rms: f32,
+    pub shared_peak: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StartCaptureResult {
+    pub status: String,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,14 +169,16 @@ pub fn list_audio_devices() -> Result<Vec<DeviceInfo>, String> {
 }
 
 #[tauri::command]
-pub fn start_capture(
+pub async fn start_capture(
     session_id: String,
-    interviewer_dev_id: String,
-    candidate_dev_id: String,
-    spool_dir: String,
+    interviewer_dev_id: Option<String>,
+    candidate_dev_id: Option<String>,
+    shared_dev_id: Option<String>,
+    spool_dir: Option<String>,
     consent_given: bool,
-    state: tauri::State<AppState>,
-) -> Result<String, String> {
+    capture_mode: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<StartCaptureResult, String> {
     if !consent_given {
         return Err("Consent verification failed: Participant consent is strictly mandatory prior to recording.".into());
     }
@@ -175,80 +187,125 @@ pub fn start_capture(
         return Err("Запись уже активна. Остановите текущую сессию перед началом новой.".into());
     }
 
-    if interviewer_dev_id == candidate_dev_id && !interviewer_dev_id.is_empty() {
-        return Err("Для двухканального сценария требуется настроить отдельный вход кандидата (например, Loopback / BlackHole). Выбор одного и того же микрофона для обоих каналов запрещён.".into());
-    }
-
-    let host = cpal::default_host();
-    let mut dev_inv: Option<cpal::Device> = None;
-    let mut dev_cand: Option<cpal::Device> = None;
-
-    if let Ok(devices) = host.input_devices() {
-        for dev in devices {
-            if let Ok(name) = dev.name() {
-                if name == interviewer_dev_id {
-                    dev_inv = Some(dev);
-                } else if name == candidate_dev_id {
-                    dev_cand = Some(dev);
-                }
-            }
-        }
-    }
-
-    // No silent fallback to default input
-    let dev_inv = dev_inv.ok_or_else(|| {
-        format!("Устройство аудиовхода интервьюера '{}' не найдено или недоступно. Выберите устройство повторно.", interviewer_dev_id)
-    })?;
-    let dev_cand = dev_cand.ok_or_else(|| {
-        format!("Устройство аудиовхода кандидата '{}' не найдено или недоступно. Выберите устройство повторно.", candidate_dev_id)
-    })?;
-
-    let spool_path = resolve_capture_spool_dir(&spool_dir);
+    let mode = capture_mode.unwrap_or_else(|| "dual_source".to_string());
+    let spool_dir_val = spool_dir.unwrap_or_default();
+    let spool_path = resolve_capture_spool_dir(&spool_dir_val);
     std::fs::create_dir_all(&spool_path)
         .map_err(|e| format!("Не удалось создать директорию capture spool {:?}: {}", spool_path, e))?;
 
     let spool_mgr = Arc::new(AudioSpoolManager::new(&spool_path));
     let mut clock = MonotonicInterviewClock::new(1);
+    let host = cpal::default_host();
 
-    clock.mark_track_start(TrackType::Interviewer);
+    let (inv_handle, cand_handle, shared_handle) = if mode == "single_source" {
+        let dev_name = shared_dev_id
+            .or(interviewer_dev_id)
+            .or(candidate_dev_id)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "Не выбрано аудиоустройство для записи одного источника.".to_string())?;
 
-    // 1. Start interviewer track
-    let inv_handle = start_device_capture(
-        &dev_inv,
-        session_id.clone(),
-        TrackType::Interviewer,
-        spool_mgr.clone(),
-        clock.clone(),
-        1000,
-    ).map_err(|e| format!("Failed to open interviewer capture stream: {}", e))?;
-
-    // 2. Start candidate track. If failed, cleanly stop interviewer track immediately!
-    clock.mark_track_start(TrackType::Candidate);
-    let cand_handle = match start_device_capture(
-        &dev_cand,
-        session_id.clone(),
-        TrackType::Candidate,
-        spool_mgr.clone(),
-        clock.clone(),
-        1000,
-    ) {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = inv_handle.stop();
-            state.is_recording.store(false, Ordering::SeqCst);
-            return Err(format!("Failed to open candidate capture stream (interviewer stream cleanly aborted): {}", e));
+        let mut dev_found: Option<cpal::Device> = None;
+        if let Ok(devices) = host.input_devices() {
+            for dev in devices {
+                if let Ok(name) = dev.name() {
+                    if name == dev_name {
+                        dev_found = Some(dev);
+                        break;
+                    }
+                }
+            }
         }
+        let dev = dev_found.ok_or_else(|| {
+            format!("Устройство аудиовхода '{}' не найдено или недоступно. Выберите устройство повторно.", dev_name)
+        })?;
+
+        clock.mark_track_start(TrackType::Shared);
+        let handle = start_device_capture(
+            &dev,
+            session_id.clone(),
+            TrackType::Shared,
+            spool_mgr.clone(),
+            clock.clone(),
+            1000,
+        ).map_err(|e| format!("Failed to open shared capture stream: {}", e))?;
+
+        (None, None, Some(handle))
+    } else {
+        // Dual source
+        let inv_name = interviewer_dev_id.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+            "Не выбрано устройство микрофона интервьюера.".to_string()
+        })?;
+        let cand_name = candidate_dev_id.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+            "Не выбрано устройство звука кандидата (Loopback / Звонок).".to_string()
+        })?;
+
+        if inv_name == cand_name {
+            return Err("Для двухканального сценария требуется настроить отдельный вход кандидата (например, Loopback / BlackHole). Выбор одного и того же микрофона для обоих каналов запрещён.".into());
+        }
+
+        let mut dev_inv: Option<cpal::Device> = None;
+        let mut dev_cand: Option<cpal::Device> = None;
+
+        if let Ok(devices) = host.input_devices() {
+            for dev in devices {
+                if let Ok(name) = dev.name() {
+                    if name == inv_name {
+                        dev_inv = Some(dev);
+                    } else if name == cand_name {
+                        dev_cand = Some(dev);
+                    }
+                }
+            }
+        }
+
+        let dev_inv = dev_inv.ok_or_else(|| {
+            format!("Устройство аудиовхода интервьюера '{}' не найдено или недоступно. Выберите устройство повторно.", inv_name)
+        })?;
+        let dev_cand = dev_cand.ok_or_else(|| {
+            format!("Устройство аудиовхода кандидата '{}' не найдено или недоступно. Выберите устройство повторно.", cand_name)
+        })?;
+
+        clock.mark_track_start(TrackType::Interviewer);
+        let inv_handle = start_device_capture(
+            &dev_inv,
+            session_id.clone(),
+            TrackType::Interviewer,
+            spool_mgr.clone(),
+            clock.clone(),
+            1000,
+        ).map_err(|e| format!("Failed to open interviewer capture stream: {}", e))?;
+
+        clock.mark_track_start(TrackType::Candidate);
+        let cand_handle = match start_device_capture(
+            &dev_cand,
+            session_id.clone(),
+            TrackType::Candidate,
+            spool_mgr.clone(),
+            clock.clone(),
+            1000,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = inv_handle.stop();
+                state.is_recording.store(false, Ordering::SeqCst);
+                return Err(format!("Failed to open candidate capture stream (interviewer stream cleanly aborted): {}", e));
+            }
+        };
+
+        (Some(inv_handle), Some(cand_handle), None)
     };
 
-    // 3. Start durable chunk uploader
+    // Start durable chunk uploader
     let mut uploader = SessionUploader::new(session_id.clone(), spool_path.clone(), get_backend_url());
     let uploader_progress = uploader.progress_handle();
     uploader.start();
 
     let session = ActiveSession {
         session_id: session_id.clone(),
-        interviewer_handle: Some(inv_handle),
-        candidate_handle: Some(cand_handle),
+        capture_mode: mode,
+        interviewer_handle: inv_handle,
+        candidate_handle: cand_handle,
+        shared_handle,
         clock,
         spool_dir: spool_path,
         is_paused: Arc::new(AtomicBool::new(false)),
@@ -261,8 +318,11 @@ pub fn start_capture(
     }
     state.is_recording.store(true, Ordering::SeqCst);
 
-    println!("[Nebula Tauri] 2-Track Capture and Uploader started successfully for session: {}", session_id);
-    Ok("Capture started successfully".into())
+    println!("[Nebula Tauri] Capture and Uploader started successfully for session: {}", session_id);
+    Ok(StartCaptureResult {
+        status: "started".into(),
+        session_id,
+    })
 }
 
 #[tauri::command]
@@ -296,6 +356,7 @@ pub async fn stop_capture(state: tauri::State<'_, AppState>) -> Result<SessionCa
 
     let mut stats_inv: Option<CaptureStats> = None;
     let mut stats_cand: Option<CaptureStats> = None;
+    let mut stats_shared: Option<CaptureStats> = None;
 
     if let Some(inv_handle) = session.interviewer_handle.take() {
         stats_inv = Some(inv_handle.stop().map_err(|e| format!("Interviewer stop failed: {}", e))?);
@@ -303,67 +364,98 @@ pub async fn stop_capture(state: tauri::State<'_, AppState>) -> Result<SessionCa
     if let Some(cand_handle) = session.candidate_handle.take() {
         stats_cand = Some(cand_handle.stop().map_err(|e| format!("Candidate stop failed: {}", e))?);
     }
+    if let Some(shared_handle) = session.shared_handle.take() {
+        stats_shared = Some(shared_handle.stop().map_err(|e| format!("Shared stop failed: {}", e))?);
+    }
 
     // Stop uploader with final drain
     if let Some(mut uploader) = session.uploader.take() {
         uploader.stop().await;
     }
 
-    let inv = stats_inv.unwrap_or_else(|| CaptureStats {
-        interview_id: session.session_id.clone(),
-        track_id: TrackType::Interviewer,
-        total_chunks: 0,
-        total_samples: 0,
-        total_duration_ms: 0,
-        dropped_samples: 0,
-        is_sealed: true,
-        gaps: Vec::new(),
-    });
+    let is_single = session.capture_mode == "single_source";
 
-    let cand = stats_cand.unwrap_or_else(|| CaptureStats {
-        interview_id: session.session_id.clone(),
-        track_id: TrackType::Candidate,
-        total_chunks: 0,
-        total_samples: 0,
-        total_duration_ms: 0,
-        dropped_samples: 0,
-        is_sealed: true,
-        gaps: Vec::new(),
-    });
+    let (total_chunks, total_duration_ms, dropped_samples, skew_ms, drift_ms, total_samples_inv, total_samples_cand) = if is_single {
+        let sh = stats_shared.unwrap_or_else(|| CaptureStats {
+            interview_id: session.session_id.clone(),
+            track_id: TrackType::Shared,
+            total_chunks: 0,
+            total_samples: 0,
+            total_duration_ms: 0,
+            dropped_samples: 0,
+            is_sealed: true,
+            gaps: Vec::new(),
+        });
+        let drift = MonotonicInterviewClock::calculate_drift_ms(
+            sh.total_duration_ms,
+            sh.total_samples,
+            16000,
+        );
+        (sh.total_chunks, sh.total_duration_ms, sh.dropped_samples, 0i64, drift, 0u64, 0u64)
+    } else {
+        let inv = stats_inv.unwrap_or_else(|| CaptureStats {
+            interview_id: session.session_id.clone(),
+            track_id: TrackType::Interviewer,
+            total_chunks: 0,
+            total_samples: 0,
+            total_duration_ms: 0,
+            dropped_samples: 0,
+            is_sealed: true,
+            gaps: Vec::new(),
+        });
 
-    let total_chunks = inv.total_chunks + cand.total_chunks;
-    let total_duration_ms = inv.total_duration_ms.max(cand.total_duration_ms);
-    let dropped_samples = inv.dropped_samples + cand.dropped_samples;
+        let cand = stats_cand.unwrap_or_else(|| CaptureStats {
+            interview_id: session.session_id.clone(),
+            track_id: TrackType::Candidate,
+            total_chunks: 0,
+            total_samples: 0,
+            total_duration_ms: 0,
+            dropped_samples: 0,
+            is_sealed: true,
+            gaps: Vec::new(),
+        });
 
-    let skew_ms = session.clock.calculate_timeline_skew_ms(
-        inv.total_samples,
-        16000,
-        cand.total_samples,
-        16000,
-    );
+        let chunks = inv.total_chunks + cand.total_chunks;
+        let dur = inv.total_duration_ms.max(cand.total_duration_ms);
+        let dropped = inv.dropped_samples + cand.dropped_samples;
 
-    let drift_ms = MonotonicInterviewClock::calculate_drift_ms(
-        total_duration_ms,
-        inv.total_samples,
-        16000,
-    );
+        let skew = session.clock.calculate_timeline_skew_ms(
+            inv.total_samples,
+            16000,
+            cand.total_samples,
+            16000,
+        );
+
+        let drift = MonotonicInterviewClock::calculate_drift_ms(
+            dur,
+            inv.total_samples,
+            16000,
+        );
+        (chunks, dur, dropped, skew, drift, inv.total_samples, cand.total_samples)
+    };
 
     // Load actual sealed manifests from spool
     let spool_mgr = AudioSpoolManager::new(&session.spool_dir);
     let mut manifests = Vec::new();
-    if let Ok(m) = spool_mgr.load_manifest(&session.session_id, TrackType::Interviewer) {
-        manifests.push(m);
-    }
-    if let Ok(m) = spool_mgr.load_manifest(&session.session_id, TrackType::Candidate) {
-        manifests.push(m);
+    if is_single {
+        if let Ok(m) = spool_mgr.load_manifest(&session.session_id, TrackType::Shared) {
+            manifests.push(m);
+        }
+    } else {
+        if let Ok(m) = spool_mgr.load_manifest(&session.session_id, TrackType::Interviewer) {
+            manifests.push(m);
+        }
+        if let Ok(m) = spool_mgr.load_manifest(&session.session_id, TrackType::Candidate) {
+            manifests.push(m);
+        }
     }
 
     Ok(SessionCaptureResult {
         status: "stopped".into(),
         session_id: session.session_id,
         total_chunks,
-        total_samples_interviewer: inv.total_samples,
-        total_samples_candidate: cand.total_samples,
+        total_samples_interviewer: total_samples_inv,
+        total_samples_candidate: total_samples_cand,
         total_duration_ms,
         drift_ms,
         skew_ms,
@@ -386,11 +478,18 @@ pub fn get_audio_levels(state: tauri::State<AppState>) -> Result<AudioLevels, St
             .as_ref()
             .map(|h| h.audio_levels())
             .unwrap_or((0.0, 0.0));
+        let (shared_rms, shared_peak) = session
+            .shared_handle
+            .as_ref()
+            .map(|h| h.audio_levels())
+            .unwrap_or((0.0, 0.0));
         return Ok(AudioLevels {
             interviewer_rms,
             interviewer_peak,
             candidate_rms,
             candidate_peak,
+            shared_rms,
+            shared_peak,
         });
     }
 
@@ -399,6 +498,8 @@ pub fn get_audio_levels(state: tauri::State<AppState>) -> Result<AudioLevels, St
         interviewer_peak: 0.0,
         candidate_rms: 0.0,
         candidate_peak: 0.0,
+        shared_rms: 0.0,
+        shared_peak: 0.0,
     })
 }
 
@@ -432,7 +533,7 @@ pub async fn get_upload_progress(
     let mut total_acked = 0u64;
     let mut total_failed = 0u64;
 
-    for track in &["candidate", "interviewer"] {
+    for track in &["candidate", "interviewer", "shared"] {
         let td = session_dir.join(track);
         if let Ok(entries) = std::fs::read_dir(td) {
             for entry in entries.flatten() {
@@ -489,6 +590,8 @@ pub fn get_active_session(state: tauri::State<AppState>) -> Result<ActiveSession
 pub fn verify_spool(spool_dir: String, interview_id: String, track: String) -> Result<bool, String> {
     let track_type = if track == "candidate" {
         TrackType::Candidate
+    } else if track == "shared" {
+        TrackType::Shared
     } else {
         TrackType::Interviewer
     };
@@ -517,6 +620,9 @@ pub fn pause_capture(state: tauri::State<AppState>) -> Result<PauseResult, Strin
     }
     if let Some(ref cand) = session.candidate_handle {
         cand.pause().map_err(|e| format!("Failed to pause candidate stream: {}", e))?;
+    }
+    if let Some(ref sh) = session.shared_handle {
+        sh.pause().map_err(|e| format!("Failed to pause shared stream: {}", e))?;
     }
 
     let elapsed_ms = session.clock.pause();
@@ -553,6 +659,9 @@ pub fn resume_capture(state: tauri::State<AppState>) -> Result<ResumeResult, Str
     if let Some(ref cand) = session.candidate_handle {
         cand.resume().map_err(|e| format!("Failed to resume candidate stream: {}", e))?;
     }
+    if let Some(ref sh) = session.shared_handle {
+        sh.resume().map_err(|e| format!("Failed to resume shared stream: {}", e))?;
+    }
 
     session.is_paused.store(false, Ordering::SeqCst);
     let elapsed_ms = session.clock.elapsed_ms();
@@ -566,3 +675,82 @@ pub fn resume_capture(state: tauri::State<AppState>) -> Result<ResumeResult, Str
         elapsed_ms,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_start_capture_result_serialization() {
+        let res = StartCaptureResult {
+            status: "started".into(),
+            session_id: "inv-test-123".into(),
+        };
+        let json = serde_json::to_string(&res).unwrap();
+        let parsed: StartCaptureResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(res, parsed);
+        assert_eq!(parsed.status, "started");
+        assert_eq!(parsed.session_id, "inv-test-123");
+    }
+
+    #[test]
+    fn test_active_session_info_serialization_none_and_some() {
+        let none_info = ActiveSessionInfo {
+            is_recording: false,
+            is_paused: false,
+            session_id: None,
+            elapsed_ms: 0,
+            epoch: 0,
+        };
+        let json = serde_json::to_string(&none_info).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["is_recording"], false);
+        assert!(parsed["session_id"].is_null());
+
+        let some_info = ActiveSessionInfo {
+            is_recording: true,
+            is_paused: false,
+            session_id: Some("inv-live-456".into()),
+            elapsed_ms: 1234,
+            epoch: 1,
+        };
+        let json2 = serde_json::to_string(&some_info).unwrap();
+        let parsed2: serde_json::Value = serde_json::from_str(&json2).unwrap();
+        assert_eq!(parsed2["is_recording"], true);
+        assert_eq!(parsed2["session_id"], "inv-live-456");
+    }
+
+    #[test]
+    fn test_audio_levels_with_shared() {
+        let levels = AudioLevels {
+            interviewer_rms: 0.1,
+            interviewer_peak: 0.2,
+            candidate_rms: 0.3,
+            candidate_peak: 0.4,
+            shared_rms: 0.5,
+            shared_peak: 0.6,
+        };
+        let json = serde_json::to_string(&levels).unwrap();
+        let parsed: AudioLevels = serde_json::from_str(&json).unwrap();
+        assert_eq!(levels, parsed);
+    }
+
+    #[test]
+    fn test_upload_progress_contract() {
+        let prog = UploadProgress {
+            session_id: "inv-789".into(),
+            total_discovered: 10,
+            total_acked: 8,
+            total_failed: 0,
+            in_flight: 2,
+            is_active: true,
+            last_error: None,
+        };
+        let json = serde_json::to_string(&prog).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["session_id"], "inv-789");
+        assert_eq!(parsed["total_discovered"], 10);
+        assert_eq!(parsed["total_acked"], 8);
+    }
+}
+

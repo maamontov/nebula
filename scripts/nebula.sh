@@ -9,6 +9,15 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Load and export environment variables from .env if present
+# Загрузка и экспорт переменных окружения из .env при наличии
+if [[ -f "$ROOT_DIR/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$ROOT_DIR/.env"
+    set +a
+fi
+
 RUN_DIR="$ROOT_DIR/.run"
 LOG_DIR="$RUN_DIR/logs"
 

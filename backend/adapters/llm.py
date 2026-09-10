@@ -78,6 +78,13 @@ class OpenAICompatibleAdapter:
 
     def _get_api_key(self) -> str:
         api_key = os.getenv(self.provider.api_key_env, "")
+        if not api_key:
+            try:
+                from dotenv import load_dotenv
+                load_dotenv()
+                api_key = os.getenv(self.provider.api_key_env, "")
+            except Exception:
+                pass
         return api_key
 
     def _build_url(self, endpoint: str) -> str:
@@ -165,6 +172,10 @@ class OpenAICompatibleAdapter:
         }
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        elif self._external_client is None:
+            raise LLMAuthenticationError(
+                f"Missing API key: environment variable '{self.provider.api_key_env}' is not set or empty."
+            )
 
         url = self._build_url("/chat/completions")
         payload = self.build_payload(messages, json_schema=json_schema, schema_name=schema_name)

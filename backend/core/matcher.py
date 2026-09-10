@@ -147,7 +147,13 @@ class QuestionMatcher:
                 continue
 
             seg_text = seg["text"].strip()
-            track = seg["track_id"]
+            track = str(seg.get("track_id", "")).lower()
+            role = str(seg.get("speaker_role", "")).lower()
+            if not role or role == "unknown":
+                if track == "shared":
+                    role = "unknown"
+                else:
+                    role = track
 
             # Find if this segment experienced an interruption
             seg_int = next(
@@ -160,7 +166,7 @@ class QuestionMatcher:
                 None,
             )
 
-            if track == "interviewer":
+            if role == "interviewer":
                 # Check if interviewer asked a new question or clarification
                 is_clarification = False
                 matched_qid = None
@@ -195,6 +201,20 @@ class QuestionMatcher:
                         is_clarification=is_clarification,
                         interruption=seg_int,
                         notes="Вопрос интервьюера" if not is_clarification else "Уточняющий вопрос",
+                    )
+                )
+
+            elif role == "unknown":
+                # Unknown/shared role: never attribute to candidate automatically
+                associations.append(
+                    SegmentAssociation(
+                        segment_id=seg["id"],
+                        question_id=active_question_id,
+                        confidence=0.0,
+                        is_ambiguous=True,
+                        is_clarification=False,
+                        interruption=seg_int,
+                        notes="Общая дорожка (роль не назначена)",
                     )
                 )
 

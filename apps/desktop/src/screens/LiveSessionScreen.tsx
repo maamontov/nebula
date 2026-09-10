@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { InterviewPlan, TranscriptSegment, AssessmentProposal } from '../types';
+import React, { useState, useEffect, useRef } from 'react';
+import { InterviewPlan, TranscriptSegment, AssessmentProposal, TrackManifest, SpeakerRole } from '../types';
 import {
   stopAudioCapture,
   pauseAudioCapture,
@@ -12,8 +12,9 @@ import {
   updateInterviewStatus,
   getInterview,
   enqueueJob,
+  setSegmentSpeakerRole,
 } from '../services/api';
-import { Square, Pause, Play, CheckCircle, MessageSquare, Quote, Sparkles, AlertTriangle, ExternalLink, Loader2 } from 'lucide-react';
+import { Square, Pause, Play, CheckCircle, MessageSquare, Quote, Sparkles, AlertTriangle, ExternalLink, Loader2, ArrowDown } from 'lucide-react';
 
 interface LiveSessionScreenProps {
   interviewId: string;
@@ -40,6 +41,43 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   // Real initial state: strictly empty, no synthetic speech or mock scores
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [proposals, setProposals] = useState<AssessmentProposal[]>([]);
+  const [isUpdatingRole, setIsUpdatingRole] = useState<string | null>(null);
+  const transcriptContainerRef = useRef<HTMLDivElement>(null);
+  const isNearBottomRef = useRef(true);
+  const [showScrollBottomBtn, setShowScrollBottomBtn] = useState(false);
+
+  const handleSetRole = async (segId: string, role: SpeakerRole) => {
+    try {
+      setIsUpdatingRole(segId);
+      // Optimistic update for instant visual feedback
+      setSegments((prev) =>
+        prev.map((s) => (s.id === segId ? { ...s, speaker_role: role } : s))
+      );
+      await setSegmentSpeakerRole(interviewId, segId, role);
+    } catch (err: any) {
+      console.error('Failed to set speaker role in live transcript:', err);
+    } finally {
+      setIsUpdatingRole(null);
+    }
+  };
+
+  const handleTranscriptScroll = () => {
+    if (!transcriptContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = transcriptContainerRef.current;
+    const isBottom = scrollHeight - scrollTop - clientHeight < 80;
+    isNearBottomRef.current = isBottom;
+    setShowScrollBottomBtn(!isBottom && segments.length > 0);
+  };
+
+  const scrollToBottom = (smooth = true) => {
+    if (!transcriptContainerRef.current) return;
+    transcriptContainerRef.current.scrollTo({
+      top: transcriptContainerRef.current.scrollHeight,
+      behavior: smooth ? 'smooth' : 'auto',
+    });
+    isNearBottomRef.current = true;
+    setShowScrollBottomBtn(false);
+  };
 
   // Monotonic timer
   useEffect(() => {
@@ -62,13 +100,20 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
         if (!isSubscribed) return;
         setBackendError('Связь с сервером бэкенда потеряна');
       }
-    }, 2000);
+    }, 800);
 
     return () => {
       isSubscribed = false;
       clearInterval(poll);
     };
   }, [interviewId]);
+
+  // Auto-scroll when new segments arrive if user is near bottom
+  useEffect(() => {
+    if (isNearBottomRef.current && segments.length > 0) {
+      scrollToBottom(true);
+    }
+  }, [segments]);
 
   const formatTime = (totalSeconds: number) => {
     const mins = Math.floor(totalSeconds / 60);
@@ -112,12 +157,11 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
       const stopResult = await stopAudioCapture();
 
       setStoppingStage('Фиксация состояния и манифестов сессии...');
-      const manifestsList: Record<string, unknown>[] = [];
-      if (stopResult.manifests?.interviewer) {
-        manifestsList.push(stopResult.manifests.interviewer);
-      }
-      if (stopResult.manifests?.candidate) {
-        manifestsList.push(stopResult.manifests.candidate);
+      let manifestsList: Array<TrackManifest | Record<string, unknown>> = [];
+      if (Array.isArray(stopResult.manifests)) {
+        manifestsList = stopResult.manifests;
+      } else if (stopResult.manifests && typeof stopResult.manifests === 'object') {
+        manifestsList = Object.values(stopResult.manifests);
       }
       await stopInterview(interviewId, manifestsList);
 
@@ -186,8 +230,10 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
     setEvalSuccessNotice(null);
 
     try {
-      // Find candidate speech segments
-      const candidateSegments = segments.filter((s) => s.track_id === 'candidate');
+      // Find candidate speech segments (both dual-track and manually assigned candidate role)
+      const candidateSegments = segments.filter(
+        (s) => s.track_id === 'candidate' || s.speaker_role === 'candidate'
+      );
       if (candidateSegments.length === 0) {
         setEvalSuccessNotice('Нет распознанных ответов кандидата для оценки.');
         setTimeout(() => setEvalSuccessNotice(null), 4000);
@@ -263,7 +309,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
       </div>
 
       {/* Main Grid: Left Questions, Center Live Transcripts, Right Live AI Copilot */}
-      <div className="flex-1 grid grid-cols-12 gap-0 overflow-hidden">
+      <div className="flex-1 grid grid-cols-12 gap-0 min-h-0 overflow-hidden">
         {/* Column 1: Questions Plan Navigator (3 cols) */}
         <div className="col-span-3 border-r border-slate-800 bg-slate-950/70 p-4 space-y-3 overflow-y-auto">
           <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">План вопросов</h3>
@@ -298,8 +344,8 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
         </div>
 
         {/* Column 2: Live Transcripts (5 cols) */}
-        <div className="col-span-5 border-r border-slate-800 flex flex-col bg-slate-950/40">
-          <div className="p-3 border-b border-slate-800/80 bg-slate-900/50 flex items-center justify-between">
+        <div className="col-span-5 border-r border-slate-800 flex flex-col bg-slate-950/40 min-h-0 relative">
+          <div className="p-3 border-b border-slate-800/80 bg-slate-900/50 flex items-center justify-between shrink-0">
             <div className="flex items-center space-x-2">
               <MessageSquare className="w-4 h-4 text-slate-400" />
               <span className="text-xs font-bold uppercase tracking-wider text-slate-300">Живая стенограмма</span>
@@ -307,7 +353,11 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
             <span className="text-[11px] text-slate-400">Whisper Large v3 Turbo (STT)</span>
           </div>
 
-          <div className="flex-1 p-4 space-y-4 overflow-y-auto">
+          <div
+            ref={transcriptContainerRef}
+            onScroll={handleTranscriptScroll}
+            className="flex-1 min-h-0 p-4 space-y-4 overflow-y-auto"
+          >
             {segments.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-slate-500 space-y-2 py-16">
                 <MessageSquare className="w-8 h-8 text-slate-600 animate-pulse" />
@@ -315,7 +365,9 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
               </div>
             ) : (
               segments.map((s) => {
-              const isCandidate = s.track_id === 'candidate';
+              const isCandidate = s.speaker_role === 'candidate' || (s.speaker_role !== 'interviewer' && s.track_id === 'candidate');
+              const isInterviewer = s.speaker_role === 'interviewer' || (s.speaker_role !== 'candidate' && s.track_id === 'interviewer');
+              const speakerLabel = isCandidate ? 'Кандидат' : isInterviewer ? 'Интервьюер' : 'Общий источник';
               const isHighlighted = selectedSegmentId === s.id;
               return (
                 <div
@@ -326,8 +378,8 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                   }`}
                 >
                   <div className="flex items-center space-x-2 mb-1">
-                    <span className={`text-[11px] font-semibold ${isCandidate ? 'text-emerald-400' : 'text-indigo-400'}`}>
-                      {isCandidate ? 'Кандидат' : 'Интервьюер'}
+                    <span className={`text-[11px] font-semibold ${isCandidate ? 'text-emerald-400' : isInterviewer ? 'text-indigo-400' : 'text-cyan-400'}`}>
+                      {speakerLabel}
                     </span>
                     <span className="text-[10px] text-slate-500 font-mono">
                       {Math.round(s.start_time_ms / 1000)}s - {Math.round(s.end_time_ms / 1000)}s
@@ -337,6 +389,42 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                         Подтверждающий фрагмент
                       </span>
                     )}
+
+                    {/* Quick Role Assignment Buttons */}
+                    <div className="flex items-center space-x-1 ml-1.5">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleSetRole(s.id, isCandidate ? 'unknown' : 'candidate');
+                        }}
+                        disabled={isUpdatingRole === s.id}
+                        className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition cursor-pointer ${
+                          isCandidate
+                            ? 'bg-emerald-600/40 text-emerald-300 border border-emerald-500/60 shadow-sm'
+                            : 'bg-slate-800/90 hover:bg-emerald-950/60 text-slate-400 hover:text-emerald-300 border border-slate-700/60'
+                        }`}
+                        title={isCandidate ? 'Снять роль кандидата' : 'Назначить репликой кандидата'}
+                      >
+                        Кандидат
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleSetRole(s.id, isInterviewer ? 'unknown' : 'interviewer');
+                        }}
+                        disabled={isUpdatingRole === s.id}
+                        className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition cursor-pointer ${
+                          isInterviewer
+                            ? 'bg-indigo-600/40 text-indigo-300 border border-indigo-500/60 shadow-sm'
+                            : 'bg-slate-800/90 hover:bg-indigo-950/60 text-slate-400 hover:text-indigo-300 border border-slate-700/60'
+                        }`}
+                        title={isInterviewer ? 'Снять роль интервьюера' : 'Назначить репликой интервьюера'}
+                      >
+                        Интервьюер
+                      </button>
+                    </div>
                   </div>
                   <div
                     className={`max-w-[85%] p-3 rounded-xl text-xs leading-relaxed transition-all ${
@@ -344,7 +432,9 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                         ? 'ring-2 ring-amber-400 bg-amber-950/40 border border-amber-500 text-amber-100 shadow-lg shadow-amber-950/50'
                         : isCandidate
                         ? 'bg-emerald-950/30 border border-emerald-800/50 text-emerald-100 rounded-tr-none'
-                        : 'bg-indigo-950/30 border border-indigo-800/50 text-indigo-100 rounded-tl-none'
+                        : isInterviewer
+                        ? 'bg-indigo-950/30 border border-indigo-800/50 text-indigo-100 rounded-tl-none'
+                        : 'bg-cyan-950/30 border border-cyan-800/50 text-cyan-100 rounded-tl-none'
                     }`}
                   >
                     {s.text}
@@ -353,6 +443,17 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
               );
             }))}
           </div>
+
+          {/* Floating Scroll to Bottom Button */}
+          {showScrollBottomBtn && (
+            <button
+              onClick={() => scrollToBottom(true)}
+              className="absolute bottom-4 right-4 flex items-center space-x-1.5 px-3 py-1.5 bg-indigo-600/90 hover:bg-indigo-500 text-white text-xs font-semibold rounded-full shadow-lg shadow-indigo-950/80 border border-indigo-400/40 backdrop-blur transition-all duration-200 animate-in fade-in cursor-pointer"
+            >
+              <ArrowDown className="w-3.5 h-3.5" />
+              <span>Вниз к новым</span>
+            </button>
+          )}
         </div>
 
         {/* Column 3: Live AI Copilot & Evidence (4 cols) */}

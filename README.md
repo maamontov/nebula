@@ -8,7 +8,9 @@
 
 Nebula — кроссплатформенный AI-помощник для проведения технических и профессиональных собеседований.
 
-Программа слушает интервьюера и кандидата (по двум изолированным аудиоканалам), распознаёт вопросы и ответы, предлагает предварительные оценки по заранее утверждённым рубрикам и формирует подтверждённое итоговое резюме собеседования.
+Программа поддерживает два режима аудиозахвата:
+- **Двухканальный (`dual_source`)**: раздельный захват интервьюера и кандидата по двум изолированным каналам с отслеживанием дрейфа тактовых генераторов (drift/skew).
+- **Одноканальный (`single_source`)**: захват с одного физического устройства (микрофон совещания или системный микс) в общую дорожку `shared` с маркировкой `unknown` и обязательной человеческой верификацией ролей говорящих перед отправкой в AI-оценку.
 
 Ключевой продуктовый принцип: **Nebula является системой поддержки принятия решений, а не автономным судьёй**. Оценки AI носят исключительно рекомендательный характер, а итоговое решение всегда принимает и подтверждает интервьюер.
 
@@ -16,7 +18,8 @@ Nebula — кроссплатформенный AI-помощник для пр�
 1. **Независимость от OpenAI и GPT**: работа ведётся через стандартный протокол `POST /v1/chat/completions` с открытыми или локальными моделями (Qwen, Llama, DeepSeek и др.). Никаких скрытых зависимостей от проприетарных сервисов OpenAI.
 2. **Детерминированный расчет баллов**: модель оценивает факты и соответствие критериям, но итоговый балл и покрытие рассчитываются детерминированной математической формулой бэкенда.
 3. **Программная валидация цитат (Evidence)**: любая оценка требует верифицируемой ссылки на транскрипт. Галлюцинации, фейковые цитаты и попытки prompt injection отсекаются валидатором.
-4. **Защита от дискриминации**: любые суждения по нерелевантным личным признакам (акцент, пол, тембр речи, возраст) блокируют утверждение оценки.
+4. **Изоляция авторства речи**: в режиме `single_source` неразмеченная общая речь (`unknown`) или реплики интервьюера категорически исключены из контекста оценки ответов кандидата.
+5. **Защита от дискриминации**: любые суждения по нерелевантным личным признакам (акцент, пол, тембр речи, возраст) блокируют утверждение оценки.
 
 ### Структура репозитория
 ```text
@@ -43,7 +46,7 @@ uv run pytest -v
 uv run ruff check .
 
 # 2. Запуск тестов нативного ядра захвата звука (Rust)
-cargo test --workspace
+cargo test --all
 
 # 3. Инспекция аудиоустройств ввода/вывода (CoreAudio / WASAPI)
 cargo run -p audio-spike -- list-devices
@@ -67,8 +70,8 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 
 ### Статус верификации и границы готовности
 - **Автоматически проверено (100% Green)**:
-  - 110 тестов Python/pytest (FastAPI эндпоинты, изоляция SQLite, детерминированный скоринг, валидатор доказательств, optimistic concurrency control, конечный автомат сессий, атомарный лизинг воркера, полная сквозная регрессионная матрица из 14 сценариев и сквозной тест десктопного пайплайна `test_desktop_pipeline_e2e.py`).
-  - 19 тестов Rust (`cargo test --workspace`), включая lock-free ringbuffer, WAV spooling и синтетическую часовую 2-канальную запись с компенсацией дрейфа тактовых генераторов (3600с симулированы за 42с без потерь).
+  - 124 теста Python/pytest (FastAPI эндпоинты, изоляция SQLite, детерминированный скоринг, валидатор доказательств, optimistic concurrency control, конечный автомат сессий, атомарный лизинг воркера, полная сквозная регрессионная матрица из 14 сценариев, поддержка single-source и сквозной тест десктопного пайплайна `test_desktop_pipeline_e2e.py`).
+  - 23 теста Rust (`cargo test --all`), включая lock-free ringbuffer, WAV spooling, IPC-контракты Tauri desktop и синтетическую часовую 2-канальную запись с компенсацией дрейфа тактовых генераторов (3600с симулированы за 40с без потерь).
   - Production-сборка десктопного фронтенда (`tsc && vite build` — 0 ошибок сборки и типизации).
 - **Проверено на физическом окружении**:
   - macOS Sonoma/Sequoia (Apple Silicon, нативный CoreAudio capture).
@@ -82,6 +85,7 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 - [План реализации](docs/implementation-plan.md)
 - [План исправлений по результатам ревью](docs/remediation-plan.md)
 - [Доработка рабочего пути Desktop → STT](docs/desktop-pipeline-remediation-plan.md)
+- [Исправление запуска и режим одного источника](docs/startup-and-single-source-plan.md)
 - [Отчёт об устранении дефектов десктопного пайплайна (Этапы A-G)](docs/desktop-pipeline-remediation-report.md)
 - [Отчёт о сквозной верификации, матрице регрессий и аудите (Этап 9)](docs/stage9-verification-and-audit.md)
 - [Спецификация контрактов и доменной модели](docs/contracts-spec.md)
@@ -97,7 +101,9 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 
 Nebula is a cross-platform AI copilot for conducting technical and professional interviews.
 
-The application captures both the interviewer and candidate audio channels independently, transcribes speech, maps questions and answers, proposes rubric-based criterion scores with verbatim evidence, and prepares a human-confirmed final report.
+The application supports two distinct audio capture modes:
+- **Dual-Channel Mode (`dual_source`)**: captures interviewer and candidate speech across two isolated hardware/software channels with continuous clock drift and skew tracking.
+- **Single-Channel Mode (`single_source`)**: captures a single hardware input (e.g., room microphone or conference mix) onto a shared track `shared` tagged as `unknown`, requiring explicit human speaker verification before sending candidate statements to AI evaluation.
 
 Core product principle: **Nebula is a decision-support system, not an autonomous hiring judge**. AI proposals are strictly advisory, and the final decision is always made and approved by the human interviewer.
 
@@ -105,7 +111,8 @@ Core product principle: **Nebula is a decision-support system, not an autonomous
 1. **Vendor Independence (No GPT Lock-in)**: operates via standard `POST /v1/chat/completions` using open or local models (Qwen, Llama, DeepSeek, etc.). Zero proprietary dependencies on OpenAI GPT models.
 2. **Deterministic Scoring Engine**: the LLM assesses content and criteria compliance, but question-level and final composite scores (along with coverage metrics) are computed deterministically on the backend.
 3. **Programmatic Evidence Verification**: every score proposal requires verifiable verbatim quotes from the candidate transcript. Hallucinated quotes and prompt injection attempts are blocked.
-4. **Bias Protection**: any scoring justifications referencing non-professional personal attributes (accent, vocal timbre, speech rate, gender, age) strictly block approval.
+4. **Speaker Attribution Isolation**: in `single_source` mode, unassigned speech (`unknown`) or interviewer speech is strictly excluded from candidate answer evaluation.
+5. **Bias Protection**: any scoring justifications referencing non-professional personal attributes (accent, vocal timbre, speech rate, gender, age) strictly block approval.
 
 ### Repository Layout
 ```text
@@ -132,7 +139,7 @@ uv run pytest -v
 uv run ruff check .
 
 # 2. Run native audio capture test suite (Rust)
-cargo test --workspace
+cargo test --all
 
 # 3. Inspect system audio input and output devices
 cargo run -p audio-spike -- list-devices
@@ -156,8 +163,8 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 
 ### Verification Status & Readiness Boundaries
 - **Automated Verification (100% Green)**:
-  - 110 Python/pytest tests (FastAPI endpoints, SQLite isolation, deterministic scoring engine, evidence validator, optimistic concurrency control, session state machine, atomic worker lease/lock handling, full 14-scenario end-to-end regression matrix, and `test_desktop_pipeline_e2e.py`).
-  - 19 Rust tests (`cargo test --workspace`), covering lock-free ringbuffer, WAV spooling, and synthetic 1-hour 2-channel recording with clock drift compensation (3600s simulated in 42s without sample loss).
+  - 124 Python/pytest tests (FastAPI endpoints, SQLite isolation, deterministic scoring engine, evidence validator, optimistic concurrency control, session state machine, atomic worker lease/lock handling, full 14-scenario end-to-end regression matrix, single-source mode, and `test_desktop_pipeline_e2e.py`).
+  - 23 Rust tests (`cargo test --all`), covering lock-free ringbuffer, WAV spooling, Tauri desktop IPC contracts, and synthetic 1-hour 2-channel recording with clock drift compensation (3600s simulated in 40s without sample loss).
   - Desktop frontend production build verified (`tsc && vite build` — 0 errors, full TypeScript type safety).
 - **Physical Environment Verification**:
   - macOS Sonoma/Sequoia (Apple Silicon, native CoreAudio capture).
@@ -171,6 +178,7 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 - [Implementation Plan](docs/implementation-plan.md)
 - [Remediation Plan (Russian)](docs/remediation-plan.md)
 - [Desktop → STT Integration Remediation (Russian)](docs/desktop-pipeline-remediation-plan.md)
+- [Startup and Single-Source Plan (Russian)](docs/startup-and-single-source-plan.md)
 - [Desktop Pipeline Remediation Report (Stages A-G)](docs/desktop-pipeline-remediation-report.md)
 - [End-to-End Verification, Regression Matrix & Audit Report (Stage 9)](docs/stage9-verification-and-audit.md)
 - [Contracts & Domain Model Specification](docs/contracts-spec.md)

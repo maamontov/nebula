@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { InterviewPlan, AssessmentProposal, TranscriptSegment, HumanAssessment } from '../types';
+import { InterviewPlan, AssessmentProposal, TranscriptSegment, HumanAssessment, SpeakerRole } from '../types';
 import {
   reviewAssessment,
   getInterview,
@@ -11,6 +11,8 @@ import {
   startBatchRetranscribe,
   getTranscriptDiff,
   getTranscriptRevisions,
+  setSegmentSpeakerRole,
+  splitSegment,
 } from '../services/api';
 import {
   Check,
@@ -33,6 +35,7 @@ import {
   RefreshCw,
   GitCompare,
   X,
+  Scissors,
 } from 'lucide-react';
 
 interface ReviewScreenProps {
@@ -84,6 +87,9 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
   // Exclusions map: question_id -> { isExcluded: boolean; reason: string }
   const [excludedQuestions, setExcludedQuestions] = useState<Record<string, { isExcluded: boolean; reason: string }>>({});
+  const [excludingQuestionModal, setExcludingQuestionModal] = useState<{ questionId: string; questionText: string } | null>(null);
+  const [exclusionReasonInput, setExclusionReasonInput] = useState('');
+  const [isSubmittingExclusion, setIsSubmittingExclusion] = useState(false);
 
   const [selectedQuote, setSelectedQuote] = useState<{ quote: string; segmentId: string } | null>(null);
   const [showFullTranscript, setShowFullTranscript] = useState(false);
@@ -93,6 +99,66 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [isEvaluatingAll, setIsEvaluatingAll] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [evalWarning, setEvalWarning] = useState<string | null>(null);
+
+  const [splittingSegment, setSplittingSegment] = useState<TranscriptSegment | null>(null);
+  const [splitTimeSec, setSplitTimeSec] = useState<number>(0);
+  const [splitText1, setSplitText1] = useState<string>('');
+  const [splitText2, setSplitText2] = useState<string>('');
+  const [splitRole1, setSplitRole1] = useState<SpeakerRole>('interviewer');
+  const [splitRole2, setSplitRole2] = useState<SpeakerRole>('candidate');
+  const [isUpdatingRole, setIsUpdatingRole] = useState<string | null>(null);
+
+  const handleSetRole = async (segId: string, role: SpeakerRole) => {
+    try {
+      setIsUpdatingRole(segId);
+      await setSegmentSpeakerRole(interviewId, segId, role);
+      setSegments((prev) =>
+        prev.map((s) => (s.id === segId ? { ...s, speaker_role: role } : s))
+      );
+    } catch (e: any) {
+      console.error('Failed to set speaker role:', e);
+      alert(`Ошибка изменения роли: ${e.message || e}`);
+    } finally {
+      setIsUpdatingRole(null);
+    }
+  };
+
+  const openSplitModal = (seg: TranscriptSegment) => {
+    const midTime = Math.round((seg.start_time_ms + seg.end_time_ms) / 2000);
+    const words = seg.text.split(' ');
+    const half = Math.max(1, Math.ceil(words.length / 2));
+    setSplittingSegment(seg);
+    setSplitTimeSec(midTime);
+    setSplitText1(words.slice(0, half).join(' '));
+    setSplitText2(words.slice(half).join(' '));
+    setSplitRole1('interviewer');
+    setSplitRole2('candidate');
+  };
+
+  const handleConfirmSplit = async () => {
+    if (!splittingSegment) return;
+    try {
+      const splitTimeMs = Math.round(splitTimeSec * 1000);
+      const res = await splitSegment(interviewId, splittingSegment.id, {
+        split_time_ms: splitTimeMs,
+        text_part1: splitText1,
+        text_part2: splitText2,
+        role_part1: splitRole1,
+        role_part2: splitRole2,
+      });
+      setSegments((prev) => {
+        const idx = prev.findIndex((s) => s.id === splittingSegment.id);
+        if (idx === -1) return prev;
+        const copy = [...prev];
+        copy.splice(idx, 1, res.segment_part1, res.segment_part2);
+        return copy;
+      });
+      setSplittingSegment(null);
+    } catch (e: any) {
+      console.error('Failed to split segment:', e);
+      alert(`Ошибка разделения сегмента: ${e.message || e}`);
+    }
+  };
 
   const loadData = useCallback(async () => {
     try {
@@ -264,8 +330,20 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     setRetranscribeError(null);
     setRetranscribeSuccess(null);
     try {
-      const nextRev = activeRevisionId === 'trans-rev-1' ? 'trans-rev-2' : `trans-rev-${Date.now().toString().slice(-4)}`;
-      const res = await startBatchRetranscribe(interviewId, nextRev);
+      let nextRevNum = 2;
+      if (availableRevisions && availableRevisions.length > 0) {
+        const nums = availableRevisions
+          .map((r) => {
+            const m = (r.revision_id || '').match(/^trans-rev-(\d+)$/);
+            return m ? parseInt(m[1], 10) : 0;
+          })
+          .filter((n) => !isNaN(n));
+        if (nums.length > 0) {
+          nextRevNum = Math.max(...nums) + 1;
+        }
+      }
+      const nextRev = `trans-rev-${nextRevNum}`;
+      const res = await startBatchRetranscribe(interviewId, nextRev, activeRevisionId);
       setRetranscribeSuccess(`Пакетная перестенограмма успешно завершена! Активная ревизия переключена на: ${res.new_revision_id}`);
       await loadData();
     } catch (err: any) {
@@ -332,39 +410,76 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     }
   };
 
-  const handleToggleExcludeQuestion = async (questionId: string) => {
+  const handleOpenExcludeModal = (questionId: string, questionText: string) => {
     if (isFinalized) return;
-    const currentEx = excludedQuestions[questionId]?.isExcluded;
-    if (currentEx) {
-      // Un-exclude
+    setExcludingQuestionModal({ questionId, questionText });
+    setExclusionReasonInput('');
+  };
+
+  const handleConfirmExclude = async () => {
+    if (!excludingQuestionModal) return;
+    const reason = exclusionReasonInput.trim();
+    if (!reason) {
+      alert('Исключение вопроса требует явного указания причины.');
+      return;
+    }
+
+    const qId = excludingQuestionModal.questionId;
+    setIsSubmittingExclusion(true);
+    try {
+      await reviewAssessment(interviewId, qId, {
+        expected_transcript_revision: activeRevisionId,
+        scores: [],
+        reviewer_notes: `Вопрос исключён экспертом: ${reason}`,
+        is_manually_adjusted: true,
+        is_excluded: true,
+        exclusion_reason: reason,
+      });
+      setExcludedQuestions((prev) => ({
+        ...prev,
+        [qId]: { isExcluded: true, reason },
+      }));
+      setExcludingQuestionModal(null);
+      setExclusionReasonInput('');
+      await loadData();
+    } catch (err: any) {
+      alert(`Ошибка при исключении вопроса: ${err?.message || err}`);
+    } finally {
+      setIsSubmittingExclusion(false);
+    }
+  };
+
+  const handleUnexcludeQuestion = async (questionId: string) => {
+    if (isFinalized) return;
+    const q = plan.questions.find((x) => x.id === questionId);
+    if (!q) return;
+
+    const qCrits = criterionScores[questionId] || {};
+    const scoresToSubmit = q.criteria.map((c) => {
+      const val = qCrits[c.id] ?? questionScores[questionId];
+      return {
+        criterion_id: c.id,
+        score: val !== undefined ? val : 3.0,
+      };
+    });
+
+    try {
+      await reviewAssessment(interviewId, questionId, {
+        expected_transcript_revision: activeRevisionId,
+        scores: scoresToSubmit,
+        reviewer_notes: 'Вопрос возвращён в оценку экспертом',
+        is_manually_adjusted: true,
+        is_excluded: false,
+        exclusion_reason: undefined,
+      });
       setExcludedQuestions((prev) => {
         const copy = { ...prev };
         delete copy[questionId];
         return copy;
       });
-    } else {
-      const reason = window.prompt('Укажите обязательную причину исключения этого вопроса:') || '';
-      if (!reason.trim()) {
-        alert('Исключение вопроса требует явного указания причины.');
-        return;
-      }
-      setExcludedQuestions((prev) => ({
-        ...prev,
-        [questionId]: { isExcluded: true, reason: reason.trim() },
-      }));
-      try {
-        await reviewAssessment(interviewId, questionId, {
-          expected_transcript_revision: activeRevisionId,
-          scores: [],
-          reviewer_notes: `Вопрос исключён экспертом: ${reason.trim()}`,
-          is_manually_adjusted: true,
-          is_excluded: true,
-          exclusion_reason: reason.trim(),
-        });
-        await loadData();
-      } catch (err: any) {
-        alert(`Ошибка при исключении вопроса: ${err?.message || err}`);
-      }
+      await loadData();
+    } catch (err: any) {
+      alert(`Ошибка при возврате вопроса в оценку: ${err?.message || err}`);
     }
   };
 
@@ -470,7 +585,9 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const handleAutoEvaluateAll = async () => {
     if (isFinalized) return;
     setEvalWarning(null);
-    const candidateSegments = segments.filter((s) => s.track_id === 'candidate');
+    const candidateSegments = segments.filter(
+      (s) => s.speaker_role === 'candidate' || (s.speaker_role !== 'interviewer' && s.track_id === 'candidate')
+    );
     if (candidateSegments.length === 0) {
       setEvalWarning('В стенограмме нет распознанной речи кандидата для запуска автооценки.');
       return;
@@ -493,22 +610,32 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           const data = await getInterview(interviewId);
           if (
             (data.assessment_proposals && data.assessment_proposals.length >= plan.questions.length) ||
-            attempts >= 10
+            attempts >= 30
           ) {
             clearInterval(poll);
             if (data.assessment_proposals && data.assessment_proposals.length > 0) {
               setProposals(data.assessment_proposals);
               const scores: Record<string, number> = {};
+              const critScores: Record<string, Record<string, number>> = {};
               data.assessment_proposals.forEach((p) => {
                 const sc = p.reviewed_scores?.[0]?.score ?? p.scores?.[0]?.score;
                 if (sc !== undefined) scores[p.question_id] = sc;
+                if (p.scores && p.scores.length > 0) {
+                  critScores[p.question_id] = {};
+                  p.scores.forEach((c) => {
+                    if (c.score !== undefined && c.score !== null) {
+                      critScores[p.question_id][c.criterion_id] = c.score;
+                    }
+                  });
+                }
               });
               setQuestionScores((prev) => ({ ...prev, ...scores }));
+              setCriterionScores((prev) => ({ ...prev, ...critScores }));
             }
             setIsEvaluatingAll(false);
           }
         } catch {
-          if (attempts >= 10) {
+          if (attempts >= 30) {
             clearInterval(poll);
             setIsEvaluatingAll(false);
           }
@@ -808,7 +935,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             ) : (
               segments.map((s) => {
                 const isSelected = selectedQuote?.segmentId === s.id;
-                const isCandidate = s.track_id === 'candidate';
+                const role = s.speaker_role || (s.track_id === 'candidate' ? 'candidate' : s.track_id === 'interviewer' ? 'interviewer' : 'unknown');
+                const isCandidate = role === 'candidate';
+                const isInterviewer = role === 'interviewer';
+                const isUnknown = role === 'unknown';
+
                 return (
                   <div
                     key={s.id}
@@ -818,18 +949,77 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                         ? 'ring-2 ring-amber-400 bg-amber-950/40 text-amber-100 border border-amber-500'
                         : isCandidate
                         ? 'bg-emerald-950/20 text-emerald-100 border border-emerald-900/40'
-                        : 'bg-indigo-950/20 text-indigo-100 border border-indigo-900/40'
+                        : isInterviewer
+                        ? 'bg-indigo-950/20 text-indigo-100 border border-indigo-900/40'
+                        : isUnknown
+                        ? 'bg-amber-950/20 text-amber-100 border border-amber-900/50'
+                        : 'bg-slate-900/40 text-slate-100 border border-slate-800'
                     }`}
                   >
                     <div className="flex items-center justify-between mb-1 text-[10px] text-slate-400">
-                      <span className="font-semibold text-slate-300">
-                        {isCandidate ? 'Кандидат' : 'Интервьюер'}
-                      </span>
-                      <span className="font-mono">
-                        {Math.round(s.start_time_ms / 1000)}s - {Math.round(s.end_time_ms / 1000)}s
-                      </span>
+                      <div className="flex items-center space-x-2">
+                        <span
+                          className={`font-semibold px-2 py-0.5 rounded text-[11px] ${
+                            isCandidate
+                              ? 'bg-emerald-900/60 text-emerald-300 border border-emerald-800/50'
+                              : isInterviewer
+                              ? 'bg-indigo-900/60 text-indigo-300 border border-indigo-800/50'
+                              : 'bg-amber-900/70 text-amber-300 border border-amber-700/60 font-medium'
+                          }`}
+                        >
+                          {isCandidate ? 'Кандидат' : isInterviewer ? 'Интервьюер' : 'Общая дорожка (роль не назначена)'}
+                        </span>
+                        {s.track_id === 'shared' && (
+                          <span className="text-[9px] text-slate-500 font-mono">общий источник</span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center space-x-3">
+                        <span className="font-mono text-slate-400">
+                          {Math.round(s.start_time_ms / 1000)}с - {Math.round(s.end_time_ms / 1000)}с
+                        </span>
+                        {!isFinalized && (
+                          <div className="flex items-center space-x-1">
+                            <button
+                              type="button"
+                              onClick={() => handleSetRole(s.id, 'candidate')}
+                              disabled={isCandidate || isUpdatingRole === s.id}
+                              className={`px-2 py-0.5 rounded text-[10px] font-medium transition ${
+                                isCandidate
+                                  ? 'bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 cursor-default'
+                                  : 'bg-slate-800 hover:bg-emerald-900/50 text-slate-400 hover:text-emerald-200'
+                              }`}
+                              title="Назначить репликой кандидата"
+                            >
+                              Кандидат
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleSetRole(s.id, 'interviewer')}
+                              disabled={isInterviewer || isUpdatingRole === s.id}
+                              className={`px-2 py-0.5 rounded text-[10px] font-medium transition ${
+                                isInterviewer
+                                  ? 'bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 cursor-default'
+                                  : 'bg-slate-800 hover:bg-indigo-900/50 text-slate-400 hover:text-indigo-200'
+                              }`}
+                              title="Назначить репликой интервьюера"
+                            >
+                              Интервьюер
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openSplitModal(s)}
+                              className="px-2 py-0.5 rounded text-[10px] bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center space-x-1 transition"
+                              title="Разделить сегмент на две отдельные реплики"
+                            >
+                              <Scissors className="w-3 h-3 text-slate-400" />
+                              <span>Разделить</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     </div>
-                    <p>{s.text}</p>
+                    <p className="mt-1 text-slate-200">{s.text}</p>
                   </div>
                 );
               })
@@ -867,8 +1057,19 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           </div>
         )}
 
+        {segments.some((s) => (s.speaker_role || (s.track_id === 'shared' ? 'unknown' : s.track_id)) === 'unknown') && (
+          <div className="p-3 bg-amber-950/30 border border-amber-800/70 text-amber-200 text-xs rounded-lg flex items-start space-x-2">
+            <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+            <div>
+              <strong>Внимание:</strong> В стенограмме обнаружены сегменты без назначенной роли говорящего (общая дорожка).
+              По правилам Nebula для оценки ответов кандидата используются <em>только</em> сегменты с ролью «Кандидат».
+              Пожалуйста, разметьте роли в раскрывающемся блоке «Полная стенограмма» выше.
+            </div>
+          </div>
+        )}
+
         {plan.questions.map((q, idx) => {
-          const prop = proposals.find((p) => p.question_id === q.id);
+          const prop = [...proposals].reverse().find((p) => p.question_id === q.id);
           const currentScore = questionScores[q.id] ?? prop?.scores?.[0]?.score;
           const isSaved = savedSuccess[q.id];
           const isExcluded = excludedQuestions[q.id]?.isExcluded;
@@ -923,13 +1124,25 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
                 <div className="flex items-center space-x-2">
                   {!isFinalized && (
-                    <button
-                      type="button"
-                      onClick={() => handleToggleExcludeQuestion(q.id)}
-                      className="px-2.5 py-1 text-[11px] font-medium text-slate-400 hover:text-rose-300 bg-slate-900 border border-slate-800 rounded-lg hover:border-rose-800 transition cursor-pointer"
-                    >
-                      {isExcluded ? 'Вернуть в оценку' : 'Исключить вопрос'}
-                    </button>
+                    isExcluded ? (
+                      <button
+                        type="button"
+                        onClick={() => handleUnexcludeQuestion(q.id)}
+                        className="px-2.5 py-1 text-[11px] font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-950/40 border border-emerald-800/60 rounded-lg hover:border-emerald-700 transition cursor-pointer flex items-center space-x-1"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        <span>Вернуть в оценку</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenExcludeModal(q.id, q.text || (q as any).prompt || '')}
+                        className="px-2.5 py-1 text-[11px] font-medium text-slate-400 hover:text-rose-300 bg-slate-900 border border-slate-800 rounded-lg hover:border-rose-800 transition cursor-pointer flex items-center space-x-1"
+                      >
+                        <XCircle className="w-3 h-3" />
+                        <span>Исключить вопрос</span>
+                      </button>
+                    )
                   )}
 
                   {!isExcluded && (
@@ -1305,6 +1518,210 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Split Segment Modal */}
+      {splittingSegment && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-xl w-full p-6 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2 text-indigo-400">
+                <Scissors className="w-5 h-5" />
+                <h3 className="text-base font-semibold text-white">Разделение сегмента речи</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSplittingSegment(null)}
+                className="text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-400">
+              Исходный интервал: {Math.round(splittingSegment.start_time_ms / 1000)}с - {Math.round(splittingSegment.end_time_ms / 1000)}с.
+              Укажите время границы разделения и распределите текст и роли участников.
+            </p>
+
+            <div className="space-y-1">
+              <label className="block text-xs font-medium text-slate-300">
+                Время разделения (секунды):
+              </label>
+              <input
+                type="number"
+                step="0.5"
+                min={Math.ceil(splittingSegment.start_time_ms / 1000)}
+                max={Math.floor(splittingSegment.end_time_ms / 1000)}
+                value={splitTimeSec}
+                onChange={(e) => setSplitTimeSec(parseFloat(e.target.value) || 0)}
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-100"
+              />
+            </div>
+
+            {/* Part 1 */}
+            <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-300">
+                  Часть 1 ({Math.round(splittingSegment.start_time_ms / 1000)}с - {splitTimeSec}с)
+                </span>
+                <select
+                  value={splitRole1}
+                  onChange={(e) => setSplitRole1(e.target.value as SpeakerRole)}
+                  className="bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-xs text-slate-200"
+                >
+                  <option value="interviewer">Интервьюер</option>
+                  <option value="candidate">Кандидат</option>
+                  <option value="unknown">Не назначено</option>
+                </select>
+              </div>
+              <textarea
+                value={splitText1}
+                onChange={(e) => setSplitText1(e.target.value)}
+                rows={3}
+                className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                placeholder="Текст первой реплики..."
+              />
+            </div>
+
+            {/* Part 2 */}
+            <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-300">
+                  Часть 2 ({splitTimeSec}с - {Math.round(splittingSegment.end_time_ms / 1000)}с)
+                </span>
+                <select
+                  value={splitRole2}
+                  onChange={(e) => setSplitRole2(e.target.value as SpeakerRole)}
+                  className="bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-xs text-slate-200"
+                >
+                  <option value="candidate">Кандидат</option>
+                  <option value="interviewer">Интервьюер</option>
+                  <option value="unknown">Не назначено</option>
+                </select>
+              </div>
+              <textarea
+                value={splitText2}
+                onChange={(e) => setSplitText2(e.target.value)}
+                rows={3}
+                className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                placeholder="Текст второй реплики..."
+              />
+            </div>
+
+            <div className="flex items-center justify-end space-x-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setSplittingSegment(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg font-medium transition cursor-pointer"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmSplit}
+                disabled={!splitText1.trim() || !splitText2.trim()}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs rounded-lg font-medium shadow-md shadow-indigo-600/30 transition cursor-pointer"
+              >
+                Применить разделение
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Exclude Question Modal */}
+      {excludingQuestionModal && (
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2 text-rose-400">
+                <XCircle className="w-5 h-5" />
+                <h3 className="text-base font-semibold text-white">Исключить вопрос из оценки</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setExcludingQuestionModal(null)}
+                className="text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-lg space-y-1">
+              <span className="text-[11px] font-semibold text-indigo-400">Вопрос:</span>
+              <p className="text-xs text-slate-200 line-clamp-3">{excludingQuestionModal.questionText}</p>
+            </div>
+
+            <p className="text-xs text-slate-400 leading-relaxed">
+              По регламенту Nebula исключение вопроса требует обязательного указания обоснованной причины эксперта. Вопрос не будет влиять на итоговый скоринг и покрытие.
+            </p>
+
+            <div className="space-y-1.5">
+              <label className="block text-xs font-medium text-slate-300">
+                Быстрый выбор типовой причины:
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  'Не успели обсудить (нехватка времени)',
+                  'Тема не входит в специализацию кандидата',
+                  'Технический сбой связи / аудио',
+                  'Вопрос пропущен по согласованию',
+                ].map((quickReason) => (
+                  <button
+                    key={quickReason}
+                    type="button"
+                    onClick={() => setExclusionReasonInput(quickReason)}
+                    className={`px-2 py-1 text-[11px] rounded border transition cursor-pointer text-left ${
+                      exclusionReasonInput === quickReason
+                        ? 'bg-rose-950/80 border-rose-600 text-rose-200'
+                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                    }`}
+                  >
+                    {quickReason}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <label className="block text-xs font-medium text-slate-300">
+                Причина исключения (обязательно):
+              </label>
+              <textarea
+                value={exclusionReasonInput}
+                onChange={(e) => setExclusionReasonInput(e.target.value)}
+                rows={3}
+                placeholder="Опишите причину исключения вопроса из оценки..."
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-100 focus:outline-none focus:border-rose-500"
+              />
+            </div>
+
+            <div className="flex items-center justify-end space-x-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setExcludingQuestionModal(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg font-medium transition cursor-pointer"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmExclude}
+                disabled={!exclusionReasonInput.trim() || isSubmittingExclusion}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-xs rounded-lg font-semibold shadow-md shadow-rose-600/30 transition cursor-pointer flex items-center space-x-1.5"
+              >
+                {isSubmittingExclusion ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Исключение...</span>
+                  </>
+                ) : (
+                  <span>Исключить вопрос</span>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
