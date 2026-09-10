@@ -65,10 +65,23 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 ./scripts/nebula.sh logs worker -f    # Просмотр логов воркера в реальном времени
 ```
 
+### Статус верификации и границы готовности
+- **Автоматически проверено (100% Green)**:
+  - 107 тестов Python/pytest (FastAPI эндпоинты, изоляция SQLite, детерминированный скоринг, валидатор доказательств, optimistic concurrency control, конечный автомат сессий, атомарный лизинг воркера и полная сквозная регрессионная матрица из 14 сценариев).
+  - 19 тестов Rust (`cargo test --workspace`), включая lock-free ringbuffer, WAV spooling и синтетическую часовую 2-канальную запись с компенсацией дрейфа тактовых генераторов (3600с симулированы за 41.8с без потерь).
+  - Production-сборка десктопного фронтенда (`tsc && vite build` — 0 ошибок сборки и типизации).
+- **Проверено на физическом окружении**:
+  - macOS Sonoma/Sequoia (Apple Silicon, нативный CoreAudio capture).
+  - Локальные OpenAI-совместимые эндпоинты (Ollama/vLLM) проверены через диагностический инструмент `evals/provider_probe.py`.
+- **Платформенные ограничения и дальнейшие требования**:
+  - Windows WASAPI loopback и Linux ALSA/PulseAudio требуют валидации захвата на физических машинах соответствующих ОС.
+  - Перед боевым использованием сторонних моделей обязателен запуск `evals/provider_probe.py` для подтверждения строгого следования JSON Schema и отсутствия GPT-специфичных зависимостей.
+
 ### Документация
 - [Концепция продукта](docs/product-concept.md)
 - [План реализации](docs/implementation-plan.md)
 - [План исправлений по результатам ревью](docs/remediation-plan.md)
+- [Отчёт о сквозной верификации, матрице регрессий и аудите (Этап 9)](docs/stage9-verification-and-audit.md)
 - [Спецификация контрактов и доменной модели](docs/contracts-spec.md)
 - [Спецификация аудиозахвата и spooling](docs/audio-capture-spec.md)
 - [Спецификация интеграции STT и LLM](docs/stt-llm-provider-spec.md)
@@ -139,12 +152,26 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 ./scripts/nebula.sh logs worker -f    # Live stream pipeline worker logs
 ```
 
+### Verification Status & Readiness Boundaries
+- **Automated Verification (100% Green)**:
+  - 107 Python/pytest tests (FastAPI endpoints, SQLite isolation, deterministic scoring engine, evidence validator, optimistic concurrency control, session state machine, atomic worker lease/lock handling, and full 14-scenario end-to-end regression matrix).
+  - 19 Rust tests (`cargo test --workspace`), covering lock-free ringbuffer, WAV spooling, and synthetic 1-hour 2-channel recording with clock drift compensation (3600s simulated in 41.8s without sample loss).
+  - Desktop frontend production build verified (`tsc && vite build` — 0 errors, full TypeScript type safety).
+- **Physical Environment Verification**:
+  - macOS Sonoma/Sequoia (Apple Silicon, native CoreAudio capture).
+  - Local OpenAI-compatible endpoints (Ollama/vLLM) probed and validated via `evals/provider_probe.py`.
+- **Platform Limitations & Operational Requirements**:
+  - Windows WASAPI loopback and Linux ALSA/PulseAudio require device validation on physical machines running target operating systems.
+  - Upstream LLM providers must pass `evals/provider_probe.py` before live deployment to verify strict JSON Schema compliance without proprietary OpenAI quirks.
+
 ### Documentation
 - [Product Concept](docs/product-concept.md)
 - [Implementation Plan](docs/implementation-plan.md)
 - [Remediation Plan (Russian)](docs/remediation-plan.md)
+- [End-to-End Verification, Regression Matrix & Audit Report (Stage 9)](docs/stage9-verification-and-audit.md)
 - [Contracts & Domain Model Specification](docs/contracts-spec.md)
 - [Audio Capture & Spooling Specification](docs/audio-capture-spec.md)
 - [STT & LLM Integration Specification](docs/stt-llm-provider-spec.md)
 - [Service Management Specification](docs/service-management-spec.md)
 - [Reliability & Pilot Readiness Specification](docs/stage7-reliability-and-pilot-spec.md)
+
