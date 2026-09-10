@@ -65,13 +65,19 @@ def validate_evidence_quote(evidence: EvidenceRef, segment_text: str) -> tuple[b
 def validate_proposal(
     proposal: AssessmentProposal,
     transcript: TranscriptRevision,
+    allowed_criteria_ids: list[str] | set[str] | None = None,
+    min_score: float = 1.0,
+    max_score: float = 5.0,
 ) -> EvidenceValidationResult:
     """
     Performs rigorous verification of an AssessmentProposal against the real TranscriptRevision:
     1. Ensures segment IDs exist in the transcript revision.
-    2. Ensures verbatim quotes exist in the referenced segments.
-    3. Flags forbidden personal attribute bias.
-    4. Detects suspicious prompt injection attempts.
+    2. Ensures evidence quotes strictly originate from the candidate speech track (not interviewer).
+    3. Ensures verbatim quotes exist in the referenced segments.
+    4. Enforces criterion score ranges (e.g. 1.0 to 5.0) and membership in question criteria.
+    5. Validates character offsets when provided.
+    6. Flags forbidden personal attribute bias.
+    7. Detects suspicious prompt injection attempts.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -96,14 +102,27 @@ def validate_proposal(
                 )
                 requires_review = True
 
-        # 3. If score is provided, evidence should ideally be present
+        # 3. Check criterion membership if allowed_criteria_ids is supplied
+        if allowed_criteria_ids and score_item.criterion_id not in allowed_criteria_ids:
+            errors.append(
+                f"Criterion '{score_item.criterion_id}' does not belong to question criteria: {list(allowed_criteria_ids)}."
+            )
+
+        # 4. Check score range
+        if score_item.score is not None:
+            if score_item.score < min_score or score_item.score > max_score:
+                errors.append(
+                    f"Score {score_item.score} for criterion '{score_item.criterion_id}' is out of allowed range [{min_score}, {max_score}]."
+                )
+
+        # 5. If score is provided, evidence should ideally be present
         if score_item.score is not None and not score_item.evidence:
             warnings.append(
                 f"Criterion '{score_item.criterion_id}' has a score ({score_item.score}) but no supporting evidence quotes."
             )
             requires_review = True
 
-        # 4. Validate every evidence item
+        # 6. Validate every evidence item
         for ev in score_item.evidence:
             seg = segments_by_id.get(ev.segment_id)
             if not seg:
@@ -112,11 +131,24 @@ def validate_proposal(
                 )
                 continue
 
+            # Ensure evidence comes from candidate speech track!
+            track_str = seg.track_id.value if hasattr(seg.track_id, "value") else str(seg.track_id).lower()
+            if track_str != "candidate":
+                errors.append(
+                    f"Evidence for criterion '{score_item.criterion_id}' references {track_str} track segment '{ev.segment_id}'. Evidence quotes must strictly come from candidate track."
+                )
+
             is_valid_quote, err_msg = validate_evidence_quote(ev, seg.text)
             if not is_valid_quote:
                 errors.append(
                     f"Invalid evidence for criterion '{score_item.criterion_id}': {err_msg}"
                 )
+
+            if ev.start_char is not None and ev.end_char is not None:
+                if ev.start_char < 0 or ev.end_char > len(seg.text) or ev.start_char > ev.end_char:
+                    errors.append(
+                        f"Invalid char offsets [{ev.start_char}:{ev.end_char}] for segment length {len(seg.text)}."
+                    )
 
     if proposal.critical_errors:
         requires_review = True

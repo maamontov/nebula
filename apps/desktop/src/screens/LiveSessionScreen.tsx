@@ -159,18 +159,14 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
     try {
       // Find candidate speech segments
       const candidateSegments = segments.filter((s) => s.track_id === 'candidate');
-      const candidateText = candidateSegments.map((s) => s.text).join(' ').trim();
-      if (!candidateText || candidateSegments.length === 0) {
+      if (candidateSegments.length === 0) {
         setEvalSuccessNotice('Нет распознанных ответов кандидата для оценки.');
         setTimeout(() => setEvalSuccessNotice(null), 4000);
         return;
       }
-      const lastSegId = candidateSegments[candidateSegments.length - 1].id;
 
       await enqueueJob(interviewId, 'EVALUATE_QUESTION', {
         question_id: currentQ.id,
-        candidate_text: candidateText,
-        segment_id: lastSegId,
         rubric_description: currentQ.criteria.map((c) => c.title).join(', '),
       });
 
@@ -421,6 +417,26 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                         {err}
                       </p>
                     ))}
+                  </div>
+                )}
+
+                {currentProp.is_rejected && (
+                  <div className="p-3 bg-rose-950/60 border border-rose-800 rounded-xl space-y-1">
+                    <div className="flex items-center space-x-1.5 text-xs font-bold text-rose-300">
+                      <AlertTriangle className="w-3.5 h-3.5" />
+                      <span>Предложение отклонено валидатором</span>
+                    </div>
+                    {currentProp.validation_errors && currentProp.validation_errors.length > 0 ? (
+                      <ul className="list-disc list-inside text-[11px] text-rose-200/90 pl-1 space-y-0.5">
+                        {currentProp.validation_errors.map((err, errIdx) => (
+                          <li key={errIdx}>{err}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-[11px] text-rose-200">
+                        Цитаты модели не найдены в стенограмме кандидата.
+                      </p>
+                    )}
                   </div>
                 )}
               </div>

@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS assessment_proposals (
     model_profile_id TEXT NOT NULL,
     scores_json TEXT NOT NULL,
     critical_errors_json TEXT NOT NULL DEFAULT '[]',
+    is_rejected INTEGER NOT NULL DEFAULT 0,
+    validation_errors_json TEXT NOT NULL DEFAULT '[]',
+    provider_id TEXT,
+    fallback_metadata_json TEXT,
     is_approved INTEGER NOT NULL DEFAULT 0,
     is_stale INTEGER NOT NULL DEFAULT 0,
     stale_reason TEXT,
@@ -121,6 +125,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     attempts INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 3,
     locked_until TEXT,
+    locked_by TEXT,
     error_message TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL

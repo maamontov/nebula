@@ -28,6 +28,8 @@ from backend.db.repository import Repository
 from contracts.audio import TrackType
 from contracts.domain import (
     AssessmentProposal,
+    CriterionScoreProposal,
+    EvidenceRef,
     TranscriptRevision,
     TranscriptSegment,
 )
@@ -51,7 +53,7 @@ class PipelineWorker:
         self._running = False
 
     async def process_one_job(self) -> bool:
-        """Claims and executes a single job. Returns True if job was processed."""
+        """Claims and executes a single job with atomic lease lock. Returns True if job was processed."""
         job = self.repo.claim_next_job(lock_duration_sec=60)
         if not job:
             return False
@@ -60,12 +62,13 @@ class PipelineWorker:
         job_type = job["type"]
         interview_id = job["interview_id"]
         payload = job["payload"]
+        owner_token = job.get("locked_by")
 
         # Check if interview exists before processing (privacy lifecycle protection)
         interview = self.repo.get_interview(interview_id)
         if not interview:
             logger.warning("Interview %s was deleted. Discarding job %s without saving results.", interview_id, job_id)
-            self.repo.fail_job(job_id, "Interview was deleted (privacy lifecycle)")
+            self.repo.fail_job(job_id, "Interview was deleted (privacy lifecycle)", owner_token=owner_token)
             return True
 
         try:
@@ -83,10 +86,10 @@ class PipelineWorker:
             # Re-verify interview wasn't deleted while job was running
             if not self.repo.get_interview(interview_id):
                 logger.warning("Interview %s deleted during execution. Discarding job %s.", interview_id, job_id)
-                self.repo.fail_job(job_id, "Interview was deleted during execution")
+                self.repo.fail_job(job_id, "Interview was deleted during execution", owner_token=owner_token)
                 return True
 
-            self.repo.complete_job(job_id)
+            self.repo.complete_job(job_id, owner_token=owner_token)
             self.repo.record_audit_event(
                 event_id=f"audit-{uuid.uuid4().hex[:8]}",
                 interview_id=interview_id,
@@ -96,7 +99,7 @@ class PipelineWorker:
             return True
         except Exception as exc:  # noqa: BLE001
             logger.exception("Job %s (%s) failed: %s", job_id, job_type, exc)
-            self.repo.fail_job(job_id, str(exc))
+            self.repo.fail_job(job_id, str(exc), owner_token=owner_token)
             self.repo.record_audit_event(
                 event_id=f"audit-{uuid.uuid4().hex[:8]}",
                 interview_id=interview_id,
@@ -151,36 +154,117 @@ class PipelineWorker:
             return
 
         question_id = payload["question_id"]
-        candidate_text = payload["candidate_text"]
-        segment_id = payload.get("segment_id", "seg-default")
-        rubric_description = payload.get("rubric_description", "Technical depth & correctness")
+        rubric_rev = payload.get("rubric_revision_id", "rub-rev-1")
+        trans_rev = payload.get("transcript_revision_id", "trans-rev-1")
 
-        # Build prompt & schema
-        schema_desc = """
+        # 1. Fetch Question details and criteria from latest interview plan
+        plan_dict = self.repo.get_latest_plan(interview_id)
+        question_text = ""
+        criteria = []
+        if plan_dict and "payload" in plan_dict:
+            questions = plan_dict["payload"].get("questions", [])
+            for q in questions:
+                if q.get("id") == question_id:
+                    question_text = q.get("text", "")
+                    criteria = q.get("criteria", [])
+                    break
+
+        rubric_description = payload.get("rubric_description")
+        if not rubric_description:
+            if criteria:
+                rubric_description = "; ".join(f"{c.get('id')}: {c.get('title')}" for c in criteria)
+            else:
+                rubric_description = "Technical depth & correctness"
+
+        # 2. Fetch transcript segments and associations for this interview
+        all_segments = self.repo.get_transcript_segments(interview_id)
+        assocs = self.repo.get_associations(interview_id)
+
+        # Identify candidate speech segments associated with this question
+        associated_seg_ids = {a["segment_id"] for a in assocs if a.get("question_id") == question_id}
+        candidate_segments_data: list[dict[str, Any]] = [
+            s for s in all_segments
+            if s["id"] in associated_seg_ids and str(s.get("track_id", "")).lower() in ("candidate", "tracktype.candidate")
+        ]
+
+        # If no associated segments found, look for candidate segments or payload fallback
+        if not candidate_segments_data:
+            cand_all = [
+                s for s in all_segments
+                if str(s.get("track_id", "")).lower() in ("candidate", "tracktype.candidate")
+            ]
+            if cand_all and not payload.get("candidate_text"):
+                candidate_segments_data = cand_all
+
+        # Backwards-compatibility fallback if no segments in DB (e.g. from direct payload)
+        if not candidate_segments_data and payload.get("candidate_text"):
+            candidate_segments_data = [
+                {
+                    "id": payload.get("segment_id", "seg-default"),
+                    "track_id": "candidate",
+                    "start_time_ms": 0,
+                    "end_time_ms": 10000,
+                    "text": payload["candidate_text"],
+                }
+            ]
+
+        # 3. Build candidate speech text with explicit individual segment IDs
+        if candidate_segments_data:
+            transcript_content = "\n".join(
+                f"[{s['id']}]: \"{s.get('text', '').strip()}\""
+                for s in candidate_segments_data
+            )
+            primary_seg_id = candidate_segments_data[0]["id"]
+        else:
+            transcript_content = "(Кандидат не дал ответа на этот вопрос)"
+            primary_seg_id = "seg-none"
+
+        first_crit_id = criteria[0]["id"] if criteria else "criterion-core"
+
+        schema_desc = f"""
 Respond strictly with a JSON object conforming to:
-{
+{{
   "scores": [
-    {
-      "criterion_id": "criterion-core",
+    {{
+      "criterion_id": "{first_crit_id}",
       "score": 5.0,
       "explanation": "...",
-      "evidence": [{"segment_id": "''' + segment_id + '''", "exact_quote": "..."}]
-    }
+      "evidence": [{{"segment_id": "{primary_seg_id}", "exact_quote": "..."}}]
+    }}
   ],
   "critical_errors": []
-}
+}}
 """
+        criteria_prompt = ""
+        if criteria:
+            criteria_prompt = "Критерии рубрики:\n" + "\n".join(
+                f"- ID: '{c.get('id')}', Название: '{c.get('title')}', Вес: {c.get('weight', 1.0)}"
+                for c in criteria
+            )
+        else:
+            criteria_prompt = f"Рубрика: {rubric_description}"
+
         messages = [
             {
                 "role": "system",
-                "content": f"Ты эксперт технической оценки собеседований. Оцени ответ кандидата по рубрике: {rubric_description}. Обязательно включи дословную точную цитату exact_quote из ответа с указанием segment_id='{segment_id}'.\n{schema_desc}",
+                "content": (
+                    f"Ты эксперт технической оценки собеседований. "
+                    f"Оцени ответ кандидата на вопрос: \"{question_text or rubric_description}\".\n"
+                    f"{criteria_prompt}\n"
+                    f"ВАЖНО:\n"
+                    f"1. Шкала оценок: от 1.0 (минимум) до 5.0 (максимум).\n"
+                    f"2. Для каждого критерия обязательно укажи segment_id и дословную точную цитату exact_quote из речи кандидата.\n"
+                    f"3. Цитата обязана строго и дословно совпадать с текстом соответствующего сегмента кандидата. Не придумывай цитаты!\n"
+                    f"{schema_desc}"
+                ),
             },
             {
                 "role": "user",
-                "content": f"Транскрипт кандидата [{segment_id}]: \"{candidate_text}\"",
+                "content": f"Речь кандидата по вопросу:\n{transcript_content}",
             },
         ]
 
+        # 4. Execute request through resilient LLM adapter
         if isinstance(self.llm_adapter, ResilientLLMAdapter):
             llm_res, actual_model_id = await self.llm_adapter.execute_request(
                 messages=messages,
@@ -194,12 +278,13 @@ Respond strictly with a JSON object conforming to:
                 },
                 schema_name="assessment_schema",
             )
-            if self.llm_adapter.last_fallback_event:
+            fallback_metadata = self.llm_adapter.last_fallback_event
+            if fallback_metadata:
                 self.repo.record_audit_event(
                     event_id=f"audit-{uuid.uuid4().hex[:8]}",
                     interview_id=interview_id,
                     event_type="MODEL_FALLBACK_TRIGGERED",
-                    payload=self.llm_adapter.last_fallback_event,
+                    payload=fallback_metadata,
                 )
         else:
             raw_res = await self.llm_adapter.execute_request(
@@ -214,6 +299,7 @@ Respond strictly with a JSON object conforming to:
                 },
                 schema_name="assessment_schema",
             )
+            fallback_metadata = None
             if isinstance(raw_res, tuple):
                 llm_res, actual_model_id = raw_res
             else:
@@ -224,9 +310,27 @@ Respond strictly with a JSON object conforming to:
         scores = parsed_json.get("scores", [])
         critical_errors = parsed_json.get("critical_errors", [])
 
-        # Validate with EvidenceValidator
-        rubric_rev = payload.get("rubric_revision_id", "rub-rev-1")
-        trans_rev = payload.get("transcript_revision_id", "trans-rev-1")
+        # 5. Programmatic Evidence Validation
+        proposal_scores_objs: list[CriterionScoreProposal] = []
+        for s in scores:
+            ev_list = []
+            for ev in s.get("evidence", []):
+                ev_list.append(
+                    EvidenceRef(
+                        segment_id=ev.get("segment_id", ""),
+                        exact_quote=ev.get("exact_quote", ""),
+                        start_char=ev.get("start_char"),
+                        end_char=ev.get("end_char"),
+                    )
+                )
+            proposal_scores_objs.append(
+                CriterionScoreProposal(
+                    criterion_id=s.get("criterion_id", first_crit_id),
+                    score=float(s["score"]) if s.get("score") is not None else None,
+                    explanation=s.get("explanation", ""),
+                    evidence=ev_list,
+                )
+            )
 
         proposal = AssessmentProposal(
             id=f"prop-{uuid.uuid4().hex[:8]}",
@@ -235,26 +339,41 @@ Respond strictly with a JSON object conforming to:
             rubric_revision_id=rubric_rev,
             transcript_revision_id=trans_rev,
             model_profile_id=actual_model_id,
-            scores=scores,
+            scores=proposal_scores_objs,
             critical_errors=critical_errors,
         )
 
-        transcript = TranscriptRevision(
+        # Build TranscriptRevision with all segments available in interview
+        transcript_segment_objs: list[TranscriptSegment] = []
+        source_segments = all_segments if all_segments else candidate_segments_data
+        for s in source_segments:
+            track = (
+                TrackType.CANDIDATE
+                if str(s.get("track_id", "")).lower() in ("candidate", "tracktype.candidate")
+                else TrackType.INTERVIEWER
+            )
+            transcript_segment_objs.append(
+                TranscriptSegment(
+                    id=s["id"],
+                    track_id=track,
+                    start_time_ms=s.get("start_time_ms", 0),
+                    end_time_ms=s.get("end_time_ms", 0),
+                    text=s.get("text", "").strip(),
+                )
+            )
+
+        transcript_obj = TranscriptRevision(
             revision_id=trans_rev,
             interview_id=interview_id,
-            segments=[
-                TranscriptSegment(
-                    id=segment_id,
-                    track_id=TrackType.CANDIDATE,
-                    start_time_ms=0,
-                    end_time_ms=10000,
-                    text=candidate_text,
-                )
-            ],
+            segments=transcript_segment_objs,
         )
 
-        validation = validate_proposal(proposal, transcript)
-        if not validation.is_valid:
+        allowed_criteria_ids = {c["id"] for c in criteria if "id" in c} if criteria else None
+        validation = validate_proposal(proposal, transcript_obj, allowed_criteria_ids=allowed_criteria_ids)
+
+        is_rejected = not validation.is_valid
+        validation_errors = validation.errors if not validation.is_valid else []
+        if is_rejected:
             logger.warning("Evidence validation failed for proposal %s: %s", proposal.id, validation.errors)
 
         if not self.repo.get_interview(interview_id):
@@ -270,6 +389,10 @@ Respond strictly with a JSON object conforming to:
             critical_errors=critical_errors,
             rubric_revision_id=rubric_rev,
             transcript_revision_id=trans_rev,
+            is_rejected=is_rejected,
+            validation_errors=validation_errors,
+            provider_id=self.provider.id if hasattr(self.provider, "id") else str(self.provider),
+            fallback_metadata=fallback_metadata,
         )
 
     async def _handle_batch_retranscribe(self, interview_id: str, payload: dict[str, Any]) -> None:

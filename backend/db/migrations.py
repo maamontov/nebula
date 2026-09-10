@@ -243,6 +243,34 @@ def run_migrations(db: Database) -> int:
             raise RuntimeError("Database integrity check failed after running migration 003!")
         current_version = 3
 
+    if current_version < 4:
+        # Migration 4: Stage 7 evidence validation and atomic job lease
+        with db.transaction() as tx_conn:
+            # 1. Add locked_by column to jobs if missing
+            job_cols = [row["name"] for row in tx_conn.execute("PRAGMA table_info(jobs)").fetchall()]
+            if "locked_by" not in job_cols:
+                tx_conn.execute("ALTER TABLE jobs ADD COLUMN locked_by TEXT;")
+
+            # 2. Add stage 7 columns to assessment_proposals if missing
+            prop_cols = [row["name"] for row in tx_conn.execute("PRAGMA table_info(assessment_proposals)").fetchall()]
+            if "is_rejected" not in prop_cols:
+                tx_conn.execute("ALTER TABLE assessment_proposals ADD COLUMN is_rejected INTEGER NOT NULL DEFAULT 0;")
+            if "validation_errors_json" not in prop_cols:
+                tx_conn.execute("ALTER TABLE assessment_proposals ADD COLUMN validation_errors_json TEXT NOT NULL DEFAULT '[]';")
+            if "provider_id" not in prop_cols:
+                tx_conn.execute("ALTER TABLE assessment_proposals ADD COLUMN provider_id TEXT;")
+            if "fallback_metadata_json" not in prop_cols:
+                tx_conn.execute("ALTER TABLE assessment_proposals ADD COLUMN fallback_metadata_json TEXT;")
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (4, '004_stage7_evidence_and_lease', ?)",
+                (now_iso,),
+            )
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 004!")
+        current_version = 4
+
     logger.info("Successfully ensured database schema up to version %d", current_version)
     return current_version
 

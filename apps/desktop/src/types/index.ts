@@ -80,6 +80,10 @@ export interface AssessmentProposal {
   scores: CriterionScore[];
   critical_errors: string[];
   is_approved: boolean;
+  is_rejected?: boolean;
+  validation_errors?: string[];
+  provider_id?: string;
+  fallback_metadata?: Record<string, any>;
   reviewed_scores?: CriterionScore[];
   reviewer_notes?: string;
   created_at: string;

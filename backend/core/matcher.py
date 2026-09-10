@@ -28,6 +28,7 @@ class SegmentAssociation:
     confidence: float
     is_ambiguous: bool
     is_clarification: bool = False
+    is_manually_adjusted: bool = False
     interruption: InterruptionEvent | None = None
     notes: str = ""
 
@@ -75,13 +76,20 @@ class QuestionMatcher:
         }
         return {w for w in words if len(w) > 2 and w not in stopwords}
 
-    def calculate_relevance(self, candidate_text: str, question_text: str, criteria: list[str]) -> float:
+    def calculate_relevance(self, candidate_text: str, question_text: str, criteria: list[Any]) -> float:
         """Calculates keyword Jaccard overlap between candidate answer and question criteria."""
         cand_kw = self._extract_keywords(candidate_text)
         if not cand_kw:
             return 0.0
 
-        target_text = f"{question_text} {' '.join(criteria)}"
+        crit_words = []
+        for c in criteria:
+            if isinstance(c, dict):
+                crit_words.append(f"{c.get('title', '')} {c.get('description', '')}")
+            elif isinstance(c, str):
+                crit_words.append(c)
+
+        target_text = f"{question_text} {' '.join(crit_words)}"
         target_kw = self._extract_keywords(target_text)
         if not target_kw:
             return 0.5
@@ -95,23 +103,49 @@ class QuestionMatcher:
         self,
         questions: list[dict[str, Any]],
         segments: list[dict[str, Any]],
+        existing_associations: list[dict[str, Any]] | None = None,
     ) -> list[SegmentAssociation]:
         """
         Associates speech segments with planned questions.
         Handles:
-        1. Contextual continuity from interviewer questions.
-        2. Clarifications (short follow-ups from interviewer).
-        3. Interruption detection.
-        4. Ambiguity flagging.
+        1. Preservation of manual adjustments (never overwritten by automated matcher).
+        2. Contextual continuity from interviewer questions.
+        3. Clarifications (short follow-ups from interviewer).
+        4. Interruption detection.
+        5. Ambiguity flagging.
         """
         associations: list[SegmentAssociation] = []
         if not questions or not segments:
             return associations
 
+        existing_by_seg: dict[str, dict[str, Any]] = {}
+        if existing_associations:
+            existing_by_seg = {a["segment_id"]: a for a in existing_associations}
+
         interruptions = self.detect_interruptions(segments)
         active_question_id = questions[0].get("id") or questions[0].get("question_id")
 
         for idx, seg in enumerate(segments):
+            seg_id = seg["id"]
+
+            # If segment was already manually adjusted by a human reviewer, strictly preserve it!
+            existing = existing_by_seg.get(seg_id)
+            if existing and existing.get("is_manually_adjusted"):
+                active_question_id = existing["question_id"]
+                associations.append(
+                    SegmentAssociation(
+                        segment_id=seg_id,
+                        question_id=existing["question_id"],
+                        confidence=existing.get("confidence", 1.0),
+                        is_ambiguous=bool(existing.get("is_ambiguous", 0)),
+                        is_clarification=False,
+                        is_manually_adjusted=True,
+                        interruption=None,
+                        notes=existing.get("notes") or "Ручная привязка интервьюером",
+                    )
+                )
+                continue
+
             seg_text = seg["text"].strip()
             track = seg["track_id"]
 
@@ -184,15 +218,25 @@ class QuestionMatcher:
                     other_text = other_q.get("text") or other_q.get("prompt") or ""
                     other_crit = other_q.get("criteria") or other_q.get("evaluation_criteria") or []
                     other_rel = self.calculate_relevance(seg_text, other_text, other_crit)
-                    if other_rel > relevance and other_rel > self.ambiguity_threshold:
+                    if other_rel > relevance:
                         candidate_other_matches.append((other_qid, other_rel))
 
                 is_ambiguous = False
                 notes = "Ответ кандидата"
+                target_qid = active_question_id
+                target_confidence = max(0.3, relevance)
+
                 if candidate_other_matches:
                     is_ambiguous = True
-                    alt_id = candidate_other_matches[0][0]
-                    notes = f"Неоднозначность: ответ больше похож на вопрос {alt_id}. Требуется ревью человека."
+                    candidate_other_matches.sort(key=lambda x: x[1], reverse=True)
+                    alt_id, alt_rel = candidate_other_matches[0]
+                    if relevance < 0.15 and alt_rel >= 0.15:
+                        target_qid = alt_id
+                        active_question_id = alt_id
+                        target_confidence = alt_rel
+                        notes = f"Неоднозначность: ответ отнесен к вопросу {alt_id} (уверенность {alt_rel:.2f}) при несовпадении с активным ({relevance:.2f}). Требуется ревью."
+                    else:
+                        notes = f"Неоднозначность: ответ больше похож на вопрос {alt_id}. Требуется ревью человека."
                 elif relevance < self.ambiguity_threshold:
                     is_ambiguous = True
                     notes = f"Неоднозначность: низкая тематическая уверенность ({relevance:.2f}). Требуется подтверждение."
@@ -200,8 +244,8 @@ class QuestionMatcher:
                 associations.append(
                     SegmentAssociation(
                         segment_id=seg["id"],
-                        question_id=active_question_id,
-                        confidence=max(0.3, relevance),
+                        question_id=target_qid,
+                        confidence=target_confidence,
                         is_ambiguous=is_ambiguous,
                         is_clarification=False,
                         interruption=seg_int,

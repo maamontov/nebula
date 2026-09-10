@@ -11,6 +11,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import uuid
 
 from backend.core.scoring import calculate_interview_score
 from backend.core.state_machine import InvalidStateTransitionError
@@ -299,6 +300,10 @@ class Repository:
         is_stale: bool = False,
         stale_reason: str | None = None,
         is_manually_adjusted: bool = False,
+        is_rejected: bool = False,
+        validation_errors: list[str] | None = None,
+        provider_id: str | None = None,
+        fallback_metadata: dict[str, Any] | None = None,
     ) -> None:
         now = utc_now_iso()
         with self.db.transaction() as conn:
@@ -311,8 +316,10 @@ class Repository:
                 INSERT INTO assessment_proposals (
                     id, interview_id, question_id, rubric_revision_id, transcript_revision_id,
                     model_profile_id, scores_json, critical_errors_json, is_approved,
-                    is_stale, stale_reason, is_manually_adjusted, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                    is_stale, stale_reason, is_manually_adjusted,
+                    is_rejected, validation_errors_json, provider_id, fallback_metadata_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     rubric_revision_id = excluded.rubric_revision_id,
                     transcript_revision_id = excluded.transcript_revision_id,
@@ -321,7 +328,11 @@ class Repository:
                     critical_errors_json = excluded.critical_errors_json,
                     is_stale = excluded.is_stale,
                     stale_reason = excluded.stale_reason,
-                    is_manually_adjusted = excluded.is_manually_adjusted
+                    is_manually_adjusted = excluded.is_manually_adjusted,
+                    is_rejected = excluded.is_rejected,
+                    validation_errors_json = excluded.validation_errors_json,
+                    provider_id = excluded.provider_id,
+                    fallback_metadata_json = excluded.fallback_metadata_json
                 """,
                 (
                     proposal_id,
@@ -335,6 +346,10 @@ class Repository:
                     1 if is_stale else 0,
                     stale_reason,
                     1 if is_manually_adjusted else 0,
+                    1 if is_rejected else 0,
+                    json.dumps(validation_errors or [], ensure_ascii=False),
+                    provider_id,
+                    json.dumps(fallback_metadata, ensure_ascii=False) if fallback_metadata else None,
                     now,
                 ),
             )
@@ -354,10 +369,28 @@ class Repository:
                 item = dict(r)
                 item["scores"] = json.loads(item["scores_json"])
                 item["critical_errors"] = json.loads(item["critical_errors_json"])
+                item["validation_errors"] = json.loads(item.get("validation_errors_json") or "[]")
+                item["is_rejected"] = bool(item.get("is_rejected", 0))
                 if item["reviewed_scores_json"]:
                     item["reviewed_scores"] = json.loads(item["reviewed_scores_json"])
                 res.append(item)
             return res
+
+    def get_assessment_proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM assessment_proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            item["scores"] = json.loads(item["scores_json"])
+            item["critical_errors"] = json.loads(item["critical_errors_json"])
+            item["validation_errors"] = json.loads(item.get("validation_errors_json") or "[]")
+            item["is_rejected"] = bool(item.get("is_rejected", 0))
+            if item["reviewed_scores_json"]:
+                item["reviewed_scores"] = json.loads(item["reviewed_scores_json"])
+            return item
 
     def approve_assessment(
         self,
@@ -1081,8 +1114,9 @@ class Repository:
             )
 
     def claim_next_job(self, lock_duration_sec: int = 60) -> dict[str, Any] | None:
-        """Atomically leases next available pending or expired job."""
+        """Atomically leases next available pending or expired job with owner token."""
         now = utc_now_iso()
+        owner_token = f"worker-{uuid.uuid4().hex}"
         with self.db.transaction() as conn:
             # Find eligible job
             row = conn.execute(
@@ -1097,23 +1131,45 @@ class Repository:
                 return None
 
             job = dict(row)
-            # Lock it
+            # Lock it with owner token
             lock_until_dt = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + lock_duration_sec, tz=timezone.utc)
             lock_until_str = lock_until_dt.isoformat()
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE jobs
                 SET status = 'PROCESSING',
                     attempts = attempts + 1,
                     locked_until = ?,
+                    locked_by = ?,
                     updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND (status = 'PENDING' OR (status = 'PROCESSING' AND locked_until < ?))
                 """,
-                (lock_until_str, now, job["id"]),
+                (lock_until_str, owner_token, now, job["id"], now),
             )
+            if cursor.rowcount == 0:
+                # Concurrent race condition: another worker claimed it in between
+                return None
+
             job["payload"] = json.loads(job["payload_json"])
             job["attempts"] += 1
+            job["locked_by"] = owner_token
             return job
+
+    def renew_job_lease(self, job_id: str, owner_token: str, extension_sec: int = 60) -> bool:
+        """Extends the lease duration for an actively executing job if owner token matches."""
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            lock_until_dt = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + extension_sec, tz=timezone.utc)
+            lock_until_str = lock_until_dt.isoformat()
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET locked_until = ?, updated_at = ?
+                WHERE id = ? AND status = 'PROCESSING' AND locked_by = ?
+                """,
+                (lock_until_str, now, job_id, owner_token),
+            )
+            return cursor.rowcount > 0
 
     def reclaim_expired_jobs(self) -> int:
         """Counts and resets expired PROCESSING jobs back to PENDING for retry."""
@@ -1122,25 +1178,43 @@ class Repository:
             cursor = conn.execute(
                 """
                 UPDATE jobs
-                SET status = 'PENDING', locked_until = NULL, updated_at = ?
+                SET status = 'PENDING', locked_until = NULL, locked_by = NULL, updated_at = ?
                 WHERE status = 'PROCESSING' AND locked_until < ? AND attempts < max_attempts
                 """,
                 (now, now),
             )
             return cursor.rowcount
 
-    def complete_job(self, job_id: str) -> None:
+    def complete_job(self, job_id: str, owner_token: str | None = None) -> None:
+        """Marks job as COMPLETED, verifying owner token if supplied."""
         now = utc_now_iso()
         with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE jobs SET status = 'COMPLETED', updated_at = ? WHERE id = ?",
-                (now, job_id),
-            )
+            if owner_token is not None:
+                cursor = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'COMPLETED', updated_at = ?, locked_until = NULL, locked_by = NULL
+                    WHERE id = ? AND status = 'PROCESSING' AND (locked_by = ? OR locked_by IS NULL)
+                    """,
+                    (now, job_id, owner_token),
+                )
+                if cursor.rowcount == 0:
+                    raise RepositoryConflictError(f"Cannot complete job {job_id}: lease expired or owner token mismatch")
+            else:
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = 'COMPLETED', updated_at = ?, locked_until = NULL, locked_by = NULL WHERE id = ?",
+                    (now, job_id),
+                )
+                if cursor.rowcount == 0:
+                    raise RepositoryConflictError(f"Cannot complete job {job_id}: job not found")
 
-    def fail_job(self, job_id: str, error_message: str) -> None:
+    def fail_job(self, job_id: str, error_message: str, owner_token: str | None = None) -> None:
+        """Marks job as FAILED or PENDING retry, verifying owner token if supplied."""
         now = utc_now_iso()
         with self.db.transaction() as conn:
-            row = conn.execute("SELECT attempts, max_attempts FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            row = conn.execute("SELECT attempts, max_attempts, status, locked_by FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if row and owner_token is not None and row["locked_by"] and row["locked_by"] != owner_token:
+                raise RepositoryConflictError(f"Cannot fail job {job_id}: owner token mismatch")
             if row and row["attempts"] >= row["max_attempts"]:
                 status = "FAILED"
             else:
@@ -1148,7 +1222,7 @@ class Repository:
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, error_message = ?, locked_until = NULL, updated_at = ?
+                SET status = ?, error_message = ?, locked_until = NULL, locked_by = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 (status, error_message, now, job_id),

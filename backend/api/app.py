@@ -634,10 +634,15 @@ async def approve_assessment_endpoint(
     revs = repo.get_transcript_revisions(interview_id)
     latest_rev = revs[-1]["id"] if revs else (inv.get("active_transcript_revision_id") or "trans-rev-1")
 
-    question_id = payload.question_id
-    if not question_id:
-        prop = repo.get_assessment_proposal(proposal_id)
-        question_id = prop["question_id"] if prop else "q-default"
+    prop = repo.get_assessment_proposal(proposal_id)
+    if prop and prop.get("is_rejected"):
+        errs = prop.get("validation_errors") or prop.get("critical_errors") or []
+        raise HTTPException(
+            status_code=409,
+            detail=f"Proposal was rejected due to evidence validation errors: {errs}. It cannot be approved automatically. Submit a manual review via /review endpoint instead.",
+        )
+
+    question_id = payload.question_id or (prop["question_id"] if prop else "q-default")
 
     assessment_id = f"ha-{interview_id}-{question_id}"
     repo.save_human_assessment(
@@ -1014,25 +1019,28 @@ async def get_associations_endpoint(
         raise HTTPException(status_code=404, detail="Interview not found")
 
     assocs = repo.get_associations(interview_id)
-    if not assocs:
-        plan = repo.get_latest_plan(interview_id)
-        segments = repo.get_transcript_segments(interview_id)
-        if plan and segments:
+    plan = repo.get_latest_plan(interview_id)
+    segments = repo.get_transcript_segments(interview_id)
+    if plan and segments:
+        associated_segment_ids = {a["segment_id"] for a in assocs}
+        unassociated = [s for s in segments if s["id"] not in associated_segment_ids]
+        if unassociated:
             questions = plan.get("payload", {}).get("questions", [])
             matcher = QuestionMatcher()
-            results = matcher.associate_segments(questions, segments)
+            results = matcher.associate_segments(questions, segments, existing_associations=assocs)
             for r in results:
-                assoc_id = f"assoc-{uuid.uuid4().hex[:8]}"
-                repo.save_association(
-                    assoc_id=assoc_id,
-                    interview_id=interview_id,
-                    question_id=r.question_id,
-                    segment_id=r.segment_id,
-                    confidence=r.confidence,
-                    is_ambiguous=r.is_ambiguous,
-                    is_manually_adjusted=False,
-                    notes=r.notes,
-                )
+                if r.segment_id not in associated_segment_ids:
+                    assoc_id = f"assoc-{uuid.uuid4().hex[:8]}"
+                    repo.save_association(
+                        assoc_id=assoc_id,
+                        interview_id=interview_id,
+                        question_id=r.question_id,
+                        segment_id=r.segment_id,
+                        confidence=r.confidence,
+                        is_ambiguous=r.is_ambiguous,
+                        is_manually_adjusted=False,
+                        notes=r.notes,
+                    )
             assocs = repo.get_associations(interview_id)
 
     return {"interview_id": interview_id, "associations": assocs}

@@ -24,6 +24,7 @@ import {
   CheckCircle2,
   Lock,
   AlertCircle,
+  AlertTriangle,
   XCircle,
   FileCheck2,
 } from 'lucide-react';
@@ -402,20 +403,16 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     if (isFinalized) return;
     setEvalWarning(null);
     const candidateSegments = segments.filter((s) => s.track_id === 'candidate');
-    const candidateText = candidateSegments.map((s) => s.text).join(' ').trim();
-    if (!candidateText || candidateSegments.length === 0) {
+    if (candidateSegments.length === 0) {
       setEvalWarning('В стенограмме нет распознанной речи кандидата для запуска автооценки.');
       return;
     }
-    const lastSegId = candidateSegments[candidateSegments.length - 1].id;
 
     setIsEvaluatingAll(true);
     try {
       for (const q of plan.questions) {
         await enqueueJob(interviewId, 'EVALUATE_QUESTION', {
           question_id: q.id,
-          candidate_text: candidateText,
-          segment_id: lastSegId,
           rubric_description: q.criteria.map((c) => c.title).join(', '),
         });
       }
@@ -645,6 +642,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                         <ShieldCheck className="w-3 h-3" />
                         <span>Подтверждено экспертом ({currentScore} / 5.0)</span>
                       </span>
+                    ) : prop?.is_rejected ? (
+                      <span className="px-2 py-0.5 text-[10px] font-semibold text-rose-400 bg-rose-950/60 border border-rose-800/60 rounded flex items-center space-x-1">
+                        <AlertTriangle className="w-3 h-3" />
+                        <span>AI-оценка отклонена</span>
+                      </span>
                     ) : currentScore !== undefined ? (
                       <span className="px-2 py-0.5 text-[10px] font-semibold text-indigo-300 bg-indigo-950/60 border border-indigo-800/60 rounded">
                         Черновик: {currentScore} / 5.0
@@ -700,6 +702,29 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
               {!isExcluded && (
                 <div className="space-y-3 bg-slate-900/50 p-4 rounded-lg border border-slate-800/80">
+                  {prop?.is_rejected && (
+                    <div className="p-3 bg-rose-950/60 border border-rose-800 rounded-lg text-rose-200 text-xs space-y-1.5">
+                      <div className="font-bold flex items-center space-x-1.5 text-rose-300">
+                        <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                        <span>AI-предложение отклонено: ошибки валидации доказательств</span>
+                      </div>
+                      {prop.validation_errors && prop.validation_errors.length > 0 ? (
+                        <ul className="list-disc list-inside space-y-0.5 text-rose-300/90 pl-1 text-[11px]">
+                          {prop.validation_errors.map((err, errIdx) => (
+                            <li key={errIdx}>{err}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-[11px] text-rose-300/90">
+                          Цитаты модели не найдены в стенограмме кандидата или выходят за рамки критериев.
+                        </p>
+                      )}
+                      <p className="text-[11px] text-rose-400/80 italic">
+                        Автоодобрение заблокировано (409 Conflict). Пожалуйста, выставьте баллы и сохраните экспертную оценку вручную.
+                      </p>
+                    </div>
+                  )}
+
                   <p className="text-xs text-slate-300 leading-relaxed">
                     {prop?.scores?.[0]?.explanation ||
                       (currentScore !== undefined
