@@ -55,6 +55,7 @@ export interface RubricCriterion {
   min_score: number;
   max_score: number;
   weight: number;
+  levels_description?: Record<number, string>;
 }
 
 export interface PlannedQuestion {
@@ -148,4 +149,66 @@ export interface InterviewDetails {
   active_transcript_revision_id?: string;
   consent_confirmed_at?: string;
   consent_version?: string;
+  template_id?: string;
+  template_version?: number;
+  finalized_checksum?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface JobTemplate {
+  id: string;
+  title: string;
+  role: string;
+  level: string;
+  description: string;
+  questions: PlannedQuestion[];
+  version: number;
+  is_archived: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InterviewListItem {
+  id: string;
+  title: string;
+  candidate_name: string;
+  role: string;
+  status: InterviewStatus;
+  created_at: string;
+  updated_at: string;
+  template_id?: string;
+  template_version?: number;
+  final_score_100?: number | null;
+  coverage_percentage?: number | null;
+  hiring_recommendation?: string | null;
+  is_reopened?: boolean;
+  latest_report_revision?: number | null;
+  last_finalized_score?: number | null;
+  last_finalized_recommendation?: string | null;
+  last_finalized_revision?: number | null;
+}
+
+export interface PaginatedInterviews {
+  items: InterviewListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ReportRevisionSummary {
+  id: string;
+  interview_id: string;
+  revision_number: number;
+  final_score_100: number | null;
+  coverage_percentage: number;
+  question_scores: Record<string, number | null>;
+  summary_markdown: string;
+  hiring_recommendation?: string;
+  confirmed_by?: string;
+  sha256_checksum: string;
+  canonical_snapshot?: Record<string, any>;
+  created_at: string;
+  is_current?: boolean;
+  reopen_reason?: string;
 }

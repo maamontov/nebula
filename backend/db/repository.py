@@ -4,6 +4,7 @@ Provides safe database operations with JSON serialization and timestamps.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -48,11 +49,13 @@ class Repository:
         title: str,
         candidate_name: str,
         role: str,
-        status: InterviewStatus = InterviewStatus.DRAFT,
+        status: InterviewStatus | str = InterviewStatus.DRAFT,
         consent_confirmed_at: str | None = None,
         consent_version: str | None = None,
         capture_mode: str = "dual_source",
         expected_tracks: list[str] | None = None,
+        template_id: str | None = None,
+        template_version: int | None = None,
     ) -> dict[str, Any]:
         now = utc_now_iso()
         if expected_tracks is None:
@@ -65,22 +68,58 @@ class Repository:
                 INSERT INTO interviews (
                     id, title, candidate_name, role, status,
                     consent_confirmed_at, consent_version, capture_mode, expected_tracks_json,
+                    template_id, template_version,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     interview_id,
                     title,
                     candidate_name,
                     role,
-                    status.value,
+                    status.value if isinstance(status, InterviewStatus) else str(status),
                     consent_confirmed_at,
                     consent_version,
                     capture_mode,
                     expected_tracks_json,
+                    template_id,
+                    template_version,
                     now,
                     now,
                 ),
+            )
+        return self.get_interview(interview_id)  # type: ignore[return-value]
+
+    def update_interview_draft(
+        self,
+        interview_id: str,
+        title: str | None = None,
+        candidate_name: str | None = None,
+        role: str | None = None,
+        template_id: str | None = None,
+        template_version: int | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            inv = conn.execute("SELECT * FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+            if not inv:
+                raise KeyError(f"Interview {interview_id} not found")
+            if inv["status"] not in ("draft", "ready"):
+                raise ValueError(f"Cannot update interview in status '{inv['status']}', expected 'draft' or 'ready'")
+
+            new_title = title if title is not None else inv["title"]
+            new_candidate = candidate_name if candidate_name is not None else inv["candidate_name"]
+            new_role = role if role is not None else inv["role"]
+            new_template_id = template_id if template_id is not None else inv["template_id"]
+            new_template_version = template_version if template_version is not None else inv["template_version"]
+
+            conn.execute(
+                """
+                UPDATE interviews
+                SET title = ?, candidate_name = ?, role = ?, template_id = ?, template_version = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (new_title, new_candidate, new_role, new_template_id, new_template_version, now, interview_id),
             )
         return self.get_interview(interview_id)  # type: ignore[return-value]
 
@@ -93,13 +132,119 @@ class Repository:
                 return None
             return dict(row)
 
-    def list_interviews(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_interviews(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        search: str | None = None,
+        role: str | None = None,
+        status: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT
+                i.id,
+                i.title,
+                i.candidate_name,
+                i.role,
+                i.status,
+                i.created_at,
+                i.updated_at,
+                i.capture_mode,
+                i.template_id,
+                i.template_version,
+                lr.final_score_100,
+                lr.coverage_percentage,
+                lr.hiring_recommendation,
+                lr.revision_number AS latest_report_revision,
+                (SELECT COUNT(*) FROM report_revisions rr WHERE rr.interview_id = i.id) AS report_revisions_count
+            FROM interviews i
+            LEFT JOIN (
+                SELECT r1.interview_id, r1.final_score_100, r1.coverage_percentage, r1.hiring_recommendation, r1.revision_number
+                FROM report_revisions r1
+                JOIN (
+                    SELECT interview_id, MAX(revision_number) AS max_rev
+                    FROM report_revisions
+                    GROUP BY interview_id
+                ) r2 ON r1.interview_id = r2.interview_id AND r1.revision_number = r2.max_rev
+            ) lr ON lr.interview_id = i.id
+            WHERE i.status != 'deleted'
+        """
+        params: list[Any] = []
+        if search:
+            query += " AND (i.candidate_name LIKE ? OR i.title LIKE ? OR i.role LIKE ?)"
+            term = f"%{search.strip()}%"
+            params.extend([term, term, term])
+        if role:
+            query += " AND i.role = ?"
+            params.append(role)
+        if status:
+            if status == "reopened":
+                query += " AND i.status = 'review' AND lr.revision_number IS NOT NULL"
+            else:
+                query += " AND i.status = ?"
+                params.append(status.lower())
+        if from_date:
+            query += " AND i.created_at >= ?"
+            params.append(from_date)
+        if to_date:
+            query += " AND i.created_at <= ?"
+            params.append(to_date)
+
+        query += " ORDER BY i.created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
         with self.db.transaction() as conn:
-            rows = conn.execute(
-                "SELECT * FROM interviews ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-            return [dict(r) for r in rows]
+            rows = conn.execute(query, params).fetchall()
+            res = []
+            for r in rows:
+                item = dict(r)
+                rev_count = item.pop("report_revisions_count", 0)
+                is_reopened = bool(rev_count > 0 and item["status"] != "finalized")
+                item["is_reopened"] = is_reopened
+                if is_reopened:
+                    item["last_finalized_score"] = item["final_score_100"]
+                    item["last_finalized_recommendation"] = item["hiring_recommendation"]
+                    item["last_finalized_revision"] = item.get("latest_report_revision")
+                res.append(item)
+            return res
+
+    def count_interviews(
+        self,
+        search: str | None = None,
+        role: str | None = None,
+        status: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> int:
+        query = "SELECT COUNT(*) FROM interviews i WHERE i.status != 'deleted'"
+        params: list[Any] = []
+        if search:
+            query += " AND (i.candidate_name LIKE ? OR i.title LIKE ? OR i.role LIKE ?)"
+            term = f"%{search.strip()}%"
+            params.extend([term, term, term])
+        if role:
+            query += " AND i.role = ?"
+            params.append(role)
+        if status:
+            if status == "reopened":
+                query += """ AND i.status = 'review' AND EXISTS (
+                    SELECT 1 FROM report_revisions rr WHERE rr.interview_id = i.id
+                )"""
+            else:
+                query += " AND i.status = ?"
+                params.append(status.lower())
+        if from_date:
+            query += " AND i.created_at >= ?"
+            params.append(from_date)
+        if to_date:
+            query += " AND i.created_at <= ?"
+            params.append(to_date)
+
+        with self.db.transaction() as conn:
+            row = conn.execute(query, params).fetchone()
+            return row[0] if row else 0
 
     def update_interview_status(
         self,
@@ -1771,5 +1916,194 @@ class Repository:
                     (interview_id,),
                 ).fetchall()
             return [dict(r) for r in rows]
+
+    # -------------------------------------------------------------
+    # Job Templates
+    # -------------------------------------------------------------
+    def create_job_template(
+        self,
+        template_id: str,
+        title: str,
+        role: str,
+        level: str = "Middle",
+        description: str = "",
+        questions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        questions_payload = questions or []
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO job_templates (
+                    id, title, role, level, description, questions_json, version, is_archived, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                """,
+                (
+                    template_id,
+                    title,
+                    role,
+                    level,
+                    description,
+                    json.dumps(questions_payload, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return self.get_job_template(template_id)  # type: ignore[return-value]
+
+    def get_job_template(self, template_id: str) -> dict[str, Any] | None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM job_templates WHERE id = ?", (template_id,)
+            ).fetchone()
+            if not row:
+                return None
+            data = dict(row)
+            data["questions"] = json.loads(data["questions_json"])
+            return data
+
+    def list_job_templates(self, include_archived: bool = False) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            if include_archived:
+                rows = conn.execute(
+                    "SELECT * FROM job_templates ORDER BY is_archived ASC, updated_at DESC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM job_templates WHERE is_archived = 0 ORDER BY updated_at DESC"
+                ).fetchall()
+            res = []
+            for r in rows:
+                item = dict(r)
+                item["questions"] = json.loads(item["questions_json"])
+                res.append(item)
+            return res
+
+    def update_job_template(
+        self,
+        template_id: str,
+        title: str | None = None,
+        role: str | None = None,
+        level: str | None = None,
+        description: str | None = None,
+        questions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            current = conn.execute(
+                "SELECT * FROM job_templates WHERE id = ?", (template_id,)
+            ).fetchone()
+            if not current:
+                raise KeyError(f"Job template {template_id} not found")
+
+            new_title = title if title is not None else current["title"]
+            new_role = role if role is not None else current["role"]
+            new_level = level if level is not None else current["level"]
+            new_description = description if description is not None else current["description"]
+            new_questions_json = json.dumps(questions, ensure_ascii=False) if questions is not None else current["questions_json"]
+            new_version = current["version"] + 1
+
+            conn.execute(
+                """
+                UPDATE job_templates
+                SET title = ?, role = ?, level = ?, description = ?, questions_json = ?, version = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    new_title,
+                    new_role,
+                    new_level,
+                    new_description,
+                    new_questions_json,
+                    new_version,
+                    now,
+                    template_id,
+                ),
+            )
+        return self.get_job_template(template_id)  # type: ignore[return-value]
+
+    def duplicate_job_template(
+        self,
+        template_id: str,
+        new_id: str | None = None,
+        title_suffix: str = " (Копия)",
+    ) -> dict[str, Any]:
+        source = self.get_job_template(template_id)
+        if not source:
+            raise KeyError(f"Job template {template_id} not found")
+
+        gen_id = new_id or f"tpl-{uuid.uuid4().hex[:8]}"
+        new_title = f"{source['title']}{title_suffix}"
+        return self.create_job_template(
+            template_id=gen_id,
+            title=new_title,
+            role=source["role"],
+            level=source.get("level", "Middle"),
+            description=source.get("description", ""),
+            questions=source.get("questions", []),
+        )
+
+    def archive_job_template(self, template_id: str, is_archived: bool = True) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            current = conn.execute(
+                "SELECT id FROM job_templates WHERE id = ?", (template_id,)
+            ).fetchone()
+            if not current:
+                raise KeyError(f"Job template {template_id} not found")
+
+            conn.execute(
+                "UPDATE job_templates SET is_archived = ?, updated_at = ? WHERE id = ?",
+                (1 if is_archived else 0, now, template_id),
+            )
+        return self.get_job_template(template_id)  # type: ignore[return-value]
+
+    def delete_job_template(self, template_id: str) -> bool:
+        with self.db.transaction() as conn:
+            ref_count = conn.execute(
+                "SELECT COUNT(*) FROM interviews WHERE template_id = ?", (template_id,)
+            ).fetchone()[0]
+            if ref_count > 0:
+                raise ValueError(
+                    f"Нельзя удалить должность {template_id}: на неё ссылаются существующие интервью ({ref_count}). Используйте архивирование."
+                )
+
+            deleted = conn.execute(
+                "DELETE FROM job_templates WHERE id = ?", (template_id,)
+            ).rowcount
+            return deleted > 0
+
+    def copy_question_to_template(
+        self,
+        source_template_id: str,
+        question_id: str,
+        target_template_id: str,
+    ) -> dict[str, Any]:
+        source = self.get_job_template(source_template_id)
+        if not source:
+            raise KeyError(f"Source template {source_template_id} not found")
+        target = self.get_job_template(target_template_id)
+        if not target:
+            raise KeyError(f"Target template {target_template_id} not found")
+
+        matching_q = None
+        for q in source.get("questions", []):
+            if q.get("id") == question_id:
+                matching_q = copy.deepcopy(q)
+                break
+        if not matching_q:
+            raise KeyError(f"Question {question_id} not found in template {source_template_id}")
+
+        target_questions = target.get("questions", [])
+        target_q_ids = {q.get("id") for q in target_questions}
+        if matching_q["id"] in target_q_ids:
+            matching_q["id"] = f"{matching_q['id']}-copy-{uuid.uuid4().hex[:4]}"
+        matching_q["order_index"] = len(target_questions)
+        target_questions.append(matching_q)
+
+        return self.update_job_template(
+            template_id=target_template_id,
+            questions=target_questions,
+        )
 
 

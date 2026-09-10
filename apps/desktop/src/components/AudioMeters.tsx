@@ -55,12 +55,12 @@ export const AudioMeters: React.FC<AudioMetersProps> = ({ isCapturing = true, ca
 
   if (isSingleSource) {
     return (
-      <div className="flex items-center space-x-6 px-4 py-2 bg-slate-900/80 border border-slate-800 rounded-lg shadow-sm">
-        <div className="flex items-center space-x-2">
-          <Radio className={`w-4 h-4 ${hasSharedTelemetry && sharedPercent > 10 ? 'text-indigo-400' : 'text-slate-500'}`} />
-          <span className="text-xs font-medium text-slate-400 w-24">Общий аудиовход</span>
+      <div className="flex items-center space-x-4 px-3.5 py-1.5 bg-slate-900/80 border border-slate-800 rounded-xl shadow-sm">
+        <div className="flex items-center space-x-2.5">
+          <Radio className={`w-4 h-4 shrink-0 ${hasSharedTelemetry && sharedPercent > 10 ? 'text-indigo-400' : 'text-slate-500'}`} />
+          <span className="text-xs font-medium text-slate-400 whitespace-nowrap shrink-0">Общий аудиовход</span>
           {hasSharedTelemetry ? (
-            <div className="w-36 h-2.5 bg-slate-950 rounded-full overflow-hidden p-0.5 flex items-center border border-slate-800">
+            <div className="w-32 h-2.5 bg-slate-950 rounded-full overflow-hidden p-0.5 flex items-center border border-slate-800 shrink-0">
               <div
                 className={`h-full rounded-full transition-all duration-100 ${
                   (levels.shared_peak ?? 0) > 0.9 ? 'bg-red-500' : sharedPercent > 60 ? 'bg-amber-400' : 'bg-indigo-500'
@@ -69,7 +69,7 @@ export const AudioMeters: React.FC<AudioMetersProps> = ({ isCapturing = true, ca
               />
             </div>
           ) : (
-            <span className="text-[10px] text-slate-500 font-mono">нет данных</span>
+            <span className="text-[10px] text-slate-500 font-mono whitespace-nowrap shrink-0">нет данных</span>
           )}
         </div>
       </div>
@@ -77,13 +77,13 @@ export const AudioMeters: React.FC<AudioMetersProps> = ({ isCapturing = true, ca
   }
 
   return (
-    <div className="flex items-center space-x-6 px-4 py-2 bg-slate-900/80 border border-slate-800 rounded-lg shadow-sm">
+    <div className="flex items-center space-x-5 px-3.5 py-1.5 bg-slate-900/80 border border-slate-800 rounded-xl shadow-sm">
       {/* Interviewer (Mic) */}
       <div className="flex items-center space-x-2">
-        <Mic className={`w-4 h-4 ${hasDualTelemetry && micPercent > 10 ? 'text-indigo-400' : 'text-slate-500'}`} />
-        <span className="text-xs font-medium text-slate-400 w-16">Интервьюер</span>
+        <Mic className={`w-4 h-4 shrink-0 ${hasDualTelemetry && micPercent > 10 ? 'text-indigo-400' : 'text-slate-500'}`} />
+        <span className="text-xs font-medium text-slate-400 whitespace-nowrap shrink-0">Интервьюер</span>
         {hasDualTelemetry ? (
-          <div className="w-24 h-2.5 bg-slate-950 rounded-full overflow-hidden p-0.5 flex items-center border border-slate-800">
+          <div className="w-20 h-2.5 bg-slate-950 rounded-full overflow-hidden p-0.5 flex items-center border border-slate-800 shrink-0">
             <div
               className={`h-full rounded-full transition-all duration-100 ${
                 levels.interviewer_peak > 0.9 ? 'bg-red-500' : micPercent > 60 ? 'bg-amber-400' : 'bg-indigo-500'
@@ -92,16 +92,16 @@ export const AudioMeters: React.FC<AudioMetersProps> = ({ isCapturing = true, ca
             />
           </div>
         ) : (
-          <span className="text-[10px] text-slate-500 font-mono">нет данных</span>
+          <span className="text-[10px] text-slate-500 font-mono whitespace-nowrap shrink-0">нет данных</span>
         )}
       </div>
 
       {/* Candidate (Loopback / Remote) */}
       <div className="flex items-center space-x-2">
-        <Volume2 className={`w-4 h-4 ${hasDualTelemetry && spkPercent > 10 ? 'text-emerald-400' : 'text-slate-500'}`} />
-        <span className="text-xs font-medium text-slate-400 w-16">Кандидат</span>
+        <Volume2 className={`w-4 h-4 shrink-0 ${hasDualTelemetry && spkPercent > 10 ? 'text-emerald-400' : 'text-slate-500'}`} />
+        <span className="text-xs font-medium text-slate-400 whitespace-nowrap shrink-0">Кандидат</span>
         {hasDualTelemetry ? (
-          <div className="w-24 h-2.5 bg-slate-950 rounded-full overflow-hidden p-0.5 flex items-center border border-slate-800">
+          <div className="w-20 h-2.5 bg-slate-950 rounded-full overflow-hidden p-0.5 flex items-center border border-slate-800 shrink-0">
             <div
               className={`h-full rounded-full transition-all duration-100 ${
                 levels.candidate_peak > 0.9 ? 'bg-red-500' : spkPercent > 60 ? 'bg-amber-400' : 'bg-emerald-500'
@@ -110,7 +110,7 @@ export const AudioMeters: React.FC<AudioMetersProps> = ({ isCapturing = true, ca
             />
           </div>
         ) : (
-          <span className="text-[10px] text-slate-500 font-mono">нет данных</span>
+          <span className="text-[10px] text-slate-500 font-mono whitespace-nowrap shrink-0">нет данных</span>
         )}
       </div>
     </div>

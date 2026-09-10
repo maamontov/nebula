@@ -1,16 +1,33 @@
 -- Nebula SQLite Schema with WAL mode support
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS job_templates (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    role TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'Middle',
+    description TEXT NOT NULL DEFAULT '',
+    questions_json TEXT NOT NULL DEFAULT '[]',
+    version INTEGER NOT NULL DEFAULT 1,
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS interviews (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     candidate_name TEXT NOT NULL,
     role TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'PLANNED',
+    status TEXT NOT NULL DEFAULT 'draft',
     consent_confirmed_at TEXT,
     consent_version TEXT,
+    capture_mode TEXT NOT NULL DEFAULT 'dual_source',
+    expected_tracks_json TEXT NOT NULL DEFAULT '["interviewer", "candidate"]',
     active_rubric_revision_id TEXT DEFAULT 'rub-rev-1',
     active_transcript_revision_id TEXT DEFAULT 'trans-rev-1',
+    template_id TEXT REFERENCES job_templates(id) ON DELETE SET NULL,
+    template_version INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -163,6 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_interview ON audit_events(interview_id, cre
 CREATE INDEX IF NOT EXISTS idx_assoc_interview_question ON question_associations(interview_id, question_id);
 
 CREATE INDEX IF NOT EXISTS idx_report_revisions ON report_revisions(interview_id, revision_number);
+CREATE INDEX IF NOT EXISTS idx_job_templates_archived ON job_templates(is_archived);
 
 CREATE TABLE IF NOT EXISTS audio_chunks (
     interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,

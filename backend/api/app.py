@@ -37,6 +37,7 @@ from contracts.domain import (
     AssessmentProposal,
     HumanCriterionScore,
     HumanQuestionAssessment,
+    InterviewPlan,
     InterviewStatus,
     PlannedQuestion,
     RubricCriterion,
@@ -120,6 +121,39 @@ class CreateInterviewRequest(BaseModel):
     role: str
     plan: dict[str, Any] | None = None
     capture_mode: str = "dual_source"
+    template_id: str | None = None
+    template_version: int | None = None
+
+
+class UpdateInterviewDraftRequest(BaseModel):
+    title: str | None = None
+    candidate_name: str | None = None
+    role: str | None = None
+    plan: dict[str, Any] | None = None
+    template_id: str | None = None
+    template_version: int | None = None
+
+
+class CreateJobTemplateRequest(BaseModel):
+    id: str | None = None
+    title: str
+    role: str
+    level: str = "Middle"
+    description: str = ""
+    questions: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class UpdateJobTemplateRequest(BaseModel):
+    title: str | None = None
+    role: str | None = None
+    level: str | None = None
+    description: str | None = None
+    questions: list[dict[str, Any]] | None = None
+
+
+class DuplicateJobTemplateRequest(BaseModel):
+    new_id: str | None = None
+    title_suffix: str = " (Копия)"
 
 
 class AddSegmentRequest(BaseModel):
@@ -236,6 +270,160 @@ async def healthz():
     return {"status": "ok", "version": "0.1.0"}
 
 
+def validate_job_template_questions(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    validated = []
+    seen_ids = set()
+    for idx, q_data in enumerate(questions):
+        try:
+            pq = PlannedQuestion.model_validate(q_data)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Invalid question structure at index {idx}: {e}")
+        if pq.id in seen_ids:
+            raise HTTPException(status_code=422, detail=f"Duplicate question ID '{pq.id}' at index {idx}")
+        seen_ids.add(pq.id)
+        validated.append(pq.model_dump())
+    return validated
+
+
+# -------------------------------------------------------------
+# Job Templates Management
+# -------------------------------------------------------------
+@app.post("/api/v1/job-templates")
+async def create_job_template_endpoint(
+    payload: CreateJobTemplateRequest,
+    repo: Repository = Depends(get_repository),
+):
+    tpl_id = payload.id or f"tpl-{uuid.uuid4().hex[:8]}"
+    validate_safe_id(tpl_id, "template_id")
+    validated_questions = validate_job_template_questions(payload.questions)
+    return repo.create_job_template(
+        template_id=tpl_id,
+        title=payload.title.strip(),
+        role=payload.role.strip(),
+        level=payload.level.strip(),
+        description=payload.description.strip(),
+        questions=validated_questions,
+    )
+
+
+@app.get("/api/v1/job-templates")
+async def list_job_templates_endpoint(
+    include_archived: bool = False,
+    repo: Repository = Depends(get_repository),
+):
+    return repo.list_job_templates(include_archived=include_archived)
+
+
+@app.get("/api/v1/job-templates/{template_id}")
+async def get_job_template_endpoint(
+    template_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(template_id, "template_id")
+    tpl = repo.get_job_template(template_id)
+    if not tpl:
+        raise HTTPException(status_code=404, detail=f"Job template {template_id} not found")
+    return tpl
+
+
+@app.put("/api/v1/job-templates/{template_id}")
+async def update_job_template_endpoint(
+    template_id: str,
+    payload: UpdateJobTemplateRequest,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(template_id, "template_id")
+    validated_questions = None
+    if payload.questions is not None:
+        validated_questions = validate_job_template_questions(payload.questions)
+    try:
+        return repo.update_job_template(
+            template_id=template_id,
+            title=payload.title.strip() if payload.title is not None else None,
+            role=payload.role.strip() if payload.role is not None else None,
+            level=payload.level.strip() if payload.level is not None else None,
+            description=payload.description.strip() if payload.description is not None else None,
+            questions=validated_questions,
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/v1/job-templates/{template_id}/duplicate")
+async def duplicate_job_template_endpoint(
+    template_id: str,
+    payload: DuplicateJobTemplateRequest = DuplicateJobTemplateRequest(),
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(template_id, "template_id")
+    try:
+        return repo.duplicate_job_template(
+            template_id=template_id,
+            new_id=payload.new_id,
+            title_suffix=payload.title_suffix,
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/v1/job-templates/{template_id}/archive")
+async def archive_job_template_endpoint(
+    template_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(template_id, "template_id")
+    try:
+        return repo.archive_job_template(template_id=template_id, is_archived=True)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/v1/job-templates/{template_id}/unarchive")
+async def unarchive_job_template_endpoint(
+    template_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(template_id, "template_id")
+    try:
+        return repo.archive_job_template(template_id=template_id, is_archived=False)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.delete("/api/v1/job-templates/{template_id}")
+async def delete_job_template_endpoint(
+    template_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(template_id, "template_id")
+    try:
+        deleted = repo.delete_job_template(template_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Job template {template_id} not found")
+        return {"status": "deleted", "template_id": template_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/v1/job-templates/{template_id}/questions/{question_id}/copy-to/{target_template_id}")
+async def copy_question_to_template_endpoint(
+    template_id: str,
+    question_id: str,
+    target_template_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(template_id, "source_template_id")
+    validate_safe_id(target_template_id, "target_template_id")
+    try:
+        return repo.copy_question_to_template(
+            source_template_id=template_id,
+            question_id=question_id,
+            target_template_id=target_template_id,
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 # -------------------------------------------------------------
 # Interview Management
 # -------------------------------------------------------------
@@ -252,24 +440,107 @@ async def create_interview_endpoint(
         role=payload.role,
         status=InterviewStatus.DRAFT,
         capture_mode=payload.capture_mode,
+        template_id=payload.template_id,
+        template_version=payload.template_version,
     )
-    if payload.plan:
-        repo.save_plan(f"plan-{payload.id}", payload.id, payload.plan, version=1)
+    plan_to_save = payload.plan
+    if not plan_to_save and payload.template_id:
+        tpl = repo.get_job_template(payload.template_id)
+        if tpl:
+            plan_to_save = {
+                "id": f"plan-{payload.id}",
+                "title": tpl["title"],
+                "role": tpl["role"],
+                "questions": tpl["questions"],
+            }
+    if plan_to_save:
+        repo.save_plan(f"plan-{payload.id}", payload.id, plan_to_save, version=1)
     repo.record_audit_event(
         event_id=f"audit-{uuid.uuid4().hex[:8]}",
         interview_id=payload.id,
         event_type="INTERVIEW_CREATED",
-        payload={"title": payload.title, "candidate": payload.candidate_name, "role": payload.role},
+        payload={"title": payload.title, "candidate": payload.candidate_name, "role": payload.role, "template_id": payload.template_id},
     )
     return inv
+
+
+@app.put("/api/v1/interviews/{interview_id}")
+async def update_interview_endpoint(
+    interview_id: str,
+    payload: UpdateInterviewDraftRequest,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if inv["status"] not in ("draft", "ready"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot edit interview in status '{inv['status']}', expected 'draft' or 'ready'",
+        )
+
+    repo.update_interview_draft(
+        interview_id=interview_id,
+        title=payload.title,
+        candidate_name=payload.candidate_name,
+        role=payload.role,
+        template_id=payload.template_id,
+        template_version=payload.template_version,
+    )
+
+    if payload.plan is not None:
+        latest_plan = repo.get_latest_plan(interview_id)
+        next_ver = (latest_plan["version"] + 1) if latest_plan else 1
+        repo.save_plan(
+            plan_id=f"plan-{interview_id}-v{next_ver}",
+            interview_id=interview_id,
+            payload=payload.plan,
+            version=next_ver,
+        )
+
+    repo.record_audit_event(
+        event_id=f"audit-{uuid.uuid4().hex[:8]}",
+        interview_id=interview_id,
+        event_type="INTERVIEW_DRAFT_UPDATED",
+        payload={"title": payload.title, "candidate": payload.candidate_name, "role": payload.role},
+    )
+    return repo.get_interview(interview_id)
 
 
 @app.get("/api/v1/interviews")
 async def list_interviews_endpoint(
     limit: int = 50,
+    offset: int = 0,
+    search: str | None = None,
+    role: str | None = None,
+    status: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
     repo: Repository = Depends(get_repository),
 ):
-    return repo.list_interviews(limit=limit)
+    items = repo.list_interviews(
+        limit=limit,
+        offset=offset,
+        search=search,
+        role=role,
+        status=status,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    total = repo.count_interviews(
+        search=search,
+        role=role,
+        status=status,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 def compute_interview_scoring(
@@ -981,14 +1252,70 @@ async def approve_assessment_endpoint(
     return {"status": "approved", "proposal_id": proposal_id, "question_id": question_id}
 
 
+@app.get("/api/v1/interviews/{interview_id}/revisions/reports")
+async def list_report_revisions_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    return repo.get_report_revisions(interview_id)
+
+
+@app.get("/api/v1/interviews/{interview_id}/plan/readiness")
+async def get_interview_plan_readiness_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    plan = repo.get_latest_plan(interview_id)
+    if not plan or not plan.get("payload"):
+        return {"is_ready": False, "errors": ["План собеседования отсутствует или пуст"]}
+    try:
+        InterviewPlan.model_validate(plan["payload"])
+        return {"is_ready": True, "errors": []}
+    except Exception as e:
+        return {"is_ready": False, "errors": [str(e)]}
+
+
 @app.get("/api/v1/interviews/{interview_id}/export")
 async def export_interview_endpoint(
     interview_id: str,
+    revision_number: int | None = None,
     repo: Repository = Depends(get_repository),
 ):
     inv = repo.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
+
+    if revision_number is not None:
+        revisions = repo.get_report_revisions(interview_id)
+        rev = next((r for r in revisions if r.get("revision_number") == revision_number), None)
+        if not rev:
+            raise HTTPException(status_code=404, detail=f"Report revision {revision_number} not found")
+        snapshot = rev.get("canonical_snapshot") or {}
+        return {
+            "interview_id": inv["id"],
+            "title": inv["title"],
+            "candidate_name": inv["candidate_name"],
+            "role": inv["role"],
+            "status": "FINALIZED",
+            "is_draft": False,
+            "revision_number": revision_number,
+            "final_score_100": rev["final_score_100"],
+            "coverage_percentage": rev["coverage_percentage"],
+            "sha256_checksum": rev["sha256_checksum"],
+            "snapshot": snapshot,
+            "report_revision": rev,
+            "summary": snapshot.get("executive_summary") or rev.get("summary_markdown"),
+            "human_assessments": snapshot.get("human_assessments"),
+            "audit_trail": repo.get_audit_events(interview_id),
+        }
 
     is_finalized = inv["status"] == "finalized"
     latest_report = repo.get_latest_report_revision(interview_id)

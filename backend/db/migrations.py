@@ -4,6 +4,7 @@ Versioned SQLite Schema Migrations for Nebula.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -41,7 +42,7 @@ def run_migrations(db: Database) -> int:
     finally:
         conn.close()
 
-    TARGET_VERSION = 6
+    TARGET_VERSION = 7
     if current_version < TARGET_VERSION:
         # Make verified pre-migration backup if not in-memory
         if db.db_path != ":memory:" and Path(db.db_path).exists():
@@ -377,6 +378,115 @@ def run_migrations(db: Database) -> int:
         if not db.verify_integrity():
             raise RuntimeError("Database integrity check failed after running migration 006!")
         current_version = 6
+
+    if current_version < 7:
+        # Migration 7: Job templates and interview links
+        with db.transaction() as tx_conn:
+            # 1. Create job_templates table
+            tx_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_templates (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    level TEXT NOT NULL DEFAULT 'Middle',
+                    description TEXT NOT NULL DEFAULT '',
+                    questions_json TEXT NOT NULL DEFAULT '[]',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    is_archived INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            tx_conn.execute("CREATE INDEX IF NOT EXISTS idx_job_templates_archived ON job_templates(is_archived);")
+
+            # 2. Add template_id and template_version to interviews table if not present
+            int_cols = [row["name"] for row in tx_conn.execute("PRAGMA table_info(interviews)").fetchall()]
+            if "template_id" not in int_cols:
+                tx_conn.execute("ALTER TABLE interviews ADD COLUMN template_id TEXT REFERENCES job_templates(id) ON DELETE SET NULL;")
+            if "template_version" not in int_cols:
+                tx_conn.execute("ALTER TABLE interviews ADD COLUMN template_version INTEGER;")
+
+            # 3. Seed default template if empty
+            count = tx_conn.execute("SELECT COUNT(*) FROM job_templates").fetchone()[0]
+            if count == 0:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                default_questions = [
+                    {
+                        "id": "q-backend-saga",
+                        "title": "Распределённые транзакции (Saga)",
+                        "prompt": "Как вы проектируете распределённые транзакции в микросервисах? Расскажите про паттерн Saga и механизмы компенсации.",
+                        "text": "Как вы проектируете распределённые транзакции в микросервисах? Расскажите про паттерн Saga и механизмы компенсации.",
+                        "order_index": 0,
+                        "weight": 1.5,
+                        "criteria": [
+                            {
+                                "id": "crit-arch-saga",
+                                "title": "Понимание Saga & Orchestration",
+                                "description": "Понимание различий оркестрации и хореографии, идемпотентность компенсирующих транзакций",
+                                "min_score": 1.0,
+                                "max_score": 5.0,
+                                "weight": 1.0,
+                                "levels_description": {
+                                    1: "Нет понимания паттерна",
+                                    3: "Базовые знания хореографии",
+                                    5: "Глубокое понимание оркестрации и компенсаций"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "id": "q-backend-db",
+                        "title": "Выбор хранилища и партиционирование",
+                        "prompt": "В каких случаях вы выбираете PostgreSQL вместо NoSQL и как организуете партиционирование при высоких нагрузках?",
+                        "text": "В каких случаях вы выбираете PostgreSQL вместо NoSQL и как организуете партиционирование при высоких нагрузках?",
+                        "order_index": 1,
+                        "weight": 1.0,
+                        "criteria": [
+                            {
+                                "id": "crit-db-tradeoffs",
+                                "title": "Выбор хранилища и шардирование",
+                                "description": "Знание ACID, индексов, типов репликации и партиций по диапазонам/хешу",
+                                "min_score": 1.0,
+                                "max_score": 5.0,
+                                "weight": 1.0,
+                                "levels_description": {
+                                    1: "Слабое представление об индексах",
+                                    3: "Знание репликации и шардинга",
+                                    5: "Глубокий опыт тюнинга и отказоустойчивости"
+                                }
+                            }
+                        ]
+                    }
+                ]
+                tx_conn.execute(
+                    """
+                    INSERT INTO job_templates (
+                        id, title, role, level, description, questions_json, version, is_archived, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                    """,
+                    (
+                        "tpl-backend-senior",
+                        "Senior Backend / Systems Engineer",
+                        "Senior Backend Engineer",
+                        "Senior",
+                        "Проектирование высоконагруженных распределённых систем и хранилищ данных.",
+                        json.dumps(default_questions, ensure_ascii=False),
+                        now_iso,
+                        now_iso,
+                    )
+                )
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (7, '007_job_templates_and_interview_links', ?)",
+                (now_iso,),
+            )
+
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 007!")
+        current_version = 7
 
     logger.info("Successfully ensured database schema up to version %d", current_version)
     return current_version

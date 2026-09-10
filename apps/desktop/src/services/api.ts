@@ -1,5 +1,5 @@
 import { isTauri, invoke } from '@tauri-apps/api/core';
-import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus, SpeakerRole, CaptureMode, TrackManifest } from '../types';
+import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus, SpeakerRole, CaptureMode, TrackManifest, JobTemplate, PaginatedInterviews, ReportRevisionSummary } from '../types';
 
 const API_BASE = 'http://127.0.0.1:8000/api/v1';
 
@@ -522,8 +522,11 @@ export async function enqueueJob(
   return res.json();
 }
 
-export async function exportInterview(interviewId: string): Promise<Record<string, unknown>> {
-  const res = await fetch(`${API_BASE}/interviews/${interviewId}/export`);
+export async function exportInterview(interviewId: string, revisionNumber?: number): Promise<Record<string, unknown>> {
+  const url = revisionNumber !== undefined
+    ? `${API_BASE}/interviews/${interviewId}/export?revision_number=${revisionNumber}`
+    : `${API_BASE}/interviews/${interviewId}/export`;
+  const res = await fetch(url);
   if (!res.ok) throw new Error(`Export interview error: ${res.statusText}`);
   return res.json();
 }
@@ -892,6 +895,192 @@ export async function splitSegment(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+// -------------------------------------------------------------
+// Workspace: Interviews Listing, Filtering, and Drafts
+// -------------------------------------------------------------
+export async function listInterviews(params?: {
+  limit?: number;
+  offset?: number;
+  search?: string;
+  role?: string;
+  status?: string;
+  from_date?: string;
+  to_date?: string;
+}): Promise<PaginatedInterviews> {
+  const query = new URLSearchParams();
+  if (params?.limit !== undefined) query.set('limit', params.limit.toString());
+  if (params?.offset !== undefined) query.set('offset', params.offset.toString());
+  if (params?.search) query.set('search', params.search);
+  if (params?.role) query.set('role', params.role);
+  if (params?.status) query.set('status', params.status);
+  if (params?.from_date) query.set('from_date', params.from_date);
+  if (params?.to_date) query.set('to_date', params.to_date);
+
+  const qs = query.toString();
+  const url = qs ? `${API_BASE}/interviews?${qs}` : `${API_BASE}/interviews`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`List interviews error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function updateInterviewDraft(
+  id: string,
+  data: {
+    title?: string;
+    candidate_name?: string;
+    role?: string;
+    plan?: InterviewPlan;
+    template_id?: string;
+    template_version?: number;
+  }
+): Promise<any> {
+  const res = await fetch(`${API_BASE}/interviews/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function getInterviewPlanReadiness(
+  interviewId: string
+): Promise<{ is_ready: boolean; errors: string[] }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/plan/readiness`);
+  if (!res.ok) throw new Error(`Plan readiness check failed: ${res.statusText}`);
+  return res.json();
+}
+
+export async function reopenInterviewRevision(
+  interviewId: string,
+  reviewerId: string,
+  reason: string
+): Promise<{ status: string; interview_id: string; reopened_at: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/revisions/reopen`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reviewer_id: reviewerId, reason }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function getReportRevisions(
+  interviewId: string
+): Promise<ReportRevisionSummary[]> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/revisions/reports`);
+  if (!res.ok) throw new Error(`Get report revisions failed: ${res.statusText}`);
+  return res.json();
+}
+
+// -------------------------------------------------------------
+// Workspace: Job Templates API
+// -------------------------------------------------------------
+export async function listJobTemplates(includeArchived = false): Promise<JobTemplate[]> {
+  const url = includeArchived
+    ? `${API_BASE}/job-templates?include_archived=true`
+    : `${API_BASE}/job-templates`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`List job templates error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getJobTemplate(templateId: string): Promise<JobTemplate> {
+  const res = await fetch(`${API_BASE}/job-templates/${templateId}`);
+  if (!res.ok) throw new Error(`Get job template error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function createJobTemplate(data: {
+  id?: string;
+  title: string;
+  role: string;
+  level?: string;
+  description?: string;
+  questions?: any[];
+}): Promise<JobTemplate> {
+  const res = await fetch(`${API_BASE}/job-templates`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function updateJobTemplate(
+  templateId: string,
+  data: {
+    title?: string;
+    role?: string;
+    level?: string;
+    description?: string;
+    questions?: any[];
+  }
+): Promise<JobTemplate> {
+  const res = await fetch(`${API_BASE}/job-templates/${templateId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function duplicateJobTemplate(
+  templateId: string,
+  titleSuffix = ' (Копия)'
+): Promise<JobTemplate> {
+  const res = await fetch(`${API_BASE}/job-templates/${templateId}/duplicate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title_suffix: titleSuffix }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function archiveJobTemplate(templateId: string): Promise<JobTemplate> {
+  const res = await fetch(`${API_BASE}/job-templates/${templateId}/archive`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function unarchiveJobTemplate(templateId: string): Promise<JobTemplate> {
+  const res = await fetch(`${API_BASE}/job-templates/${templateId}/unarchive`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function deleteJobTemplate(
+  templateId: string
+): Promise<{ status: string; template_id: string }> {
+  const res = await fetch(`${API_BASE}/job-templates/${templateId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function copyQuestionToTemplate(
+  sourceTemplateId: string,
+  questionId: string,
+  targetTemplateId: string
+): Promise<JobTemplate> {
+  const res = await fetch(
+    `${API_BASE}/job-templates/${sourceTemplateId}/questions/${questionId}/copy-to/${targetTemplateId}`,
+    {
+      method: 'POST',
+    }
+  );
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
