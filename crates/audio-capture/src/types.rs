@@ -50,4 +50,21 @@ pub struct TrackManifest {
     pub is_sealed: bool,
     #[serde(default)]
     pub gaps: Vec<AudioGap>,
+    #[serde(default)]
+    pub total_samples: u64,
+    #[serde(default)]
+    pub dropped_samples: u64,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureStats {
+    pub interview_id: String,
+    pub track_id: TrackType,
+    pub total_chunks: u64,
+    pub total_samples: u64,
+    pub total_duration_ms: u64,
+    pub dropped_samples: u64,
+    pub is_sealed: bool,
+    pub gaps: Vec<AudioGap>,
+}
+

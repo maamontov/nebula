@@ -8,6 +8,7 @@ Adheres strictly to docs/implementation-plan.md Section 7.3:
 - Computes actual planned weight coverage percentage.
 - Does not invent zero scores for missing questions; missing questions result in null or reduced coverage.
 """
+import math
 from dataclasses import dataclass
 
 from contracts.domain import (
@@ -51,25 +52,27 @@ def calculate_interview_score(
     assessments_map = {a.question_id: a for a in assessments}
 
     total_planned_weight = sum(q.weight for q in rubric.questions)
-    if total_planned_weight <= 0:
-        raise ScoringError("Total planned weight across questions must be strictly positive.")
+    if math.isnan(total_planned_weight) or math.isinf(total_planned_weight) or total_planned_weight <= 0:
+        raise ScoringError("Total planned weight across questions must be strictly positive and finite.")
 
     question_results: dict[str, QuestionScoringResult] = {}
     total_evaluated_weight = 0.0
     weighted_score_sum = 0.0
 
     for question in rubric.questions:
-        if question.weight < 0:
-            raise ScoringError(f"Question '{question.id}' has negative weight {question.weight}.")
+        if math.isnan(question.weight) or math.isinf(question.weight) or question.weight < 0:
+            raise ScoringError(f"Question '{question.id}' has invalid weight {question.weight}.")
 
         # Check criteria validation
         for crit in question.criteria:
+            if math.isnan(crit.min_score) or math.isinf(crit.min_score) or math.isnan(crit.max_score) or math.isinf(crit.max_score):
+                raise ScoringError(f"Criterion '{crit.id}' has non-finite scale limits.")
             if crit.max_score <= crit.min_score:
                 raise ScoringError(
                     f"Criterion '{crit.id}' has invalid scale: max ({crit.max_score}) <= min ({crit.min_score})."
                 )
-            if crit.weight < 0:
-                raise ScoringError(f"Criterion '{crit.id}' has negative weight {crit.weight}.")
+            if math.isnan(crit.weight) or math.isinf(crit.weight) or crit.weight < 0:
+                raise ScoringError(f"Criterion '{crit.id}' has invalid weight {crit.weight}.")
 
         assessment = assessments_map.get(question.id)
 
@@ -86,7 +89,23 @@ def calculate_interview_score(
 
         # Evaluate criteria within this question
         criteria_map = {c.id: c for c in question.criteria}
-        user_scores_map = {cs.criterion_id: cs for cs in assessment.criteria_scores}
+        seen_criterion_ids = set()
+        user_scores_map = {}
+
+        for cs in assessment.criteria_scores:
+            if cs.criterion_id not in criteria_map:
+                raise ScoringError(
+                    f"Unknown criterion '{cs.criterion_id}' in assessment for question '{question.id}'."
+                )
+            if cs.criterion_id in seen_criterion_ids:
+                raise ScoringError(
+                    f"Duplicate criterion '{cs.criterion_id}' in assessment for question '{question.id}'."
+                )
+            seen_criterion_ids.add(cs.criterion_id)
+            if cs.score is not None:
+                if math.isnan(cs.score) or math.isinf(cs.score):
+                    raise ScoringError(f"Score for criterion '{cs.criterion_id}' must be a finite number.")
+            user_scores_map[cs.criterion_id] = cs
 
         crit_norm_scores: dict[str, float | None] = {}
         crit_weight_sum = 0.0

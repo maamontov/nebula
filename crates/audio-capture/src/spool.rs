@@ -107,6 +107,30 @@ impl AudioSpoolManager {
         total_chunks: u64,
         total_duration_ms: u64,
     ) -> Result<TrackManifest> {
+        self.seal_manifest_extended(
+            interview_id,
+            track_id,
+            capture_epoch,
+            total_chunks,
+            total_duration_ms,
+            0,
+            0,
+            Vec::new(),
+        )
+    }
+
+    /// Seals the track manifest with full sample counts, overflow metrics, and gaps.
+    pub fn seal_manifest_extended(
+        &self,
+        interview_id: &str,
+        track_id: TrackType,
+        capture_epoch: u32,
+        total_chunks: u64,
+        total_duration_ms: u64,
+        total_samples: u64,
+        dropped_samples: u64,
+        gaps: Vec<crate::types::AudioGap>,
+    ) -> Result<TrackManifest> {
         let track_dir = self.get_track_dir(interview_id, track_id);
         let manifest = TrackManifest {
             interview_id: interview_id.to_string(),
@@ -115,7 +139,9 @@ impl AudioSpoolManager {
             total_chunks,
             total_duration_ms,
             is_sealed: true,
-            gaps: Vec::new(),
+            gaps,
+            total_samples,
+            dropped_samples,
         };
 
         let manifest_path = track_dir.join("manifest.json");
@@ -124,6 +150,7 @@ impl AudioSpoolManager {
 
         Ok(manifest)
     }
+
 
     /// Verifies all chunks in a track directory against their metadata and checksums.
     pub fn verify_track_spool(

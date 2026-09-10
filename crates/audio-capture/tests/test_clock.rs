@@ -24,3 +24,28 @@ fn test_clock_drift_and_skew() {
     let skew_diff = MonotonicInterviewClock::calculate_inter_track_skew_ms(16800, 16000, 48000, 48000);
     assert_eq!(skew_diff, 50);
 }
+
+#[test]
+fn test_clock_pause_resume() {
+    let mut clock = MonotonicInterviewClock::new(1);
+    assert_eq!(clock.epoch(), 1);
+    assert!(!clock.is_paused());
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let elapsed_before_pause = clock.pause();
+    assert!(clock.is_paused());
+    assert!(elapsed_before_pause >= 15);
+
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    // During pause, elapsed_ms should stay frozen
+    assert_eq!(clock.elapsed_ms(), elapsed_before_pause);
+
+    let new_epoch = clock.resume();
+    assert_eq!(new_epoch, 2);
+    assert_eq!(clock.epoch(), 2);
+    assert!(!clock.is_paused());
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(clock.elapsed_ms() > elapsed_before_pause);
+}
+

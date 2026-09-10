@@ -23,28 +23,63 @@ async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Prom
     }
   }
 
-  // Browser development fallback
-  console.log(`[Browser Mock] Tauri invoke: ${cmd}`, args);
+  // If running in browser without Tauri:
+  // Check if explicit demo mock mode was enabled via window.NEBULA_ENABLE_DEMO_MOCK
+  const isDemoMode = typeof window !== 'undefined' && (window as unknown as { NEBULA_ENABLE_DEMO_MOCK?: boolean }).NEBULA_ENABLE_DEMO_MOCK === true;
+  if (isDemoMode) {
+    console.log(`[Explicit Demo Mode] Tauri invoke: ${cmd}`, args);
+    if (cmd === 'list_audio_devices') {
+      return [
+        { id: 'demo_mic', name: 'Demo Микрофон (Mock)', is_default: true, channels: 1, sample_rate: 48000 },
+        { id: 'demo_speaker', name: 'Demo Loopback (Mock)', is_default: false, channels: 2, sample_rate: 48000 },
+      ] as unknown as T;
+    }
+    if (cmd === 'get_audio_levels') {
+      return {
+        interviewer_rms: 0.05,
+        interviewer_peak: 0.1,
+        candidate_rms: 0.05,
+        candidate_peak: 0.1,
+      } as unknown as T;
+    }
+    if (cmd === 'start_capture') {
+      return { status: 'started', session_id: args?.session_id } as unknown as T;
+    }
+    if (cmd === 'pause_capture') {
+      return { status: 'paused', session_id: 'demo', elapsed_ms: 1000 } as unknown as T;
+    }
+    if (cmd === 'resume_capture') {
+      return { status: 'resumed', session_id: 'demo', epoch: 2, elapsed_ms: 1000 } as unknown as T;
+    }
+    if (cmd === 'stop_capture') {
+      return { status: 'stopped', total_chunks: 1, drift_ms: 0 } as unknown as T;
+    }
+    return {} as T;
+  }
+
+  // Normal browser without capture capability: do NOT fake success or audio levels
   if (cmd === 'list_audio_devices') {
-    return [
-      { id: 'default_mic', name: 'Встроенный микрофон (MacBook Air)', is_default: true, channels: 1, sample_rate: 48000 },
-      { id: 'usb_headset', name: 'USB Наушники с гарнитурой', is_default: false, channels: 2, sample_rate: 48000 },
-      { id: 'loopback_dev', name: 'BlackHole 2ch (Virtual Loopback)', is_default: false, channels: 2, sample_rate: 48000 },
-    ] as unknown as T;
+    return [] as unknown as T;
   }
   if (cmd === 'get_audio_levels') {
     return {
-      interviewer_rms: 0.05 + Math.random() * 0.15,
-      interviewer_peak: 0.25,
-      candidate_rms: 0.08 + Math.random() * 0.2,
-      candidate_peak: 0.35,
+      interviewer_rms: 0,
+      interviewer_peak: 0,
+      candidate_rms: 0,
+      candidate_peak: 0,
     } as unknown as T;
   }
   if (cmd === 'start_capture') {
-    return { status: 'started', session_id: args?.session_id } as unknown as T;
+    throw new Error('Захват аудио недоступен: веб-браузер не имеет доступа к Tauri аудиоядру. Запустите десктопное приложение Tauri.');
+  }
+  if (cmd === 'pause_capture') {
+    return { status: 'paused', session_id: '', elapsed_ms: 0 } as unknown as T;
+  }
+  if (cmd === 'resume_capture') {
+    return { status: 'resumed', session_id: '', epoch: 1, elapsed_ms: 0 } as unknown as T;
   }
   if (cmd === 'stop_capture') {
-    return { status: 'stopped', total_chunks: 12, drift_ms: 4 } as unknown as T;
+    return { status: 'stopped', total_chunks: 0, drift_ms: 0 } as unknown as T;
   }
   return {} as T;
 }
@@ -76,7 +111,25 @@ export async function startAudioCapture(
   });
 }
 
-export async function stopAudioCapture(): Promise<{ status: string; total_chunks: number; drift_ms: number }> {
+export async function pauseAudioCapture(): Promise<{ status: string; session_id: string; elapsed_ms: number }> {
+  return invokeTauri('pause_capture');
+}
+
+export async function resumeAudioCapture(): Promise<{ status: string; session_id: string; epoch: number; elapsed_ms: number }> {
+  return invokeTauri('resume_capture');
+}
+
+export async function stopAudioCapture(): Promise<{
+  status: string;
+  session_id: string;
+  total_chunks: number;
+  total_samples_interviewer: number;
+  total_samples_candidate: number;
+  total_duration_ms: number;
+  drift_ms: number;
+  skew_ms: number;
+  dropped_samples: number;
+}> {
   return invokeTauri('stop_capture');
 }
 
@@ -104,9 +157,55 @@ export async function getInterview(id: string): Promise<{
   plan?: InterviewPlan;
   transcript_segments: TranscriptSegment[];
   assessment_proposals: AssessmentProposal[];
+  human_assessments?: Array<{
+    id: string;
+    question_id: string;
+    rubric_revision_id: string;
+    transcript_revision_id: string;
+    reviewer_id?: string;
+    scores: Array<{ criterion_id: string; score: number; explanation?: string }>;
+    reviewer_notes?: string;
+    is_manually_adjusted: boolean;
+    is_stale: boolean;
+    updated_at: string;
+  }>;
+  scoring?: {
+    final_score_100: number | null;
+    coverage_percentage: number;
+    total_planned_weight: number;
+    evaluated_weight: number;
+  };
 }> {
   const res = await fetch(`${API_BASE}/interviews/${id}`);
   if (!res.ok) throw new Error(`Get interview error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function reviewAssessment(
+  interviewId: string,
+  questionId: string,
+  data: {
+    expected_transcript_revision: string;
+    scores: Array<{ criterion_id: string; score: number; explanation?: string }>;
+    reviewer_notes?: string;
+    reviewer_id?: string;
+    is_manually_adjusted?: boolean;
+    is_excluded?: boolean;
+    exclusion_reason?: string;
+  }
+): Promise<{ status: string; assessment_id: string; question_id: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/assessments/${questionId}/review`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    if (res.status === 409) {
+      const errBody = await res.json().catch(() => ({ detail: 'Конфликт версий стенограммы' }));
+      throw new Error(`409: ${errBody.detail || 'Конфликт ревизии'}`);
+    }
+    throw new Error(`Review assessment error: ${res.statusText}`);
+  }
   return res.json();
 }
 
@@ -127,6 +226,46 @@ export async function updateInterviewStatus(
     }),
   });
   if (!res.ok) throw new Error(`Update status error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function pauseInterview(interviewId: string): Promise<{ status: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/pause`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(`Pause interview error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function resumeInterview(interviewId: string): Promise<{ status: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/resume`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(`Resume interview error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function stopInterview(
+  interviewId: string,
+  manifests?: Array<Record<string, unknown>>
+): Promise<{ status: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/stop`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ manifests: manifests || [] }),
+  });
+  if (!res.ok) throw new Error(`Stop interview error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getInterviewJobsStatus(interviewId: string): Promise<{
+  interview_id: string;
+  counts: Record<string, number>;
+  pending_or_processing: number;
+  is_pipeline_idle: boolean;
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/jobs/status`);
+  if (!res.ok) throw new Error(`Get jobs status error: ${res.statusText}`);
   return res.json();
 }
 
@@ -174,6 +313,69 @@ export async function enqueueJob(
 export async function exportInterview(interviewId: string): Promise<Record<string, unknown>> {
   const res = await fetch(`${API_BASE}/interviews/${interviewId}/export`);
   if (!res.ok) throw new Error(`Export interview error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getSummary(interviewId: string): Promise<{
+  interview_id: string;
+  has_summary: boolean;
+  is_confirmed: boolean;
+  model_profile_id?: string;
+  summary?: any;
+  confirmed_markdown?: string;
+  confirmed_recommendation?: string;
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/summary`);
+  if (!res.ok) throw new Error(`Get summary error: ${res.statusText}`);
+  return res.json();
+}
+
+export async function confirmSummary(
+  interviewId: string,
+  data: {
+    reviewer_id: string;
+    confirmed_markdown: string;
+    confirmed_recommendation: string;
+  }
+): Promise<{ status: string; interview_id: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/summary/confirm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(errBody.detail || `Confirm summary error: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function finalizeInterviewReport(
+  interviewId: string,
+  data: {
+    summary_markdown: string;
+    hiring_recommendation: string;
+    confirmed_by: string;
+    audio_limitations?: string[];
+  }
+): Promise<{
+  status: string;
+  final_score_100: number | null;
+  coverage_percentage: number;
+  sha256_checksum: string;
+  report_id: string;
+  revision_number: number;
+  snapshot: any;
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/report/finalize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(errBody.detail || `Finalize report error: ${res.statusText}`);
+  }
   return res.json();
 }
 
@@ -373,29 +575,26 @@ export async function finalizeAndSealReport(
 // -------------------------------------------------------------
 // Stage 7: Reliability, Privacy Lifecycle & Backup
 // -------------------------------------------------------------
-export async function deleteInterview(interviewId: string, spoolDir?: string): Promise<{
+export async function deleteInterview(interviewId: string): Promise<{
   status: string;
   interview_id: string;
   success: boolean;
 }> {
-  const url = spoolDir
-    ? `${API_BASE}/interviews/${interviewId}?spool_dir=${encodeURIComponent(spoolDir)}`
-    : `${API_BASE}/interviews/${interviewId}`;
-  const res = await fetch(url, {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}`, {
     method: 'DELETE',
   });
   if (!res.ok) throw new Error(`Delete interview error: ${res.statusText}`);
   return res.json();
 }
 
-export async function createDatabaseBackup(targetPath: string): Promise<{
+export async function createDatabaseBackup(filename?: string): Promise<{
   status: string;
   target_path: string;
 }> {
   const res = await fetch(`${API_BASE}/system/backup`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ target_path: targetPath }),
+    body: JSON.stringify(filename ? { target_path: filename } : {}),
   });
   if (!res.ok) throw new Error(`Create backup error: ${res.statusText}`);
   return res.json();

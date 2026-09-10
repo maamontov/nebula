@@ -14,7 +14,9 @@ from typing import Any
 from backend.adapters.llm import OpenAICompatibleAdapter
 from backend.adapters.resilient_llm import ResilientLLMAdapter
 from backend.adapters.stt import OpenAICompatibleSTTAdapter
+from backend.core.audio_utils import pcm_s16le_to_wav_bytes
 from backend.core.evidence_validator import validate_proposal
+
 from backend.core.revisions import TranscriptDiffEngine
 from backend.core.summary_generator import ExecutiveSummaryGenerator
 from backend.core.profiles import (
@@ -108,11 +110,21 @@ class PipelineWorker:
         track_id = payload.get("track_id", "candidate")
         start_ms = payload.get("start_ms", 0)
         end_ms = payload.get("end_ms", 0)
+        sample_rate = payload.get("sample_rate", 16000)
+        channels = payload.get("channels", 1)
+        format_val = payload.get("format", "pcm_s16le")
         language = payload.get("language", "ru")
 
+        # If audio payload is raw PCM, wrap it into a compliant WAV container before STT
+        if format_val == "pcm_s16le" or not audio_bytes.startswith(b"RIFF"):
+            wav_bytes = pcm_s16le_to_wav_bytes(audio_bytes, sample_rate, channels)
+        else:
+            wav_bytes = audio_bytes
+
+        filename = f"chunk_{track_id}_{start_ms}_{end_ms}.wav"
         res = await self.stt_adapter.transcribe_audio(
-            audio_bytes,
-            filename="chunk.wav",
+            wav_bytes,
+            filename=filename,
             content_type="audio/wav",
             language=language,
         )
@@ -131,6 +143,7 @@ class PipelineWorker:
             text=res.text.strip(),
             is_final=True,
         )
+
 
     async def _handle_evaluate(self, interview_id: str, payload: dict[str, Any]) -> None:
         if not self.repo.get_interview(interview_id):

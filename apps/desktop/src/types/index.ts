@@ -36,8 +36,10 @@ export interface RubricCriterion {
 
 export interface PlannedQuestion {
   id: string;
-  text: string;
-  order_index: number;
+  title?: string;
+  prompt?: string;
+  text?: string;
+  order_index?: number;
   weight: number;
   criteria: RubricCriterion[];
 }
@@ -83,12 +85,36 @@ export interface AssessmentProposal {
   created_at: string;
 }
 
+export interface HumanAssessment {
+  id: string;
+  interview_id: string;
+  question_id: string;
+  rubric_revision_id: string;
+  transcript_revision_id: string;
+  reviewer_id?: string;
+  scores: Array<{
+    criterion_id: string;
+    score: number;
+    explanation?: string;
+  }>;
+  reviewer_notes?: string;
+  is_manually_adjusted: boolean;
+  is_stale: boolean;
+  stale_reason?: string;
+  is_excluded?: boolean;
+  exclusion_reason?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface InterviewDetails {
   id: string;
   title: string;
   candidate_name: string;
   role: string;
   status: InterviewStatus;
+  active_rubric_revision_id?: string;
+  active_transcript_revision_id?: string;
   consent_confirmed_at?: string;
   consent_version?: string;
 }

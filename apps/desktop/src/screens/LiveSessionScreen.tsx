@@ -1,6 +1,17 @@
 import React, { useState, useEffect } from 'react';
 import { InterviewPlan, TranscriptSegment, AssessmentProposal } from '../types';
-import { stopAudioCapture, updateInterviewStatus, getInterview, enqueueJob, addTranscriptSegment } from '../services/api';
+import {
+  stopAudioCapture,
+  pauseAudioCapture,
+  resumeAudioCapture,
+  pauseInterview,
+  resumeInterview,
+  stopInterview,
+  getInterviewJobsStatus,
+  updateInterviewStatus,
+  getInterview,
+  enqueueJob,
+} from '../services/api';
 import { Square, Pause, Play, CheckCircle, MessageSquare, Quote, Sparkles, AlertTriangle, ExternalLink, Loader2 } from 'lucide-react';
 
 interface LiveSessionScreenProps {
@@ -16,55 +27,18 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
 }) => {
   const [elapsedSec, setElapsedSec] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
+  const [isTogglingPause, setIsTogglingPause] = useState(false);
   const [activeQuestionIdx, setActiveQuestionIdx] = useState(0);
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
+  const [stoppingStage, setStoppingStage] = useState<string | null>(null);
   const [evalSuccessNotice, setEvalSuccessNotice] = useState<string | null>(null);
+  const [backendError, setBackendError] = useState<string | null>(null);
 
-  const [segments, setSegments] = useState<TranscriptSegment[]>([
-    {
-      id: 'seg-1',
-      track_id: 'interviewer',
-      start_time_ms: 0,
-      end_time_ms: 4500,
-      text: plan.questions[0]?.text || 'Добрый день! Начнем с первого вопроса.',
-      is_final: true,
-    },
-    {
-      id: 'seg-2',
-      track_id: 'candidate',
-      start_time_ms: 5000,
-      end_time_ms: 12500,
-      text: 'Для распределённых транзакций мы применили паттерн Saga с оркестрацией. В случае сбоя шага оркестратор запускает компенсирующие транзакции в обратном порядке.',
-      is_final: true,
-    },
-  ]);
-
-  const [proposals, setProposals] = useState<AssessmentProposal[]>([
-    {
-      id: 'prop-1',
-      interview_id: interviewId,
-      question_id: plan.questions[0]?.id || 'q-1',
-      model_profile_id: 'google/gemini-3.8-flash',
-      scores: [
-        {
-          criterion_id: 'crit-arch-saga',
-          score: 5.0,
-          explanation: 'Кандидат корректно описывает применение паттерна Saga на основе оркестрации, а также механизм отката через запуск компенсирующих транзакций в обратном порядке.',
-          evidence: [
-            {
-              segment_id: 'seg-2',
-              exact_quote: 'Для распределённых транзакций мы применили паттерн Saga с оркестрацией. В случае сбоя шага оркестратор запускает компенсирующие транзакции в обратном порядке.',
-            },
-          ],
-        },
-      ],
-      critical_errors: [],
-      is_approved: false,
-      created_at: new Date().toISOString(),
-    },
-  ]);
+  // Real initial state: strictly empty, no synthetic speech or mock scores
+  const [segments, setSegments] = useState<TranscriptSegment[]>([]);
+  const [proposals, setProposals] = useState<AssessmentProposal[]>([]);
 
   // Monotonic timer
   useEffect(() => {
@@ -73,61 +47,97 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
     return () => clearInterval(timer);
   }, [isPaused]);
 
-  // Polling for backend updates
+  // Polling for real backend updates with clean unmount
   useEffect(() => {
+    let isSubscribed = true;
     const poll = setInterval(async () => {
       try {
         const data = await getInterview(interviewId);
-        if (data.transcript_segments && data.transcript_segments.length > 0) {
-          setSegments(data.transcript_segments);
-        }
-        if (data.assessment_proposals && data.assessment_proposals.length > 0) {
-          setProposals(data.assessment_proposals);
-        }
-      } catch (err) {
-        // Ignored in offline/local spike
+        if (!isSubscribed) return;
+        setSegments(data.transcript_segments || []);
+        setProposals(data.assessment_proposals || []);
+        setBackendError(null);
+      } catch (err: any) {
+        if (!isSubscribed) return;
+        setBackendError('Связь с сервером бэкенда потеряна');
       }
     }, 2000);
 
-    return () => clearInterval(poll);
-  }, [interviewId]);
-
-  useEffect(() => {
-    async function seedInitialSegments() {
-      try {
-        const data = await getInterview(interviewId);
-        if (!data.transcript_segments || data.transcript_segments.length === 0) {
-          for (const seg of segments) {
-            await addTranscriptSegment(interviewId, seg);
-          }
-        }
-      } catch (e) {
-        console.warn('Seed initial segments error:', e);
-      }
-    }
-    seedInitialSegments();
+    return () => {
+      isSubscribed = false;
+      clearInterval(poll);
+    };
   }, [interviewId]);
 
   const formatTime = (totalSeconds: number) => {
-    const m = Math.floor(totalSeconds / 60);
-    const s = totalSeconds % 60;
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const handleTogglePause = async () => {
+    if (isTogglingPause || isStopping) return;
+    setIsTogglingPause(true);
+    setBackendError(null);
+    try {
+      if (!isPaused) {
+        // Pause audio capture engine
+        await pauseAudioCapture();
+        // Record pause state in backend
+        await pauseInterview(interviewId);
+        setIsPaused(true);
+      } else {
+        // Resume capture engine (advances epoch)
+        await resumeAudioCapture();
+        // Record resume in backend
+        await resumeInterview(interviewId);
+        setIsPaused(false);
+      }
+    } catch (err: any) {
+      console.error('Failed to toggle pause:', err);
+      setBackendError(`Ошибка переключения паузы: ${err.message || err}`);
+    } finally {
+      setIsTogglingPause(false);
+    }
   };
 
   const handleStop = async () => {
     if (isStopping) return;
     setIsStopping(true);
+    setBackendError(null);
+
     try {
+      setStoppingStage('Остановка захвата звука...');
       await stopAudioCapture();
-    } catch (e) {
-      console.warn('stopAudioCapture warning/error:', e);
+
+      setStoppingStage('Фиксация состояния и манифестов сессии...');
+      await stopInterview(interviewId);
+
+      setStoppingStage('Ожидание завершения обработки пайплайна...');
+      const maxWaitMs = 15000;
+      const startTime = Date.now();
+      while (Date.now() - startTime < maxWaitMs) {
+        try {
+          const jobsStatus = await getInterviewJobsStatus(interviewId);
+          if (jobsStatus.is_pipeline_idle) {
+            break;
+          }
+        } catch {
+          // Brief wait before retry
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
+      setStoppingStage('Переход к ревью сессии...');
+      await updateInterviewStatus(interviewId, 'processing', 'review');
+
+      onFinishSession(interviewId);
+    } catch (e: any) {
+      console.error('Stop session failed:', e);
+      setBackendError(`Не удалось завершить сессию: ${e.message || e}`);
+      setIsStopping(false);
+      setStoppingStage(null);
     }
-    try {
-      await updateInterviewStatus(interviewId, isPaused ? 'paused' : 'recording', 'review');
-    } catch (e) {
-      console.warn('updateInterviewStatus warning/error:', e);
-    }
-    onFinishSession(interviewId);
   };
 
   const scrollToSegment = (segmentId: string) => {
@@ -149,12 +159,17 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
     try {
       // Find candidate speech segments
       const candidateSegments = segments.filter((s) => s.track_id === 'candidate');
-      const candidateText = candidateSegments.map((s) => s.text).join(' ');
-      const lastSegId = candidateSegments[candidateSegments.length - 1]?.id || 'seg-cand-last';
+      const candidateText = candidateSegments.map((s) => s.text).join(' ').trim();
+      if (!candidateText || candidateSegments.length === 0) {
+        setEvalSuccessNotice('Нет распознанных ответов кандидата для оценки.');
+        setTimeout(() => setEvalSuccessNotice(null), 4000);
+        return;
+      }
+      const lastSegId = candidateSegments[candidateSegments.length - 1].id;
 
       await enqueueJob(interviewId, 'EVALUATE_QUESTION', {
         question_id: currentQ.id,
-        candidate_text: candidateText || 'Кандидат ответил на вопрос по теме.',
+        candidate_text: candidateText,
         segment_id: lastSegId,
         rubric_description: currentQ.criteria.map((c) => c.title).join(', '),
       });
@@ -170,6 +185,17 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
 
   return (
     <div className="h-[calc(100vh-4rem)] flex flex-col bg-slate-950 overflow-hidden">
+      {/* Backend connection banner */}
+      {backendError && (
+        <div className="px-6 py-2 bg-rose-950/80 border-b border-rose-800 text-rose-300 text-xs flex items-center justify-between">
+          <div className="flex items-center space-x-2">
+            <AlertTriangle className="w-4 h-4 text-rose-400" />
+            <span>{backendError}</span>
+          </div>
+          <span className="text-[11px] text-rose-400">Проверьте запуск бэкенда на localhost:8000</span>
+        </div>
+      )}
+
       {/* Top Session Control Bar */}
       <div className="px-6 py-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
         <div className="flex items-center space-x-4">
@@ -182,20 +208,31 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
 
         <div className="flex items-center space-x-3">
           <button
-            onClick={() => setIsPaused(!isPaused)}
-            className="flex items-center space-x-1.5 px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-lg transition"
+            onClick={handleTogglePause}
+            disabled={isTogglingPause || isStopping}
+            className="flex items-center space-x-1.5 px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-xs font-medium rounded-lg transition"
           >
-            {isPaused ? <Play className="w-3.5 h-3.5 fill-slate-200" /> : <Pause className="w-3.5 h-3.5" />}
+            {isTogglingPause ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : isPaused ? (
+              <Play className="w-3.5 h-3.5 fill-slate-200" />
+            ) : (
+              <Pause className="w-3.5 h-3.5" />
+            )}
             <span>{isPaused ? 'Продолжить' : 'Пауза'}</span>
           </button>
 
           <button
             onClick={handleStop}
-            disabled={isStopping}
+            disabled={isStopping || isTogglingPause}
             className="flex items-center space-x-1.5 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-xs font-semibold rounded-lg shadow-sm shadow-rose-600/30 transition cursor-pointer disabled:cursor-not-allowed"
           >
-            <Square className="w-3.5 h-3.5 fill-white" />
-            <span>{isStopping ? 'Завершение...' : 'Завершить запись'}</span>
+            {isStopping ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-white" />
+            ) : (
+              <Square className="w-3.5 h-3.5 fill-white" />
+            )}
+            <span>{stoppingStage || (isStopping ? 'Завершение...' : 'Завершить запись')}</span>
           </button>
         </div>
       </div>
@@ -246,7 +283,13 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
           </div>
 
           <div className="flex-1 p-4 space-y-4 overflow-y-auto">
-            {segments.map((s) => {
+            {segments.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-slate-500 space-y-2 py-16">
+                <MessageSquare className="w-8 h-8 text-slate-600 animate-pulse" />
+                <p className="text-xs">Стенограмма пуста. Ожидание речи и распознавания...</p>
+              </div>
+            ) : (
+              segments.map((s) => {
               const isCandidate = s.track_id === 'candidate';
               const isHighlighted = selectedSegmentId === s.id;
               return (
@@ -283,7 +326,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                   </div>
                 </div>
               );
-            })}
+            }))}
           </div>
         </div>
 
@@ -383,7 +426,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
               </div>
             ) : (
               <div className="p-6 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-xl">
-                Ожидание ответа кандидата или нажмите кнопку «Запросить оценку» выше.
+                Автооценка недоступна. Ожидание ответов кандидата или ручного запуска оценки.
               </div>
             )}
           </div>

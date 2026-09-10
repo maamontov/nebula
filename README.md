@@ -68,6 +68,7 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 ### Документация
 - [Концепция продукта](docs/product-concept.md)
 - [План реализации](docs/implementation-plan.md)
+- [План исправлений по результатам ревью](docs/remediation-plan.md)
 - [Спецификация контрактов и доменной модели](docs/contracts-spec.md)
 - [Спецификация аудиозахвата и spooling](docs/audio-capture-spec.md)
 - [Спецификация интеграции STT и LLM](docs/stt-llm-provider-spec.md)
@@ -141,6 +142,7 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 ### Documentation
 - [Product Concept](docs/product-concept.md)
 - [Implementation Plan](docs/implementation-plan.md)
+- [Remediation Plan (Russian)](docs/remediation-plan.md)
 - [Contracts & Domain Model Specification](docs/contracts-spec.md)
 - [Audio Capture & Spooling Specification](docs/audio-capture-spec.md)
 - [STT & LLM Integration Specification](docs/stt-llm-provider-spec.md)

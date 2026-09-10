@@ -3,7 +3,8 @@
 mod commands;
 
 use commands::{
-    get_audio_levels, list_audio_devices, start_capture, stop_capture, verify_spool, AppState,
+    get_audio_levels, list_audio_devices, pause_capture, resume_capture, start_capture,
+    stop_capture, verify_spool, AppState,
 };
 
 fn main() {
@@ -13,6 +14,8 @@ fn main() {
             list_audio_devices,
             start_capture,
             stop_capture,
+            pause_capture,
+            resume_capture,
             get_audio_levels,
             verify_spool
         ])

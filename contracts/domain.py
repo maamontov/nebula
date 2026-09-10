@@ -23,10 +23,14 @@ class InterviewStatus(str, Enum):
     DELETED = "deleted"
 
 
+from typing import Any
+from pydantic import BaseModel, Field, model_validator
+
+
 class RubricCriterion(BaseModel):
     """Criterion within an interview rubric."""
     id: str = Field(..., description="Unique criterion ID (e.g. 'crit-arch-scale')")
-    title: str = Field(..., min_length=2)
+    title: str = Field(..., min_length=1)
     description: str = Field(default="")
     min_score: float = Field(default=1.0, description="Minimum possible score on this scale")
     max_score: float = Field(default=5.0, description="Maximum possible score on this scale")
@@ -38,12 +42,51 @@ class RubricCriterion(BaseModel):
 
 
 class PlannedQuestion(BaseModel):
-    """Question planned in the interview blueprint."""
+    """
+    Question planned in the interview blueprint.
+    Standardized domain format supporting both id/question_id and title/prompt/text.
+    Канонический формат вопроса с поддержкой синонимов id/question_id и title/prompt/text.
+    """
     id: str = Field(..., description="Unique question ID (e.g. 'q-system-design')")
-    title: str = Field(..., min_length=2)
-    prompt: str = Field(..., description="Guide / wording for interviewer")
+    title: str = Field(default="", description="Short question title")
+    prompt: str = Field(default="", description="Guide / wording for interviewer")
+    text: str | None = Field(default=None, description="Alternative/legacy text field")
+    order_index: int = Field(default=0)
     weight: float = Field(default=1.0, ge=0.0, description="Relative weight of this question in the final score")
     criteria: list[RubricCriterion] = Field(..., min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_question_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Normalize question_id -> id
+            if "question_id" in data and "id" not in data:
+                data["id"] = data["question_id"]
+            # Normalize text -> prompt / title
+            txt = data.get("text") or ""
+            if not data.get("prompt") and txt:
+                data["prompt"] = txt
+            if not data.get("title"):
+                data["title"] = txt[:60] if txt else data.get("prompt", "Question")[:60]
+        return data
+
+    @model_validator(mode="after")
+    def validate_unique_criteria(self) -> "PlannedQuestion":
+        crit_ids = [c.id for c in self.criteria]
+        if len(crit_ids) != len(set(crit_ids)):
+            raise ValueError(f"Duplicate criterion IDs found in question '{self.id}': {crit_ids}")
+        return self
+
+
+class InterviewPlan(BaseModel):
+    """
+    Structured interview plan contract.
+    Структурированный контракт плана интервью.
+    """
+    id: str = Field(default="plan-default")
+    title: str = Field(..., min_length=2)
+    role: str = Field(default="")
+    questions: list[PlannedQuestion] = Field(..., min_length=1)
 
 
 class RubricRevision(BaseModel):

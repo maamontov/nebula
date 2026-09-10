@@ -106,11 +106,12 @@ def test_add_segments_and_jobs(client):
     assert detail["transcript_segments"][0]["text"].startswith("Terraform")
 
 
-def test_delete_interview_privacy_lifecycle(client, tmp_path):
+def test_delete_interview_privacy_lifecycle(client, tmp_path, monkeypatch):
     spool_dir = tmp_path / "spool"
     spool_inv = spool_dir / "inv-delete-1"
     spool_inv.mkdir(parents=True)
     (spool_inv / "audio.wav").write_bytes(b"audio data")
+    monkeypatch.setenv("NEBULA_SPOOL_DIR", str(spool_dir))
 
     client.post(
         "/api/v1/interviews",
@@ -122,7 +123,7 @@ def test_delete_interview_privacy_lifecycle(client, tmp_path):
     )
 
     # Delete interview
-    del_res = client.delete(f"/api/v1/interviews/inv-delete-1?spool_dir={spool_dir}")
+    del_res = client.delete("/api/v1/interviews/inv-delete-1")
     assert del_res.status_code == 200
     assert del_res.json()["success"] is True
 
@@ -134,15 +135,16 @@ def test_delete_interview_privacy_lifecycle(client, tmp_path):
     assert not spool_inv.exists()
 
 
-def test_system_backup_and_integrity(client, tmp_path):
+def test_system_backup_and_integrity(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("NEBULA_BACKUP_DIR", str(tmp_path))
+
     # Integrity check
     integ_res = client.get("/api/v1/system/integrity")
     assert integ_res.status_code == 200
     assert integ_res.json()["integrity_ok"] is True
 
     # Backup
-    backup_file = tmp_path / "backup.db"
-    backup_res = client.post("/api/v1/system/backup", json={"target_path": str(backup_file)})
+    backup_res = client.post("/api/v1/system/backup", json={"target_path": "backup.db"})
     assert backup_res.status_code == 200
-    assert backup_file.exists()
+    assert (tmp_path / "backup.db").exists()
 

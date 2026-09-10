@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS interviews (
     status TEXT NOT NULL DEFAULT 'PLANNED',
     consent_confirmed_at TEXT,
     consent_version TEXT,
+    active_rubric_revision_id TEXT DEFAULT 'rub-rev-1',
+    active_transcript_revision_id TEXT DEFAULT 'trans-rev-1',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -22,7 +24,7 @@ CREATE TABLE IF NOT EXISTS interview_plans (
 );
 
 CREATE TABLE IF NOT EXISTS transcript_segments (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
     interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
     track_id TEXT NOT NULL,
     start_time_ms INTEGER NOT NULL,
@@ -30,7 +32,8 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
     text TEXT NOT NULL,
     is_final INTEGER NOT NULL DEFAULT 1,
     revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (interview_id, revision_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS transcript_revisions (
@@ -38,7 +41,8 @@ CREATE TABLE IF NOT EXISTS transcript_revisions (
     interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
     revision_number INTEGER NOT NULL DEFAULT 1,
     is_batch_final INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    UNIQUE (interview_id, revision_number)
 );
 
 CREATE TABLE IF NOT EXISTS assessment_proposals (
@@ -72,8 +76,11 @@ CREATE TABLE IF NOT EXISTS human_assessments (
     is_manually_adjusted INTEGER NOT NULL DEFAULT 0,
     is_stale INTEGER NOT NULL DEFAULT 0,
     stale_reason TEXT,
+    is_excluded INTEGER NOT NULL DEFAULT 0,
+    exclusion_reason TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE (interview_id, question_id)
 );
 
 CREATE TABLE IF NOT EXISTS summary_proposals (
@@ -100,7 +107,9 @@ CREATE TABLE IF NOT EXISTS report_revisions (
     hiring_recommendation TEXT,
     confirmed_by TEXT,
     sha256_checksum TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    canonical_snapshot_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (interview_id, revision_number)
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -128,13 +137,16 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE TABLE IF NOT EXISTS question_associations (
     id TEXT PRIMARY KEY,
     interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
     question_id TEXT NOT NULL,
-    segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    segment_id TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 1.0,
     is_ambiguous INTEGER NOT NULL DEFAULT 0,
     is_manually_adjusted INTEGER NOT NULL DEFAULT 0,
     notes TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (interview_id, revision_id, segment_id)
+        REFERENCES transcript_segments(interview_id, revision_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_transcript_interview ON transcript_segments(interview_id, start_time_ms);
@@ -144,5 +156,27 @@ CREATE INDEX IF NOT EXISTS idx_human_assessment ON human_assessments(interview_i
 CREATE INDEX IF NOT EXISTS idx_jobs_status_locked ON jobs(status, locked_until);
 CREATE INDEX IF NOT EXISTS idx_audit_interview ON audit_events(interview_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_assoc_interview_question ON question_associations(interview_id, question_id);
+
 CREATE INDEX IF NOT EXISTS idx_report_revisions ON report_revisions(interview_id, revision_number);
+
+CREATE TABLE IF NOT EXISTS audio_chunks (
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL,
+    capture_epoch INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    start_time_ms INTEGER NOT NULL,
+    end_time_ms INTEGER NOT NULL,
+    sample_rate INTEGER NOT NULL,
+    channels INTEGER NOT NULL,
+    sample_count INTEGER NOT NULL,
+    format TEXT NOT NULL,
+    checksum_sha256 TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (interview_id, track_id, capture_epoch, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_audio_chunks_interview ON audio_chunks(interview_id, track_id, sequence);
+
 

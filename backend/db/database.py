@@ -42,17 +42,34 @@ class Database:
         with self.transaction() as conn:
             conn.executescript(sql)
 
-    def backup(self, target_path: str) -> str:
-        """Performs consistent online SQLite WAL backup to target_path."""
-        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+        from backend.db.migrations import run_migrations
+        run_migrations(self)
+
+    def backup(self, target_path: str, trusted_backup_dir: str | Path | None = None) -> str:
+        """
+        Performs consistent online SQLite WAL backup to target_path.
+        If trusted_backup_dir is provided, target_path is strictly constrained inside it.
+        Выполняет согласованный онлайн-бэкап SQLite WAL.
+        Если передан trusted_backup_dir, target_path строго ограничивается этим каталогом.
+        """
+        if trusted_backup_dir is not None:
+            trusted_dir = Path(trusted_backup_dir).resolve()
+            filename = Path(target_path).name
+            dest_path = (trusted_dir / filename).resolve()
+            if not dest_path.is_relative_to(trusted_dir):
+                raise ValueError(f"Target path {target_path} escapes trusted backup directory {trusted_dir}")
+        else:
+            dest_path = Path(target_path).resolve()
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
         source_conn = self.get_connection()
-        dest_conn = sqlite3.connect(target_path)
+        dest_conn = sqlite3.connect(str(dest_path))
         try:
             source_conn.backup(dest_conn)
         finally:
             dest_conn.close()
             source_conn.close()
-        return target_path
+        return str(dest_path)
 
     def verify_integrity(self) -> bool:
         """Verifies database integrity using PRAGMA integrity_check."""

@@ -147,7 +147,10 @@ fn main() -> Result<()> {
                 std::io::Write::flush(&mut std::io::stdout())?;
             }
             println!("\nStopping capture and sealing spool...");
-            handle.stop();
+            let stats = handle.stop()?;
+            println!("Capture stats: {} chunks, {} samples, {} ms, dropped: {}",
+                stats.total_chunks, stats.total_samples, stats.total_duration_ms, stats.dropped_samples);
+
 
             println!("\nVerifying captured spool...");
             let report = spool.verify_track_spool(&interview_id, TrackType::Interviewer)?;

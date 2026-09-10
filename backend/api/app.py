@@ -26,14 +26,22 @@ from backend.core.state_machine import (
     transition_status,
 )
 from backend.db.database import get_db
-from backend.db.repository import Repository
+from backend.db.repository import Repository, RepositoryConflictError
+from contracts.audio import AudioChunkMetadata
 from contracts.domain import (
+
     AssessmentProposal,
+    HumanCriterionScore,
     HumanQuestionAssessment,
     InterviewStatus,
+    PlannedQuestion,
+    RubricCriterion,
     RubricRevision,
     TranscriptRevision,
 )
+
+import re
+from pathlib import Path
 
 app = FastAPI(
     title="Nebula Backend API",
@@ -41,14 +49,51 @@ app = FastAPI(
     description="Core API for Nebula AI Interview Copilot",
 )
 
-# Enable CORS for desktop UI (localhost:1420, tauri://localhost, etc.)
+# Allowed origins for Tauri desktop and local development loopback
+# Разрешенные origins для десктопа Tauri и локальной разработки на loopback
+ALLOWED_ORIGINS = [
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    "tauri://localhost",
+    "https://tauri.localhost",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+SAFE_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+
+
+def validate_safe_id(identifier: str, field_name: str = "id") -> str:
+    """
+    Validates that an identifier contains only safe alphanumeric/hyphen/underscore characters.
+    Проверяет, что идентификатор содержит только безопасные символы и не позволяет path traversal.
+    """
+    if not identifier or not SAFE_IDENTIFIER_PATTERN.match(identifier):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name}: must contain only alphanumeric characters, underscores, or hyphens (1-128 chars).",
+        )
+    return identifier
+
+
+def get_trusted_spool_dir() -> Path:
+    spool_path = os.getenv("NEBULA_SPOOL_DIR", "./spool")
+    path = Path(spool_path).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_trusted_backup_dir() -> Path:
+    backup_path = os.getenv("NEBULA_BACKUP_DIR", "./backups")
+    path = Path(backup_path).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def get_repository() -> Repository:
@@ -98,7 +143,7 @@ class ValidateProposalRequest(BaseModel):
 
 
 class TransitionStateRequest(BaseModel):
-    current_status: InterviewStatus
+    current_status: InterviewStatus | None = None
     target_status: InterviewStatus
     consent_confirmed_at: str | None = None
     consent_version: str | None = None
@@ -117,29 +162,47 @@ class BatchRetranscribeRequest(BaseModel):
 
 class ReviewAssessmentWithRevisionRequest(BaseModel):
     expected_transcript_revision: str
-    scores: list[dict[str, Any]]
+    scores: list[dict[str, Any]] = Field(default_factory=list)
     reviewer_notes: str | None = None
-    reviewer_id: str | None = "interviewer-1"
+    reviewer_id: str | None = None
     is_manually_adjusted: bool = True
+    is_excluded: bool = False
+    exclusion_reason: str | None = None
 
 
 class ConfirmSummaryRequest(BaseModel):
-    reviewer_id: str = "interviewer-1"
+    reviewer_id: str
     confirmed_markdown: str
     confirmed_recommendation: str
 
 
 class FinalizeReportRequest(BaseModel):
-    confirmed_by: str = "interviewer-1"
-    summary_markdown: str | None = None
-    hiring_recommendation: str | None = None
+    confirmed_by: str
+    summary_markdown: str
+    hiring_recommendation: str
+    audio_limitations: list[str] | None = None
+
+
+class ReopenRevisionRequest(BaseModel):
+    reviewer_id: str
+    reason: str
 
 
 class CreateBackupRequest(BaseModel):
-    target_path: str
+    target_path: str | None = None
+
+
+class IngestAudioChunkRequest(BaseModel):
+    metadata: AudioChunkMetadata
+    payload_hex: str
+
+
+class StopInterviewRequest(BaseModel):
+    manifests: list[dict[str, Any]] = Field(default_factory=list)
 
 
 @app.get("/healthz")
+
 async def healthz():
     return {"status": "ok", "version": "0.1.0"}
 
@@ -152,6 +215,7 @@ async def create_interview_endpoint(
     payload: CreateInterviewRequest,
     repo: Repository = Depends(get_repository),
 ):
+    validate_safe_id(payload.id, "interview_id")
     inv = repo.create_interview(
         interview_id=payload.id,
         title=payload.title,
@@ -178,11 +242,83 @@ async def list_interviews_endpoint(
     return repo.list_interviews(limit=limit)
 
 
+def compute_interview_scoring(
+    inv: dict[str, Any],
+    plan_payload: dict[str, Any] | None,
+    human_assessments: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not plan_payload or not plan_payload.get("questions"):
+        return None
+    try:
+        domain_questions = []
+        for q_dict in plan_payload.get("questions", []):
+            domain_criteria = []
+            for c_dict in q_dict.get("criteria", []):
+                domain_criteria.append(
+                    RubricCriterion(
+                        id=c_dict["id"],
+                        title=c_dict.get("title", ""),
+                        description=c_dict.get("description", ""),
+                        min_score=float(c_dict.get("min_score", 1.0)),
+                        max_score=float(c_dict.get("max_score", 5.0)),
+                        weight=float(c_dict.get("weight", 1.0)),
+                    )
+                )
+            domain_questions.append(
+                PlannedQuestion(
+                    id=q_dict.get("id") or q_dict.get("question_id", "q"),
+                    title=q_dict.get("title", ""),
+                    prompt=q_dict.get("prompt") or q_dict.get("text", ""),
+                    weight=float(q_dict.get("weight", 1.0)),
+                    criteria=domain_criteria,
+                )
+            )
+        rubric = RubricRevision(
+            revision_id=inv.get("active_rubric_revision_id") or "rub-rev-1",
+            interview_id=inv["id"],
+            questions=domain_questions,
+        )
+
+        domain_assessments = []
+        for ha in human_assessments:
+            crit_scores = []
+            for sc in ha.get("scores", []):
+                crit_scores.append(
+                    HumanCriterionScore(
+                        criterion_id=sc["criterion_id"],
+                        score=float(sc["score"]) if sc.get("score") is not None else None,
+                        explanation=sc.get("explanation"),
+                    )
+                )
+            domain_assessments.append(
+                HumanQuestionAssessment(
+                    question_id=ha["question_id"],
+                    criteria_scores=crit_scores,
+                    reviewer_notes=ha.get("reviewer_notes"),
+                    reviewer_id=ha.get("reviewer_id"),
+                    is_manually_adjusted=bool(ha.get("is_manually_adjusted")),
+                    is_excluded=bool(ha.get("is_excluded")),
+                    exclusion_reason=ha.get("exclusion_reason"),
+                )
+            )
+
+        res = calculate_interview_score(rubric, domain_assessments)
+        return {
+            "final_score_100": res.final_score_100,
+            "coverage_percentage": round(res.coverage_percentage, 2),
+            "total_planned_weight": res.total_planned_weight,
+            "evaluated_weight": res.evaluated_weight,
+        }
+    except Exception as e:
+        return {"final_score_100": None, "coverage_percentage": 0.0, "error": str(e)}
+
+
 @app.get("/api/v1/interviews/{interview_id}")
 async def get_interview_endpoint(
     interview_id: str,
     repo: Repository = Depends(get_repository),
 ):
+    validate_safe_id(interview_id, "interview_id")
     inv = repo.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
@@ -190,27 +326,41 @@ async def get_interview_endpoint(
     plan = repo.get_latest_plan(interview_id)
     segments = repo.get_transcript_segments(interview_id)
     proposals = repo.get_assessment_proposals(interview_id)
+    human_assessments = repo.get_human_assessments(interview_id)
+    plan_payload = plan["payload"] if plan else None
+    scoring = compute_interview_scoring(inv, plan_payload, human_assessments)
 
     return {
         "interview": inv,
-        "plan": plan["payload"] if plan else None,
+        "plan": plan_payload,
         "transcript_segments": segments,
         "assessment_proposals": proposals,
+        "human_assessments": human_assessments,
+        "scoring": scoring,
     }
 
 
 @app.delete("/api/v1/interviews/{interview_id}")
 async def delete_interview_endpoint(
     interview_id: str,
-    spool_dir: str = os.getenv("NEBULA_SPOOL_DIR", "./spool"),
     repo: Repository = Depends(get_repository),
 ):
+    validate_safe_id(interview_id, "interview_id")
     inv = repo.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
 
-    deleted = repo.delete_interview(interview_id=interview_id, spool_dir=spool_dir)
-    return {"status": "deleted", "interview_id": interview_id, "success": deleted}
+    spool_dir = get_trusted_spool_dir()
+    try:
+        deleted = repo.delete_interview(interview_id=interview_id, spool_dir=spool_dir)
+        if not deleted:
+            raise HTTPException(status_code=500, detail="Failed to delete interview records")
+    except ValueError as val_err:
+        raise HTTPException(status_code=400, detail=str(val_err))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Interview physical cleanup failed: {str(exc)}")
+
+    return {"status": "deleted", "interview_id": interview_id, "success": True}
 
 
 @app.post("/api/v1/interviews/{interview_id}/status")
@@ -243,7 +393,167 @@ async def update_status_endpoint(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/api/v1/interviews/{interview_id}/audio/chunks")
+async def ingest_audio_chunk_endpoint(
+    interview_id: str,
+    payload: IngestAudioChunkRequest,
+    repo: Repository = Depends(get_repository),
+    spool_dir: Path = Depends(get_trusted_spool_dir),
+):
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    status_str = inv["status"]
+    if status_str == InterviewStatus.FINALIZED.value:
+        raise HTTPException(status_code=409, detail="Cannot ingest audio chunks into finalized interview")
+    if status_str not in (
+        InterviewStatus.RECORDING.value,
+        InterviewStatus.PAUSED.value,
+        InterviewStatus.PROCESSING.value,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot ingest audio chunks in status '{status_str}'; must be recording, paused, or processing",
+        )
+
+    try:
+        payload_bytes = bytes.fromhex(payload.payload_hex)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid payload_hex: not valid hexadecimal string")
+
+    # Validate size
+    if len(payload_bytes) != payload.metadata.size_bytes:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Payload byte size mismatch: expected {payload.metadata.size_bytes}, got {len(payload_bytes)}",
+        )
+
+    # Validate SHA-256
+    computed_hash = hashlib.sha256(payload_bytes).hexdigest()
+    if computed_hash.lower() != payload.metadata.checksum_sha256.lower():
+        raise HTTPException(
+            status_code=422,
+            detail=f"Payload checksum mismatch: declared {payload.metadata.checksum_sha256}, computed {computed_hash}",
+        )
+
+    try:
+        track_val = payload.metadata.track_id.value if hasattr(payload.metadata.track_id, "value") else str(payload.metadata.track_id)
+        fmt_val = payload.metadata.format.value if hasattr(payload.metadata.format, "value") else str(payload.metadata.format)
+        res_status, _is_new = repo.save_audio_chunk(
+            interview_id=interview_id,
+            track_id=track_val,
+            capture_epoch=payload.metadata.capture_epoch,
+            sequence=payload.metadata.sequence,
+            start_time_ms=payload.metadata.start_time_ms,
+            end_time_ms=payload.metadata.end_time_ms,
+            sample_rate=payload.metadata.sample_rate,
+            channels=payload.metadata.channels,
+            sample_count=payload.metadata.sample_count,
+            format_str=fmt_val,
+            checksum_sha256=computed_hash,
+            payload_bytes=payload_bytes,
+            spool_base_dir=spool_dir,
+        )
+        return {
+            "status": res_status,
+            "interview_id": interview_id,
+            "track_id": track_val,
+            "sequence": payload.metadata.sequence,
+        }
+    except RepositoryConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/v1/interviews/{interview_id}/pause")
+async def pause_interview_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    current_status = InterviewStatus(inv["status"])
+    try:
+        new_status = transition_status(current_status, InterviewStatus.PAUSED)
+        repo.update_interview_status(interview_id, new_status)
+        repo.record_audit_event(
+            event_id=f"audit-{uuid.uuid4().hex[:8]}",
+            interview_id=interview_id,
+            event_type="INTERVIEW_PAUSED",
+            payload={"from": current_status.value, "to": new_status.value},
+        )
+        return {"status": new_status.value}
+    except InvalidStateTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/v1/interviews/{interview_id}/resume")
+async def resume_interview_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    current_status = InterviewStatus(inv["status"])
+    try:
+        new_status = transition_status(current_status, InterviewStatus.RECORDING)
+        repo.update_interview_status(interview_id, new_status)
+        repo.record_audit_event(
+            event_id=f"audit-{uuid.uuid4().hex[:8]}",
+            interview_id=interview_id,
+            event_type="INTERVIEW_RESUMED",
+            payload={"from": current_status.value, "to": new_status.value},
+        )
+        return {"status": new_status.value}
+    except InvalidStateTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/v1/interviews/{interview_id}/stop")
+async def stop_interview_endpoint(
+    interview_id: str,
+    payload: StopInterviewRequest | None = None,
+    repo: Repository = Depends(get_repository),
+    spool_dir: Path = Depends(get_trusted_spool_dir),
+):
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    current_status = InterviewStatus(inv["status"])
+    try:
+        new_status = transition_status(current_status, InterviewStatus.PROCESSING)
+        repo.update_interview_status(interview_id, new_status)
+
+        if payload and payload.manifests:
+            for manifest_dict in payload.manifests:
+                track = manifest_dict.get("track_id", "unknown")
+                track_dir = Path(spool_dir) / interview_id / track
+                track_dir.mkdir(parents=True, exist_ok=True)
+                manifest_path = track_dir / "manifest.json"
+                manifest_path.write_text(json.dumps(manifest_dict, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        repo.record_audit_event(
+            event_id=f"audit-{uuid.uuid4().hex[:8]}",
+            interview_id=interview_id,
+            event_type="INTERVIEW_STOPPED",
+            payload={"from": current_status.value, "to": new_status.value},
+        )
+        return {"status": new_status.value}
+    except InvalidStateTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
 @app.post("/api/v1/interviews/{interview_id}/segments")
+
 async def add_segment_endpoint(
     interview_id: str,
     payload: AddSegmentRequest,
@@ -252,17 +562,22 @@ async def add_segment_endpoint(
     inv = repo.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
+    if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
+        raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
 
-    repo.add_transcript_segment(
-        segment_id=payload.id,
-        interview_id=interview_id,
-        track_id=payload.track_id,
-        start_time_ms=payload.start_time_ms,
-        end_time_ms=payload.end_time_ms,
-        text=payload.text,
-        is_final=payload.is_final,
-    )
-    return {"status": "ok", "segment_id": payload.id}
+    try:
+        repo.add_transcript_segment(
+            segment_id=payload.id,
+            interview_id=interview_id,
+            track_id=payload.track_id,
+            start_time_ms=payload.start_time_ms,
+            end_time_ms=payload.end_time_ms,
+            text=payload.text,
+            is_final=payload.is_final,
+        )
+        return {"status": "ok", "segment_id": payload.id}
+    except RepositoryConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @app.post("/api/v1/interviews/{interview_id}/jobs/enqueue")
@@ -274,15 +589,33 @@ async def enqueue_job_endpoint(
     inv = repo.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
+    if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
+        raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
 
-    repo.enqueue_job(
-        job_id=payload.id,
-        job_type=payload.type,
-        interview_id=interview_id,
-        payload=payload.payload,
-        max_attempts=payload.max_attempts,
-    )
-    return {"status": "enqueued", "job_id": payload.id}
+    try:
+        repo.enqueue_job(
+            job_id=payload.id,
+            job_type=payload.type,
+            interview_id=interview_id,
+            payload=payload.payload,
+            max_attempts=payload.max_attempts,
+        )
+        return {"status": "enqueued", "job_id": payload.id}
+    except RepositoryConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.get("/api/v1/interviews/{interview_id}/jobs/status")
+async def get_jobs_status_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    return repo.get_interview_jobs_status(interview_id)
+
 
 
 @app.post("/api/v1/interviews/{interview_id}/assessments/{proposal_id}/approve")
@@ -292,20 +625,38 @@ async def approve_assessment_endpoint(
     payload: ApproveAssessmentRequest,
     repo: Repository = Depends(get_repository),
 ):
-    repo.approve_assessment(
-        proposal_id=proposal_id,
-        reviewed_scores=payload.reviewed_scores,
-        reviewer_notes=payload.reviewer_notes,
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
+        raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
+
+    revs = repo.get_transcript_revisions(interview_id)
+    latest_rev = revs[-1]["id"] if revs else (inv.get("active_transcript_revision_id") or "trans-rev-1")
+
+    question_id = payload.question_id
+    if not question_id:
+        prop = repo.get_assessment_proposal(proposal_id)
+        question_id = prop["question_id"] if prop else "q-default"
+
+    assessment_id = f"ha-{interview_id}-{question_id}"
+    repo.save_human_assessment(
+        assessment_id=assessment_id,
         interview_id=interview_id,
-        question_id=payload.question_id,
+        question_id=question_id,
+        rubric_revision_id=inv.get("active_rubric_revision_id") or "rub-rev-1",
+        transcript_revision_id=latest_rev,
+        scores=payload.reviewed_scores or [],
+        reviewer_notes=payload.reviewer_notes or "Оценка подтверждена экспертом",
+        is_manually_adjusted=True,
     )
     repo.record_audit_event(
         event_id=f"audit-{uuid.uuid4().hex[:8]}",
         interview_id=interview_id,
         event_type="ASSESSMENT_APPROVED",
-        payload={"proposal_id": proposal_id, "reviewer_notes": payload.reviewer_notes},
+        payload={"proposal_id": proposal_id, "question_id": question_id, "reviewer_notes": payload.reviewer_notes},
     )
-    return {"status": "approved", "proposal_id": proposal_id}
+    return {"status": "approved", "proposal_id": proposal_id, "question_id": question_id}
 
 
 @app.get("/api/v1/interviews/{interview_id}/export")
@@ -317,51 +668,72 @@ async def export_interview_endpoint(
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
 
+    is_finalized = inv["status"] == "finalized"
+    latest_report = repo.get_latest_report_revision(interview_id)
+
+    if is_finalized and latest_report and latest_report.get("canonical_snapshot"):
+        snapshot = latest_report["canonical_snapshot"]
+        return {
+            "interview_id": inv["id"],
+            "title": inv["title"],
+            "candidate_name": inv["candidate_name"],
+            "role": inv["role"],
+            "status": "FINALIZED",
+            "is_draft": False,
+            "final_score_100": latest_report["final_score_100"],
+            "coverage_percentage": latest_report["coverage_percentage"],
+            "sha256_checksum": latest_report["sha256_checksum"],
+            "snapshot": snapshot,
+            "report_revision": latest_report,
+            "summary": snapshot.get("executive_summary"),
+            "human_assessments": snapshot.get("human_assessments"),
+            "audit_trail": repo.get_audit_events(interview_id),
+        }
+
     plan = repo.get_latest_plan(interview_id)
     segments = repo.get_transcript_segments(interview_id)
     proposals = repo.get_assessment_proposals(interview_id)
+    human_assessments = repo.get_human_assessments(interview_id)
     audit_events = repo.get_audit_events(interview_id)
+    plan_payload = plan["payload"] if plan else None
 
-    total_score = 0.0
-    count = 0
-    decisions = []
-    for p in proposals:
-        score_val = None
-        if p.get("reviewed_scores") and len(p["reviewed_scores"]) > 0:
-            score_val = p["reviewed_scores"][0].get("score")
-        elif p.get("scores") and len(p["scores"]) > 0:
-            score_val = p["scores"][0].get("score")
+    # Calculate deterministic scoring
+    scoring = compute_interview_scoring(inv, plan_payload, human_assessments)
+    calc_final_score = scoring["final_score_100"] if scoring else None
 
-        if score_val is not None:
-            total_score += float(score_val)
-            count += 1
-            decisions.append({
-                "proposal_id": p["id"],
-                "question_id": p["question_id"],
-                "score": score_val,
-                "is_approved": bool(p.get("is_approved")),
-                "reviewer_notes": p.get("reviewer_notes"),
-            })
-
-    final_score_100 = round((total_score / (count * 5.0)) * 100.0, 2) if count > 0 else 0.0
-
-    latest_report = repo.get_latest_report_revision(interview_id)
     summary_prop = repo.get_summary_proposal(interview_id)
+
+    decisions = []
+    for ha in human_assessments:
+        decisions.append({
+            "question_id": ha["question_id"],
+            "scores": ha.get("scores", []),
+            "reviewer_notes": ha.get("reviewer_notes"),
+            "reviewer_id": ha.get("reviewer_id"),
+            "is_manually_adjusted": bool(ha.get("is_manually_adjusted")),
+            "is_excluded": bool(ha.get("is_excluded")),
+            "exclusion_reason": ha.get("exclusion_reason"),
+            "updated_at": ha.get("updated_at"),
+        })
+
+    final_score = latest_report["final_score_100"] if latest_report else calc_final_score
 
     return {
         "interview_id": inv["id"],
         "title": inv["title"],
         "candidate_name": inv["candidate_name"],
         "role": inv["role"],
-        "status": inv["status"],
-        "is_draft": latest_report is None,
-        "plan": plan["payload"] if plan else None,
+        "status": inv["status"].upper(),
+        "is_draft": True,
+        "plan": plan_payload,
         "transcript_segments": segments,
         "assessment_proposals": proposals,
+        "human_assessments": human_assessments,
+        "scoring": scoring,
         "decisions": decisions,
-        "final_score_100": latest_report["final_score_100"] if latest_report else final_score_100,
+        "final_score_100": final_score,
         "report_revision": latest_report,
-        "sha256_checksum": latest_report["sha256_checksum"] if latest_report else None,
+        "sha256_checksum": None,
         "summary": summary_prop.get("summary_data") if summary_prop else None,
         "audit_trail": audit_events,
     }
@@ -376,19 +748,24 @@ async def batch_retranscribe_endpoint(
     inv = repo.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
+    if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
+        raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
 
     job_id = f"job-batch-{uuid.uuid4().hex[:8]}"
-    repo.enqueue_job(
-        job_id=job_id,
-        job_type="BATCH_RETRANSCRIBE",
-        interview_id=interview_id,
-        payload={
-            "new_revision_id": payload.new_revision_id,
-            "old_revision_id": payload.old_revision_id,
-            "segments": payload.segments,
-        },
-    )
-    return {"status": "enqueued", "job_id": job_id, "new_revision_id": payload.new_revision_id}
+    try:
+        repo.enqueue_job(
+            job_id=job_id,
+            job_type="BATCH_RETRANSCRIBE",
+            interview_id=interview_id,
+            payload={
+                "new_revision_id": payload.new_revision_id,
+                "old_revision_id": payload.old_revision_id,
+                "segments": payload.segments,
+            },
+        )
+        return {"status": "enqueued", "job_id": job_id, "new_revision_id": payload.new_revision_id}
+    except RepositoryConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @app.get("/api/v1/interviews/{interview_id}/revisions/transcript/diff")
@@ -462,6 +839,8 @@ async def review_assessment_endpoint(
     inv = repo.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
+    if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
+        raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
 
     # Conflict check: verify expected transcript revision against latest revision
     revs = repo.get_transcript_revisions(interview_id)
@@ -479,19 +858,24 @@ async def review_assessment_endpoint(
 
     # Save human assessment (immutable record of human decision)
     assessment_id = f"pass-{uuid.uuid4().hex[:8]}"
-    repo.save_human_assessment(
-        assessment_id=assessment_id,
-        interview_id=interview_id,
-        question_id=question_id,
-        rubric_revision_id="rub-rev-1",
-        transcript_revision_id=payload.expected_transcript_revision,
-        scores=payload.scores,
-        reviewer_notes=payload.reviewer_notes,
-        reviewer_id=payload.reviewer_id,
-        is_manually_adjusted=payload.is_manually_adjusted,
-        is_stale=False,
-        stale_reason=None,
-    )
+    try:
+        repo.save_human_assessment(
+            assessment_id=assessment_id,
+            interview_id=interview_id,
+            question_id=question_id,
+            rubric_revision_id="rub-rev-1",
+            transcript_revision_id=payload.expected_transcript_revision,
+            scores=payload.scores,
+            reviewer_notes=payload.reviewer_notes,
+            reviewer_id=payload.reviewer_id,
+            is_manually_adjusted=payload.is_manually_adjusted,
+            is_stale=False,
+            stale_reason=None,
+            is_excluded=payload.is_excluded,
+            exclusion_reason=payload.exclusion_reason,
+        )
+    except RepositoryConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
     repo.record_audit_event(
         event_id=f"audit-{uuid.uuid4().hex[:8]}",
@@ -502,6 +886,7 @@ async def review_assessment_endpoint(
             "question_id": question_id,
             "transcript_revision_id": payload.expected_transcript_revision,
             "is_manually_adjusted": payload.is_manually_adjusted,
+            "is_excluded": payload.is_excluded,
             "reviewer_notes": payload.reviewer_notes,
         },
     )
@@ -547,25 +932,30 @@ async def confirm_summary_endpoint(
     inv = repo.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
+    if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
+        raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
 
-    repo.confirm_summary(
-        interview_id=interview_id,
-        reviewer_id=payload.reviewer_id,
-        confirmed_markdown=payload.confirmed_markdown,
-        confirmed_recommendation=payload.confirmed_recommendation,
-    )
+    try:
+        repo.confirm_summary(
+            interview_id=interview_id,
+            reviewer_id=payload.reviewer_id,
+            confirmed_markdown=payload.confirmed_markdown,
+            confirmed_recommendation=payload.confirmed_recommendation,
+        )
 
-    repo.record_audit_event(
-        event_id=f"audit-{uuid.uuid4().hex[:8]}",
-        interview_id=interview_id,
-        event_type="EXECUTIVE_SUMMARY_CONFIRMED",
-        payload={
-            "confirmed_by": payload.reviewer_id,
-            "recommendation": payload.confirmed_recommendation,
-        },
-    )
+        repo.record_audit_event(
+            event_id=f"audit-{uuid.uuid4().hex[:8]}",
+            interview_id=interview_id,
+            event_type="EXECUTIVE_SUMMARY_CONFIRMED",
+            payload={
+                "confirmed_by": payload.reviewer_id,
+                "recommendation": payload.confirmed_recommendation,
+            },
+        )
 
-    return {"status": "summary_confirmed", "interview_id": interview_id}
+        return {"status": "summary_confirmed", "interview_id": interview_id}
+    except RepositoryConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @app.post("/api/v1/interviews/{interview_id}/report/finalize")
@@ -574,103 +964,44 @@ async def finalize_report_endpoint(
     payload: FinalizeReportRequest,
     repo: Repository = Depends(get_repository),
 ):
-    inv = repo.get_interview(interview_id)
-    if not inv:
-        raise HTTPException(status_code=404, detail="Interview not found")
+    validate_safe_id(interview_id, "interview_id")
+    try:
+        return repo.finalize_interview(
+            interview_id=interview_id,
+            summary_markdown=payload.summary_markdown,
+            hiring_recommendation=payload.hiring_recommendation,
+            confirmed_by=payload.confirmed_by,
+            audio_limitations=payload.audio_limitations,
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidStateTransitionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RepositoryConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    plan = repo.get_latest_plan(interview_id)
-    questions = plan.get("payload", {}).get("questions", []) if plan else []
-    human_assessments = repo.get_human_assessments(interview_id)
-    proposals = repo.get_assessment_proposals(interview_id)
 
-    decisions_map: dict[str, Any] = {}
-    for p in proposals:
-        score_val = p["scores"][0].get("score") if p.get("scores") else None
-        decisions_map[p["question_id"]] = {"score": score_val, "is_human": False}
-    for h in human_assessments:
-        score_val = h["scores"][0].get("score") if h.get("scores") else None
-        decisions_map[h["question_id"]] = {"score": score_val, "is_human": True, "notes": h.get("reviewer_notes")}
-
-    total_weighted_score = 0.0
-    total_weight = 0.0
-    question_scores = {}
-
-    for q in questions:
-        q_id = q["question_id"]
-        q_weight = float(q.get("weight", 1.0))
-        total_weight += q_weight
-        dec = decisions_map.get(q_id)
-        if dec and dec.get("score") is not None:
-            norm_score = float(dec["score"]) / 5.0
-            total_weighted_score += norm_score * q_weight
-            question_scores[q_id] = {
-                "score": dec["score"],
-                "normalized": round(norm_score, 4),
-                "is_human_override": dec.get("is_human", False),
-            }
-        else:
-            question_scores[q_id] = {"score": None, "normalized": 0.0, "is_human_override": False}
-
-    final_score_100 = round((total_weighted_score / total_weight) * 100.0, 2) if total_weight > 0 else 0.0
-    coverage_pct = round((len([v for v in question_scores.values() if v["score"] is not None]) / len(questions)) * 100.0, 1) if questions else 0.0
-
-    summary_prop = repo.get_summary_proposal(interview_id)
-    summary_md = payload.summary_markdown or (summary_prop.get("confirmed_markdown") if summary_prop else "") or "Резюме утверждено."
-    rec = payload.hiring_recommendation or (summary_prop.get("confirmed_recommendation") if summary_prop else "HIRE")
-
-    canonical_dict = {
-        "interview_id": interview_id,
-        "candidate": inv.get("candidate_name"),
-        "role": inv.get("role"),
-        "final_score_100": final_score_100,
-        "coverage_percentage": coverage_pct,
-        "question_scores": question_scores,
-        "summary": summary_md,
-        "recommendation": rec,
-        "confirmed_by": payload.confirmed_by,
-    }
-    canonical_json = json.dumps(canonical_dict, sort_keys=True, ensure_ascii=False)
-    sha256_checksum = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
-
-    revs = repo.get_report_revisions(interview_id)
-    next_rev_num = len(revs) + 1
-    report_id = f"rep-rev-{next_rev_num}"
-
-    repo.save_report_revision(
-        report_id=report_id,
-        interview_id=interview_id,
-        revision_number=next_rev_num,
-        final_score_100=final_score_100,
-        coverage_percentage=coverage_pct,
-        question_scores=question_scores,
-        summary_markdown=summary_md,
-        hiring_recommendation=rec,
-        confirmed_by=payload.confirmed_by,
-        sha256_checksum=sha256_checksum,
-    )
-
-    repo.update_interview_status(interview_id, InterviewStatus.FINALIZED)
-    repo.record_audit_event(
-        event_id=f"audit-{uuid.uuid4().hex[:8]}",
-        interview_id=interview_id,
-        event_type="REPORT_FINALIZED_AND_SEALED",
-        payload={
-            "report_id": report_id,
-            "revision_number": next_rev_num,
-            "final_score_100": final_score_100,
-            "sha256_checksum": sha256_checksum,
-            "confirmed_by": payload.confirmed_by,
-        },
-    )
-
-    return {
-        "status": "finalized",
-        "report_id": report_id,
-        "revision_number": next_rev_num,
-        "final_score_100": final_score_100,
-        "coverage_percentage": coverage_pct,
-        "sha256_checksum": sha256_checksum,
-    }
+@app.post("/api/v1/interviews/{interview_id}/revisions/reopen")
+async def reopen_revision_endpoint(
+    interview_id: str,
+    payload: ReopenRevisionRequest,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    try:
+        return repo.reopen_revision(
+            interview_id=interview_id,
+            reviewer_id=payload.reviewer_id,
+            reason=payload.reason,
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidStateTransitionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/v1/interviews/{interview_id}/associations")
@@ -814,12 +1145,25 @@ async def transition_state_endpoint(payload: TransitionStateRequest):
 # -------------------------------------------------------------
 @app.post("/api/v1/system/backup")
 async def backup_database_endpoint(
-    payload: CreateBackupRequest,
+    payload: CreateBackupRequest | None = None,
     repo: Repository = Depends(get_repository),
 ):
     try:
-        target = repo.db.backup(payload.target_path)
+        backup_dir = get_trusted_backup_dir()
+        filename = "backup.db"
+        if payload and payload.target_path:
+            raw_path = payload.target_path.strip()
+            if ".." in raw_path or "/" in raw_path or "\\" in raw_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid backup filename: path separators and '..' are forbidden; backups must reside in trusted directory.",
+                )
+            filename = raw_path
+
+        target = repo.db.backup(filename, trusted_backup_dir=backup_dir)
         return {"status": "ok", "target_path": target}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
 

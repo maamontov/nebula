@@ -74,3 +74,158 @@ pub fn resample_linear_f32(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec
     }
     out
 }
+
+/// Stateful audio stream converter:
+/// 1. Preserves inter-channel frame remainders across chunk boundaries (no lost channel frames).
+/// 2. Downsamples mono audio to target rate using linear interpolation while maintaining
+///    continuous phase across chunk boundaries (no phase jitter, no drift error accumulation).
+#[derive(Debug, Clone)]
+pub struct StatefulAudioConverter {
+    channels: u16,
+    from_rate: u32,
+    to_rate: u32,
+    channel_remainder: Vec<f32>,
+    mono_history: Vec<f32>,
+    phase: f64,
+    ratio: f64,
+}
+
+impl StatefulAudioConverter {
+    pub fn new(channels: u16, from_rate: u32, to_rate: u32) -> Self {
+        let ch = if channels == 0 { 1 } else { channels };
+        let ratio = from_rate as f64 / to_rate as f64;
+        Self {
+            channels: ch,
+            from_rate,
+            to_rate,
+            channel_remainder: Vec::with_capacity(ch as usize),
+            mono_history: Vec::with_capacity(4096),
+            phase: 0.0,
+            ratio,
+        }
+    }
+
+    pub fn process_input(&mut self, input: &[f32]) -> Vec<f32> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+
+        let ch = self.channels as usize;
+        let mut mono_samples = Vec::new();
+
+        if ch <= 1 {
+            mono_samples.extend_from_slice(input);
+        } else {
+            let mut cursor = 0;
+            // First complete any previous channel remainder
+            if !self.channel_remainder.is_empty() {
+                let needed = ch - self.channel_remainder.len();
+                if input.len() >= needed {
+                    self.channel_remainder.extend_from_slice(&input[..needed]);
+                    cursor = needed;
+                    let sum: f32 = self.channel_remainder.iter().sum();
+                    mono_samples.push(sum / ch as f32);
+                    self.channel_remainder.clear();
+                } else {
+                    self.channel_remainder.extend_from_slice(input);
+                    return Vec::new();
+                }
+            }
+
+            let remaining_input = &input[cursor..];
+            let full_frames = remaining_input.len() / ch;
+            let frame_samples_len = full_frames * ch;
+
+            for frame in remaining_input[..frame_samples_len].chunks_exact(ch) {
+                let sum: f32 = frame.iter().sum();
+                mono_samples.push(sum / ch as f32);
+            }
+
+            if frame_samples_len < remaining_input.len() {
+                self.channel_remainder.extend_from_slice(&remaining_input[frame_samples_len..]);
+            }
+        }
+
+        if self.from_rate == self.to_rate {
+            return mono_samples;
+        }
+
+        self.mono_history.extend(mono_samples);
+
+        let step = self.ratio;
+        let mut out = Vec::new();
+        let mut pos = self.phase;
+
+        while {
+            let idx = pos.floor() as usize;
+            idx + 1 < self.mono_history.len()
+        } {
+            let idx = pos.floor() as usize;
+            let frac = (pos - idx as f64) as f32;
+            let s0 = self.mono_history[idx];
+            let s1 = self.mono_history[idx + 1];
+            out.push(s0 + frac * (s1 - s0));
+            pos += step;
+        }
+
+        let last_idx = pos.floor() as usize;
+        if last_idx > 0 {
+            let drain_count = last_idx.min(self.mono_history.len());
+            self.mono_history.drain(0..drain_count);
+            self.phase = pos - drain_count as f64;
+        } else {
+            self.phase = pos;
+        }
+
+        out
+    }
+
+    pub fn flush(&mut self) -> Vec<f32> {
+        let mut out = Vec::new();
+
+        // Flush trailing incomplete channel remainder
+        if !self.channel_remainder.is_empty() {
+            let sum: f32 = self.channel_remainder.iter().sum();
+            let avg = sum / self.channel_remainder.len() as f32;
+            self.channel_remainder.clear();
+            if self.from_rate == self.to_rate {
+                out.push(avg);
+                return out;
+            }
+            self.mono_history.push(avg);
+        }
+
+        if self.from_rate == self.to_rate {
+            let remaining = std::mem::take(&mut self.mono_history);
+            out.extend(remaining);
+            return out;
+        }
+
+        let step = self.ratio;
+        let mut pos = self.phase;
+
+        // Drain any pairs remaining
+        while {
+            let idx = pos.floor() as usize;
+            idx + 1 < self.mono_history.len()
+        } {
+            let idx = pos.floor() as usize;
+            let frac = (pos - idx as f64) as f32;
+            let s0 = self.mono_history[idx];
+            let s1 = self.mono_history[idx + 1];
+            out.push(s0 + frac * (s1 - s0));
+            pos += step;
+        }
+
+        // Emit final trailing sample if pos hasn't exceeded the last sample index
+        let last_idx = pos.floor() as usize;
+        if last_idx < self.mono_history.len() {
+            out.push(self.mono_history[last_idx]);
+        }
+
+        self.mono_history.clear();
+        self.phase = 0.0;
+        out
+    }
+}
+
