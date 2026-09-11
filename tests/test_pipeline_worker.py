@@ -1,10 +1,12 @@
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from backend.adapters.stt import STTTranscriptionResult
 from backend.db.database import Database
 from backend.db.repository import Repository
 from backend.workers.pipeline import PipelineWorker
 from contracts.domain import InterviewStatus
-from backend.adapters.stt import STTTranscriptionResult
 
 
 @pytest.fixture
@@ -84,6 +86,24 @@ async def test_worker_evaluate_question_job(repo):
         }
     )
 
+    repo.add_transcript_segment(
+        segment_id="seg-go-1",
+        interview_id="inv-w2",
+        track_id="candidate",
+        start_time_ms=0,
+        end_time_ms=10000,
+        text="sync.Pool снижает нагрузку на GC.",
+        speaker_role="candidate",
+        revision_id="trans-rev-1",
+    )
+    repo.save_association(
+        assoc_id="assoc-go-1",
+        interview_id="inv-w2",
+        question_id="q-sync",
+        segment_id="seg-go-1",
+        revision_id="trans-rev-1",
+    )
+
     worker = PipelineWorker(repo, stt_adapter=MagicMock(), llm_adapter=mock_llm)
 
     repo.enqueue_job(
@@ -92,11 +112,10 @@ async def test_worker_evaluate_question_job(repo):
         interview_id="inv-w2",
         payload={
             "question_id": "q-sync",
-            "candidate_text": "sync.Pool снижает нагрузку на GC.",
-            "segment_id": "seg-go-1",
             "rubric_description": "Go concurrency & memory primitives",
         },
     )
+
 
     processed = await worker.process_one_job()
     assert processed is True

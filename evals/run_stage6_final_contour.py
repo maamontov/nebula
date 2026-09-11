@@ -13,15 +13,14 @@ Verifies:
 9. Final report immutable snapshot created with deterministic 100-pt score and SHA-256 cryptographic seal.
 """
 
-import sys
-import os
-import time
-import json
-import uuid
-import tempfile
 import asyncio
-import hashlib
+import os
+import sys
+import tempfile
+import time
+import uuid
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,14 +28,12 @@ load_dotenv()
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from starlette.testclient import TestClient
+
+from backend.api import app as api_module
 from backend.db.database import Database
 from backend.db.repository import Repository
-from backend.core.revisions import TranscriptDiffEngine
-from backend.core.summary_generator import ExecutiveSummaryGenerator
-from backend.adapters.resilient_llm import ResilientLLMAdapter
 from backend.workers.pipeline import PipelineWorker
-from backend.api import app as api_module
-from starlette.testclient import TestClient
 
 
 def run_stage6_acceptance():
@@ -217,7 +214,7 @@ def run_stage6_acceptance():
         assert human_q1["is_manually_adjusted"] == 1
         assert "кандидат отлично ориентируется" in human_q1["reviewer_notes"]
         assert human_q1["is_stale"] == 1, "Modified transcript must flag human assessment as stale"
-        print(f"[Step 5/8] Verified Human Override Invariant:")
+        print("[Step 5/8] Verified Human Override Invariant:")
         print(f"  - Q1 Score preserved: {human_q1['scores'][0]['score']}/5.0 (Notes: '{human_q1['reviewer_notes']}')")
         print(f"  - Q1 is_stale flagged: {bool(human_q1['is_stale'])} (Reason: '{human_q1['stale_reason']}')")
 
@@ -239,7 +236,7 @@ def run_stage6_acceptance():
             },
         )
         assert conflict_resp.status_code == 409, f"Expected 409 Conflict for outdated revision, got {conflict_resp.status_code}"
-        print(f"[Step 6/8] Conflict Protection Verified: Stale review submission rejected with HTTP 409 Conflict")
+        print("[Step 6/8] Conflict Protection Verified: Stale review submission rejected with HTTP 409 Conflict")
         print(f"  - Conflict detail: {conflict_resp.json()['detail']}")
 
         # Re-approve with expected revision 'trans-rev-2'
@@ -253,7 +250,7 @@ def run_stage6_acceptance():
             },
         )
         assert valid_review_resp.status_code == 200
-        print(f"  - Updated review on 'trans-rev-2' accepted successfully (Score: 4.9/5.0)")
+        print("  - Updated review on 'trans-rev-2' accepted successfully (Score: 4.9/5.0)")
 
         # Also confirm Q2 and Q3 under trans-rev-2
         client.post(
@@ -316,7 +313,7 @@ def run_stage6_acceptance():
         assert fin_data["final_score_100"] > 90.0
         assert fin_data["coverage_percentage"] == 100.0
         assert len(fin_data["sha256_checksum"]) == 64
-        print(f"[Step 8/8] Final Report Sealed with Cryptographic Hash:")
+        print("[Step 8/8] Final Report Sealed with Cryptographic Hash:")
         print(f"  - Final Score: {fin_data['final_score_100']}/100")
         print(f"  - Coverage: {fin_data['coverage_percentage']}%")
         print(f"  - SHA-256 Checksum: {fin_data['sha256_checksum']}")

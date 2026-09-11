@@ -4,10 +4,10 @@ Tests for Stage 7: Question matching, Evidence validation, and Atomic Job Lease 
 """
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 from fastapi.testclient import TestClient
-
-from unittest.mock import AsyncMock, MagicMock
 
 from backend.api.app import app
 from backend.core.evidence_validator import validate_proposal
@@ -426,6 +426,7 @@ def test_incremental_associations_endpoint(client: TestClient, repo: Repository)
 @pytest.mark.asyncio
 async def test_pipeline_worker_evidence_validation_rejects_hallucination(repo: Repository):
     from unittest.mock import AsyncMock, MagicMock
+
     from backend.workers.pipeline import PipelineWorker
 
     interview_id = "inv-worker-ev-1"

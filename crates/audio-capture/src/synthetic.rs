@@ -1,6 +1,6 @@
+use anyhow::Result;
 use std::f32::consts::PI;
 use std::sync::Arc;
-use anyhow::Result;
 
 use crate::clock::MonotonicInterviewClock;
 use crate::resampler::f32_to_pcm_s16le;
@@ -47,7 +47,9 @@ pub fn simulate_track_recording(
 
         // Check for simulated dropout
         if let Some(drop_start) = config.simulated_dropout_at_ms {
-            if start_time_ms >= drop_start && start_time_ms < drop_start + config.dropout_duration_ms {
+            if start_time_ms >= drop_start
+                && start_time_ms < drop_start + config.dropout_duration_ms
+            {
                 // Drop this chunk completely to simulate network or driver failure
                 continue;
             }

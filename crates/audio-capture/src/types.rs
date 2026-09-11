@@ -71,4 +71,3 @@ pub struct CaptureStats {
     pub is_sealed: bool,
     pub gaps: Vec<AudioGap>,
 }
-

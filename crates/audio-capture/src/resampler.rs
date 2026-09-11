@@ -17,10 +17,13 @@ pub fn calculate_rms_i16(samples: &[i16]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
-    let sum_sq: f64 = samples.iter().map(|&s| {
-        let norm = s as f64 / 32768.0;
-        norm * norm
-    }).sum();
+    let sum_sq: f64 = samples
+        .iter()
+        .map(|&s| {
+            let norm = s as f64 / 32768.0;
+            norm * norm
+        })
+        .sum();
     ((sum_sq / samples.len() as f64).sqrt()) as f32
 }
 
@@ -147,7 +150,8 @@ impl StatefulAudioConverter {
             }
 
             if frame_samples_len < remaining_input.len() {
-                self.channel_remainder.extend_from_slice(&remaining_input[frame_samples_len..]);
+                self.channel_remainder
+                    .extend_from_slice(&remaining_input[frame_samples_len..]);
             }
         }
 
@@ -233,4 +237,3 @@ impl StatefulAudioConverter {
         out
     }
 }
-

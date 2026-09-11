@@ -107,12 +107,17 @@ CREATE TABLE IF NOT EXISTS human_assessments (
 CREATE TABLE IF NOT EXISTS summary_proposals (
     id TEXT PRIMARY KEY,
     interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    transcript_revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
+    rubric_revision_id TEXT NOT NULL DEFAULT 'rub-rev-1',
     model_profile_id TEXT NOT NULL,
     summary_data_json TEXT NOT NULL,
+    decisions_snapshot_hash TEXT,
     is_confirmed INTEGER NOT NULL DEFAULT 0,
     confirmed_by TEXT,
     confirmed_markdown TEXT,
     confirmed_recommendation TEXT,
+    is_stale INTEGER NOT NULL DEFAULT 0,
+    stale_reason TEXT,
     created_at TEXT NOT NULL,
     confirmed_at TEXT
 );

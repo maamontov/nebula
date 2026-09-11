@@ -17,6 +17,10 @@ import {
   RotateCcw,
   CheckCircle2,
   FileEdit,
+  Sparkles,
+  ThumbsUp,
+  AlertTriangle,
+  XCircle,
 } from 'lucide-react';
 
 interface HomeScreenProps {
@@ -195,17 +199,46 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     if (!rec) return null;
     switch (rec.toUpperCase()) {
       case 'STRONG_HIRE':
-        return <span className="px-2 py-0.5 text-[11px] font-bold text-emerald-300 bg-emerald-950 border border-emerald-700 rounded">STRONG HIRE</span>;
+        return (
+          <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 text-xs font-bold text-emerald-300 bg-emerald-950/80 border border-emerald-600/80 rounded-lg shadow-sm">
+            <Sparkles className="w-3 h-3 text-emerald-400" />
+            <span>Strong Hire</span>
+          </span>
+        );
       case 'HIRE':
-        return <span className="px-2 py-0.5 text-[11px] font-bold text-teal-300 bg-teal-950 border border-teal-700 rounded">HIRE</span>;
+        return (
+          <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 text-xs font-bold text-teal-300 bg-teal-950/80 border border-teal-600/80 rounded-lg shadow-sm">
+            <CheckCircle2 className="w-3 h-3 text-teal-400" />
+            <span>Hire</span>
+          </span>
+        );
       case 'LEAN_HIRE':
-        return <span className="px-2 py-0.5 text-[11px] font-bold text-sky-300 bg-sky-950 border border-sky-700 rounded">LEAN HIRE</span>;
+        return (
+          <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 text-xs font-bold text-cyan-300 bg-cyan-950/80 border border-cyan-600/80 rounded-lg shadow-sm">
+            <ThumbsUp className="w-3 h-3 text-cyan-400" />
+            <span>Lean Hire</span>
+          </span>
+        );
       case 'LEAN_NO_HIRE':
-        return <span className="px-2 py-0.5 text-[11px] font-bold text-amber-300 bg-amber-950 border border-amber-700 rounded">LEAN NO HIRE</span>;
+        return (
+          <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 text-xs font-bold text-amber-300 bg-amber-950/80 border border-amber-600/80 rounded-lg shadow-sm">
+            <AlertTriangle className="w-3 h-3 text-amber-400" />
+            <span>Lean No Hire</span>
+          </span>
+        );
       case 'NO_HIRE':
-        return <span className="px-2 py-0.5 text-[11px] font-bold text-rose-300 bg-rose-950 border border-rose-700 rounded">NO HIRE</span>;
+        return (
+          <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 text-xs font-bold text-rose-300 bg-rose-950/80 border border-rose-600/80 rounded-lg shadow-sm">
+            <XCircle className="w-3 h-3 text-rose-400" />
+            <span>No Hire</span>
+          </span>
+        );
       default:
-        return <span className="px-2 py-0.5 text-[11px] font-bold text-slate-300 bg-slate-800 border border-slate-700 rounded">{rec}</span>;
+        return (
+          <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 text-xs font-medium text-slate-300 bg-slate-800 border border-slate-700 rounded-lg">
+            <span>{rec}</span>
+          </span>
+        );
     }
   };
 

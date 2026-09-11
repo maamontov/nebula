@@ -7,9 +7,10 @@ Adheres strictly to docs/implementation-plan.md Section 7.3 & 10:
 - Emits objective hiring recommendation with evidence quotes.
 """
 
-from typing import Any
 import json
 import logging
+from typing import Any
+
 from backend.adapters.resilient_llm import ResilientLLMAdapter
 
 logger = logging.getLogger("nebula.summary_generator")

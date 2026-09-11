@@ -2,16 +2,12 @@
 Regression test suite for Stage 0: Security, path traversal, and lifecycle protection.
 Набор регрессионных тестов для Этапа 0: Безопасность путей, защита файловой системы и жизненного цикла.
 """
-import os
-import stat
-from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.api.app import app, get_repository
 from backend.db.database import Database
-from backend.db.repository import Repository
-from contracts.domain import InterviewStatus
+from backend.db.repository import Repository, RepositoryConflictError
 
 
 @pytest.fixture
@@ -140,7 +136,6 @@ def test_backup_restricted_to_trusted_directory(test_env):
     Бэкап должен отклонять выход за пределы доверенного каталога.
     """
     client = test_env["client"]
-    backup_dir = test_env["backup_dir"]
     tmp_path = test_env["tmp_path"]
 
     # Traversal attempt
@@ -178,7 +173,7 @@ def test_late_worker_cannot_resurrect_or_orphan_deleted_interview(test_env):
     assert del_res.status_code == 200
 
     # Simulate late worker attempting to save transcript segment
-    with pytest.raises(Exception):
+    with pytest.raises((ValueError, RepositoryConflictError)):
         repo.add_transcript_segment(
             segment_id="seg-late-1",
             interview_id=inv_id,

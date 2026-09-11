@@ -1,4 +1,5 @@
 import pytest
+
 from backend.db.database import Database
 from backend.db.repository import Repository
 from contracts.domain import InterviewStatus

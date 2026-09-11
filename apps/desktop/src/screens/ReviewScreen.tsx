@@ -48,7 +48,72 @@ import {
   CheckSquare,
   ArrowLeft,
   FileSpreadsheet,
+  ThumbsUp,
 } from 'lucide-react';
+
+interface DecisionOption {
+  id: string;
+  labelEn: string;
+  labelRu: string;
+  tagline: string;
+  icon: React.ComponentType<{ className?: string }>;
+  colorActive: string;
+  colorHover: string;
+  accentColor: string;
+}
+
+const DECISION_OPTIONS: DecisionOption[] = [
+  {
+    id: 'STRONG_HIRE',
+    labelEn: 'Strong Hire',
+    labelRu: 'Уверенный найм',
+    tagline: 'Исключительный кандидат, превосходит планку роли',
+    icon: Sparkles,
+    colorActive: 'bg-emerald-950/80 border-emerald-400 text-emerald-100 ring-2 ring-emerald-500/80 shadow-lg shadow-emerald-950/70',
+    colorHover: 'hover:border-emerald-500/60 hover:bg-emerald-950/30 text-slate-300',
+    accentColor: 'text-emerald-400',
+  },
+  {
+    id: 'HIRE',
+    labelEn: 'Hire',
+    labelRu: 'Найм',
+    tagline: 'Полностью соответствует профилю требований',
+    icon: CheckCircle2,
+    colorActive: 'bg-teal-950/80 border-teal-400 text-teal-100 ring-2 ring-teal-500/80 shadow-lg shadow-teal-950/70',
+    colorHover: 'hover:border-teal-500/60 hover:bg-teal-950/30 text-slate-300',
+    accentColor: 'text-teal-400',
+  },
+  {
+    id: 'LEAN_HIRE',
+    labelEn: 'Lean Hire',
+    labelRu: 'Скорее найм',
+    tagline: 'Проходит по планке, с небольшими оговорками',
+    icon: ThumbsUp,
+    colorActive: 'bg-cyan-950/80 border-cyan-400 text-cyan-100 ring-2 ring-cyan-500/80 shadow-lg shadow-cyan-950/70',
+    colorHover: 'hover:border-cyan-500/60 hover:bg-cyan-950/30 text-slate-300',
+    accentColor: 'text-cyan-400',
+  },
+  {
+    id: 'LEAN_NO_HIRE',
+    labelEn: 'Lean No Hire',
+    labelRu: 'Скорее отказ',
+    tagline: 'Существенные риски или пробелы в компетенциях',
+    icon: AlertTriangle,
+    colorActive: 'bg-amber-950/80 border-amber-400 text-amber-100 ring-2 ring-amber-500/80 shadow-lg shadow-amber-950/70',
+    colorHover: 'hover:border-amber-500/60 hover:bg-amber-950/30 text-slate-300',
+    accentColor: 'text-amber-400',
+  },
+  {
+    id: 'NO_HIRE',
+    labelEn: 'No Hire',
+    labelRu: 'Отказ',
+    tagline: 'Не соответствует требованиям позиции',
+    icon: XCircle,
+    colorActive: 'bg-rose-950/80 border-rose-400 text-rose-100 ring-2 ring-rose-500/80 shadow-lg shadow-rose-950/70',
+    colorHover: 'hover:border-rose-500/60 hover:bg-rose-950/30 text-slate-300',
+    accentColor: 'text-rose-400',
+  },
+];
 
 type ReviewTab = 'overview' | 'questions' | 'transcript' | 'result' | 'history';
 
@@ -97,6 +162,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [isSummaryConfirmed, setIsSummaryConfirmed] = useState(false);
   const [isSavingSummary, setIsSavingSummary] = useState(false);
   const [summarySavedSuccess, setSummarySavedSuccess] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [aiSummaryData, setAiSummaryData] = useState<any>(null);
 
   // Lifecycle & Finalization state
   const [interviewStatus, setInterviewStatus] = useState<string>('review');
@@ -127,6 +194,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [selectedQuote, setSelectedQuote] = useState<{ quote: string; segmentId: string } | null>(null);
   const [reviewerNotes, setReviewerNotes] = useState<Record<string, string>>({});
   const [savedSuccess, setSavedSuccess] = useState<Record<string, boolean>>({});
+  const [isSavingQuestion, setIsSavingQuestion] = useState<Record<string, boolean>>({});
+  const [isConfirmingAll, setIsConfirmingAll] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isEvaluatingAll, setIsEvaluatingAll] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
@@ -228,13 +297,18 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         const sumData = await getSummary(interviewId);
         if (sumData.has_summary) {
           setIsSummaryConfirmed(Boolean(sumData.is_confirmed));
+          setAiSummaryData(sumData.summary || null);
           if (sumData.confirmed_markdown) {
             setSummaryMarkdown(sumData.confirmed_markdown);
+          } else if (sumData.summary?.summary_markdown) {
+            setSummaryMarkdown(sumData.summary.summary_markdown);
           } else if (sumData.summary?.overview) {
             setSummaryMarkdown(sumData.summary.overview);
           }
           if (sumData.confirmed_recommendation) {
             setHiringRecommendation(sumData.confirmed_recommendation);
+          } else if (sumData.summary?.hiring_recommendation) {
+            setHiringRecommendation(sumData.summary.hiring_recommendation);
           }
         }
       } catch (sumErr) {
@@ -425,25 +499,34 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     }
   };
 
-  const handleSaveApproval = async (questionId: string) => {
+  const handleSaveApproval = async (questionId: string, overrideScore?: number) => {
     if (isFinalized) return;
     const q = plan.questions.find((x) => x.id === questionId);
     if (!q) return;
 
+    const prop = proposals.find((p) => p.question_id === questionId);
+    const chosenScore =
+      overrideScore !== undefined
+        ? overrideScore
+        : questionScores[questionId] !== undefined
+        ? questionScores[questionId]
+        : prop?.scores?.[0]?.score;
+
+    if (chosenScore === undefined) {
+      alert('Пожалуйста, сначала выберите балл для этого вопроса.');
+      return;
+    }
+
     const qCrits = criterionScores[questionId] || {};
     const scoresToSubmit = q.criteria.map((c) => {
-      const val = qCrits[c.id] ?? questionScores[questionId];
+      const val = qCrits[c.id] ?? chosenScore;
       return {
         criterion_id: c.id,
         score: val !== undefined ? val : 3.0,
       };
     });
 
-    if (questionScores[questionId] === undefined && Object.keys(qCrits).length === 0) {
-      alert('Пожалуйста, сначала выберите балл для этого вопроса.');
-      return;
-    }
-
+    setIsSavingQuestion((prev) => ({ ...prev, [questionId]: true }));
     try {
       await reviewAssessment(interviewId, questionId, {
         expected_transcript_revision: activeRevisionId,
@@ -453,6 +536,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       });
 
       setSavedSuccess((prev) => ({ ...prev, [questionId]: true }));
+      setFinalizeError(null);
       setTimeout(() => {
         setSavedSuccess((prev) => ({ ...prev, [questionId]: false }));
       }, 3000);
@@ -466,6 +550,42 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       } else {
         alert(`Ошибка при сохранении оценки: ${e?.message || e}`);
       }
+    } finally {
+      setIsSavingQuestion((prev) => ({ ...prev, [questionId]: false }));
+    }
+  };
+
+  const handleConfirmAllAssessments = async () => {
+    if (isFinalized || isConfirmingAll) return;
+    setIsConfirmingAll(true);
+    try {
+      for (const q of plan.questions) {
+        if (excludedQuestions[q.id]?.isExcluded) continue;
+        const human = humanAssessments.find((ha) => ha.question_id === q.id);
+        if (human && !human.is_stale && human.transcript_revision_id === activeRevisionId) {
+          continue;
+        }
+        const prop = proposals.find((p) => p.question_id === q.id);
+        const chosenScore = questionScores[q.id] ?? prop?.scores?.[0]?.score ?? 3.0;
+        const qCrits = criterionScores[q.id] || {};
+        const scoresToSubmit = q.criteria.map((c) => ({
+          criterion_id: c.id,
+          score: qCrits[c.id] ?? chosenScore,
+        }));
+
+        await reviewAssessment(interviewId, q.id, {
+          expected_transcript_revision: activeRevisionId,
+          scores: scoresToSubmit,
+          reviewer_notes: reviewerNotes[q.id] || 'Оценка подтверждена экспертом',
+          is_manually_adjusted: true,
+        });
+      }
+      setFinalizeError(null);
+      await loadData();
+    } catch (err: any) {
+      alert(`Ошибка при подтверждении всех оценок: ${err?.message || err}`);
+    } finally {
+      setIsConfirmingAll(false);
     }
   };
 
@@ -544,12 +664,15 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
   const handleSaveSummary = async () => {
     if (isFinalized) return;
-    if (!summaryMarkdown.trim()) {
-      alert('Пожалуйста, введите текст резюме (Executive Summary).');
+    setSummaryError(null);
+
+    const trimmedSummary = summaryMarkdown.trim();
+    if (!trimmedSummary) {
+      setSummaryError('Пожалуйста, введите текст резюме (Executive Summary).');
       return;
     }
     if (!hiringRecommendation) {
-      alert('Пожалуйста, выберите рекомендацию по найму (Hiring Decision).');
+      setSummaryError('Пожалуйста, выберите рекомендацию по найму (Hiring Decision).');
       return;
     }
 
@@ -557,19 +680,21 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     try {
       await confirmSummary(interviewId, {
         reviewer_id: 'lead-interviewer',
-        confirmed_markdown: summaryMarkdown.trim(),
+        confirmed_markdown: trimmedSummary,
         confirmed_recommendation: hiringRecommendation,
         expected_transcript_revision: activeRevisionId,
       });
       setIsSummaryConfirmed(true);
       setSummarySavedSuccess(true);
+      setSummaryError(null);
       setTimeout(() => setSummarySavedSuccess(false), 3000);
+      await loadData();
     } catch (err: any) {
       if (err?.message?.includes('409') || err?.message?.includes('Конфликт')) {
-        alert('Конфликт версий (409): стенограмма собеседования была обновлена. Страница перезагрузит актуальную ревизию.');
+        setSummaryError('Конфликт версий (409): стенограмма собеседования была обновлена. Страница перезагрузит актуальную ревизию.');
         await loadData();
       } else {
-        alert(`Ошибка при сохранении резюме: ${err?.message || err}`);
+        setSummaryError(`Ошибка при сохранении резюме: ${err?.message || err}`);
       }
     } finally {
       setIsSavingSummary(false);
@@ -1101,18 +1226,36 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             </h3>
 
             {!isFinalized && (
-              <button
-                onClick={handleAutoEvaluateAll}
-                disabled={isEvaluatingAll}
-                className="flex items-center space-x-2 px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-semibold rounded-lg shadow-sm transition cursor-pointer disabled:cursor-not-allowed"
-              >
-                {isEvaluatingAll ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Sparkles className="w-3.5 h-3.5 text-indigo-200" />
-                )}
-                <span>{isEvaluatingAll ? 'Анализируем ответы...' : 'Автооценка всех ответов (AI)'}</span>
-              </button>
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={handleConfirmAllAssessments}
+                  disabled={isConfirmingAll}
+                  className="flex items-center space-x-2 px-3.5 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white text-xs font-semibold rounded-lg shadow-sm transition cursor-pointer"
+                  title="Подтвердить все выставленные или предложенные AI оценки"
+                >
+                  {isConfirmingAll ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-200" />
+                  )}
+                  <span>{isConfirmingAll ? 'Подтверждение...' : 'Подтвердить все оценки'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleAutoEvaluateAll}
+                  disabled={isEvaluatingAll}
+                  className="flex items-center space-x-2 px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-semibold rounded-lg shadow-sm transition cursor-pointer disabled:cursor-not-allowed"
+                >
+                  {isEvaluatingAll ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="w-3.5 h-3.5 text-indigo-200" />
+                  )}
+                  <span>{isEvaluatingAll ? 'Анализируем ответы...' : 'Автооценка всех ответов (AI)'}</span>
+                </button>
+              </div>
             )}
           </div>
 
@@ -1215,26 +1358,54 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                     )}
 
                     {!isExcluded && (
-                      <div className="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800">
-                        <span className="text-xs text-slate-400 font-medium">Балл (1–5):</span>
-                        {[1, 2, 3, 4, 5].map((val) => {
-                          const isSelected = currentScore === val;
-                          return (
-                            <button
-                              key={val}
-                              type="button"
-                              disabled={isFinalized}
-                              onClick={() => handleScoreChange(q.id, val)}
-                              className={`w-7 h-7 rounded text-xs font-bold transition cursor-pointer flex items-center justify-center ${
-                                isSelected
-                                  ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/40 ring-2 ring-indigo-400 scale-105'
-                                  : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200'
-                              } ${isFinalized ? 'cursor-not-allowed opacity-80' : ''}`}
-                            >
-                              {val}
-                            </button>
-                          );
-                        })}
+                      <div className="flex items-center space-x-2">
+                        <div className="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800">
+                          <span className="text-xs text-slate-400 font-medium">Балл (1–5):</span>
+                          {[1, 2, 3, 4, 5].map((val) => {
+                            const isSelected = currentScore === val;
+                            return (
+                              <button
+                                key={val}
+                                type="button"
+                                disabled={isFinalized}
+                                onClick={() => {
+                                  handleScoreChange(q.id, val);
+                                  handleSaveApproval(q.id, val);
+                                }}
+                                className={`w-7 h-7 rounded text-xs font-bold transition cursor-pointer flex items-center justify-center ${
+                                  isSelected
+                                    ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/40 ring-2 ring-indigo-400 scale-105'
+                                    : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200'
+                                } ${isFinalized ? 'cursor-not-allowed opacity-80' : ''}`}
+                              >
+                                {val}
+                              </button>
+                            );
+                          })}
+                        </div>
+
+                        {!isFinalized && (
+                          <button
+                            type="button"
+                            disabled={isSavingQuestion[q.id]}
+                            onClick={() => handleSaveApproval(q.id)}
+                            className={`px-3 py-1.5 text-xs font-semibold rounded-lg flex items-center space-x-1.5 transition cursor-pointer shadow-sm ${
+                              hasHuman && !isHumanStale
+                                ? 'bg-emerald-950/70 text-emerald-300 border border-emerald-700/80 hover:bg-emerald-900/60'
+                                : 'bg-indigo-600 text-white hover:bg-indigo-500 shadow-indigo-600/30'
+                            }`}
+                            title="Подтвердить оценку эксперта"
+                          >
+                            {isSavingQuestion[q.id] ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : hasHuman && !isHumanStale ? (
+                              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                            ) : (
+                              <Check className="w-3.5 h-3.5" />
+                            )}
+                            <span>{hasHuman && !isHumanStale ? 'Подтверждено' : 'Подтвердить'}</span>
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -1625,11 +1796,91 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
               </div>
             </div>
 
+            {/* AI Insights (Strengths, Growth Areas, Rationale) if available */}
+            {aiSummaryData && (
+              <div className="space-y-3 pt-1 border-b border-slate-800/80 pb-4">
+                {aiSummaryData.recommendation_rationale && (
+                  <div className="p-3 bg-indigo-950/30 border border-indigo-800/40 rounded-lg text-xs">
+                    <div className="flex items-center space-x-1.5 font-semibold text-indigo-300 mb-1">
+                      <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>Предварительная аналитика AI (Обоснование):</span>
+                    </div>
+                    <p className="text-slate-300 leading-relaxed">{aiSummaryData.recommendation_rationale}</p>
+                  </div>
+                )}
+
+                {((aiSummaryData.key_strengths && aiSummaryData.key_strengths.length > 0) ||
+                  (aiSummaryData.growth_areas && aiSummaryData.growth_areas.length > 0)) && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                    {aiSummaryData.key_strengths && aiSummaryData.key_strengths.length > 0 && (
+                      <div className="p-3 bg-emerald-950/20 border border-emerald-800/40 rounded-lg space-y-2">
+                        <div className="font-semibold text-emerald-400 flex items-center space-x-1.5">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Сильные стороны:</span>
+                        </div>
+                        <div className="space-y-1.5">
+                          {aiSummaryData.key_strengths.map((item: any, idx: number) => (
+                            <div key={idx} className="bg-slate-900/60 p-2 rounded border border-slate-800/70">
+                              <div className="font-medium text-slate-200">{item.title}</div>
+                              {item.description && <div className="text-[11px] text-slate-400 mt-0.5">{item.description}</div>}
+                              {item.evidence_quote && (
+                                <div className="text-[10px] text-emerald-300/80 italic mt-1 border-l-2 border-emerald-500/50 pl-1.5">
+                                  «{item.evidence_quote}»
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {aiSummaryData.growth_areas && aiSummaryData.growth_areas.length > 0 && (
+                      <div className="p-3 bg-amber-950/20 border border-amber-800/40 rounded-lg space-y-2">
+                        <div className="font-semibold text-amber-400 flex items-center space-x-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5" />
+                          <span>Зоны роста и риски:</span>
+                        </div>
+                        <div className="space-y-1.5">
+                          {aiSummaryData.growth_areas.map((item: any, idx: number) => (
+                            <div key={idx} className="bg-slate-900/60 p-2 rounded border border-slate-800/70">
+                              <div className="font-medium text-slate-200">{item.title}</div>
+                              {item.description && <div className="text-[11px] text-slate-400 mt-0.5">{item.description}</div>}
+                              {item.evidence_quote && (
+                                <div className="text-[10px] text-amber-300/80 italic mt-1 border-l-2 border-amber-500/50 pl-1.5">
+                                  «{item.evidence_quote}»
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                  Резюме встречи (Executive Summary):
-                </label>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-xs font-semibold text-slate-300">
+                    Резюме встречи (Executive Summary):
+                  </label>
+                  {aiSummaryData?.summary_markdown && summaryMarkdown !== aiSummaryData.summary_markdown && !isFinalized && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSummaryMarkdown(aiSummaryData.summary_markdown);
+                        setIsSummaryConfirmed(false);
+                        setSummaryError(null);
+                      }}
+                      className="text-[11px] text-indigo-400 hover:text-indigo-300 flex items-center space-x-1 cursor-pointer transition"
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                      <span>Восстановить черновик от AI</span>
+                    </button>
+                  )}
+                </div>
                 <textarea
                   rows={4}
                   disabled={isFinalized}
@@ -1637,6 +1888,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                   onChange={(e) => {
                     setSummaryMarkdown(e.target.value);
                     setIsSummaryConfirmed(false);
+                    setSummaryError(null);
                   }}
                   placeholder="Введите профессиональное резюме результатов кандидата, ключевые сильные стороны и риски..."
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 leading-relaxed font-sans disabled:opacity-75 disabled:cursor-not-allowed"
@@ -1644,18 +1896,13 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                <label className="block text-xs font-semibold text-slate-300 mb-2">
                   Рекомендация по найму (Hiring Recommendation):
                 </label>
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
-                  {[
-                    { id: 'STRONG_HIRE', label: 'Strong Hire', color: 'border-emerald-500 text-emerald-300 hover:bg-emerald-950/40' },
-                    { id: 'HIRE', label: 'Hire', color: 'border-teal-500 text-teal-300 hover:bg-teal-950/40' },
-                    { id: 'LEAN_HIRE', label: 'Lean Hire', color: 'border-cyan-500 text-cyan-300 hover:bg-cyan-950/40' },
-                    { id: 'LEAN_NO_HIRE', label: 'Lean No Hire', color: 'border-amber-500 text-amber-300 hover:bg-amber-950/40' },
-                    { id: 'NO_HIRE', label: 'No Hire', color: 'border-rose-500 text-rose-300 hover:bg-rose-950/40' },
-                  ].map((opt) => {
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                  {DECISION_OPTIONS.map((opt) => {
                     const isSelected = hiringRecommendation === opt.id;
+                    const IconComp = opt.icon;
                     return (
                       <button
                         key={opt.id}
@@ -1664,22 +1911,62 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                         onClick={() => {
                           setHiringRecommendation(opt.id);
                           setIsSummaryConfirmed(false);
+                          setSummaryError(null);
                         }}
-                        className={`p-2.5 rounded-lg border text-xs font-bold transition flex flex-col items-center justify-center cursor-pointer ${opt.color} ${
+                        className={`relative p-3.5 rounded-xl border transition-all duration-200 text-left flex flex-col justify-between cursor-pointer group ${
                           isSelected
-                            ? 'bg-slate-800 ring-2 ring-indigo-400 shadow-md'
-                            : 'bg-slate-950/60 border-slate-800/80 opacity-60'
+                            ? opt.colorActive
+                            : `bg-slate-950/60 border-slate-800/90 ${opt.colorHover}`
                         } ${isFinalized ? 'cursor-not-allowed opacity-80' : ''}`}
                       >
-                        <span>{opt.label}</span>
+                        <div className="flex items-center justify-between mb-2">
+                          <div className={`p-1.5 rounded-lg ${isSelected ? 'bg-white/10' : 'bg-slate-900 group-hover:bg-slate-800'}`}>
+                            <IconComp className={`w-4 h-4 ${isSelected ? 'text-white' : opt.accentColor}`} />
+                          </div>
+                          <div
+                            className={`w-4 h-4 rounded-full border flex items-center justify-center transition ${
+                              isSelected
+                                ? 'border-white bg-white text-slate-950'
+                                : 'border-slate-700 bg-slate-900/80'
+                            }`}
+                          >
+                            {isSelected && <span className="w-2 h-2 rounded-full bg-current" />}
+                          </div>
+                        </div>
+
+                        <div>
+                          <div className="text-xs font-bold tracking-tight">
+                            {opt.labelEn}
+                          </div>
+                          <div className={`text-[11px] font-medium mt-0.5 ${isSelected ? 'text-white/90' : 'text-slate-400'}`}>
+                            {opt.labelRu}
+                          </div>
+                          <div className={`text-[10px] mt-1.5 leading-snug line-clamp-2 ${isSelected ? 'text-white/75' : 'text-slate-500'}`}>
+                            {opt.tagline}
+                          </div>
+                        </div>
                       </button>
                     );
                   })}
                 </div>
                 {!hiringRecommendation && (
-                  <p className="text-[11px] text-amber-400 mt-1">Решение не выбрано (выберите один из вариантов выше).</p>
+                  <p className="text-[11px] text-amber-400 mt-1.5">Решение не выбрано (выберите один из вариантов выше).</p>
                 )}
               </div>
+
+              {summaryError && (
+                <div className="p-3 bg-rose-950/60 border border-rose-800 rounded-lg flex items-center space-x-2 text-xs text-rose-200">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{summaryError}</span>
+                </div>
+              )}
+
+              {summarySavedSuccess && (
+                <div className="p-3 bg-emerald-950/60 border border-emerald-800 rounded-lg flex items-center space-x-2 text-xs text-emerald-200">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>Резюме и решение по найму успешно подтверждены экспертом.</span>
+                </div>
+              )}
 
               {!isFinalized && (
                 <div className="flex justify-end pt-2">
@@ -1705,10 +1992,23 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
           {/* Finalization Blockers Warning */}
           {finalizeError && (
-            <div className="p-4 bg-rose-950/60 border border-rose-800 rounded-xl space-y-2">
-              <div className="flex items-center space-x-2 text-xs font-bold text-rose-300">
-                <AlertCircle className="w-4 h-4 text-rose-400" />
-                <span>Финализация заблокирована:</span>
+            <div className="p-4 bg-rose-950/60 border border-rose-800 rounded-xl space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2 text-xs font-bold text-rose-300">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>Финализация заблокирована:</span>
+                </div>
+                {finalizeError.includes('не оценен человеком') && !isFinalized && (
+                  <button
+                    type="button"
+                    onClick={handleConfirmAllAssessments}
+                    disabled={isConfirmingAll}
+                    className="flex items-center space-x-1.5 px-3 py-1 bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold rounded-lg shadow transition cursor-pointer"
+                  >
+                    {isConfirmingAll ? <Loader2 className="w-3 h-3 animate-spin" /> : <ShieldCheck className="w-3 h-3" />}
+                    <span>Подтвердить все не оценённые вопросы</span>
+                  </button>
+                )}
               </div>
               <div className="text-xs text-rose-200 whitespace-pre-line leading-relaxed pl-6">
                 • {finalizeError}

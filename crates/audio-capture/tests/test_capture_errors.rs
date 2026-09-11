@@ -1,14 +1,14 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use tempfile::tempdir;
-use ringbuf::traits::{Producer, Split};
-use ringbuf::HeapRb;
 use audio_capture::{
     capture::{run_capture_worker, CaptureWorkerConfig},
     clock::MonotonicInterviewClock,
     spool::AudioSpoolManager,
     TrackType,
 };
+use ringbuf::traits::{Producer, Split};
+use ringbuf::HeapRb;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use tempfile::tempdir;
 
 #[test]
 fn test_ringbuffer_overflow_surfaced_in_stats_and_manifest() {
@@ -36,7 +36,6 @@ fn test_ringbuffer_overflow_surfaced_in_stats_and_manifest() {
     let mut dropped_count = 0u64;
     for _ in 0..2000 {
         if producer.try_push(0.1).is_err() {
-
             dropped_count += 1;
         }
     }
@@ -63,9 +62,15 @@ fn test_ringbuffer_overflow_surfaced_in_stats_and_manifest() {
     std::thread::sleep(std::time::Duration::from_millis(50));
     is_running.store(false, Ordering::SeqCst);
 
-    let stats = worker_handle.join().unwrap().expect("Worker should complete with overflow recorded");
+    let stats = worker_handle
+        .join()
+        .unwrap()
+        .expect("Worker should complete with overflow recorded");
     assert_eq!(stats.dropped_samples, dropped_count);
-    assert!(!stats.gaps.is_empty(), "Manifest must record AudioGap for overflow");
+    assert!(
+        !stats.gaps.is_empty(),
+        "Manifest must record AudioGap for overflow"
+    );
     assert!(stats.gaps[0].reason.contains("Ring buffer overflow"));
 }
 
@@ -115,5 +120,8 @@ fn test_disk_failure_causes_worker_error() {
     is_running.store(false, Ordering::SeqCst);
 
     let result = worker_handle.join().unwrap();
-    assert!(result.is_err(), "Worker must return Err on disk failure, not silent success!");
+    assert!(
+        result.is_err(),
+        "Worker must return Err on disk failure, not silent success!"
+    );
 }

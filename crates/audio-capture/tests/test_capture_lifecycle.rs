@@ -1,14 +1,14 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tempfile::tempdir;
-use ringbuf::traits::{Producer, Split};
-use ringbuf::HeapRb;
 use audio_capture::{
     capture::{run_capture_worker, CaptureWorkerConfig},
     clock::MonotonicInterviewClock,
     spool::AudioSpoolManager,
     TrackType,
 };
+use ringbuf::traits::{Producer, Split};
+use ringbuf::HeapRb;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tempfile::tempdir;
 
 #[test]
 fn test_stop_before_full_chunk_flushes_tail_and_exact_duration() {
@@ -57,16 +57,27 @@ fn test_stop_before_full_chunk_flushes_tail_and_exact_duration() {
 
     // Stop recording
     is_running.store(false, Ordering::SeqCst);
-    let stats = worker_handle.join().unwrap().expect("Worker should finish successfully");
+    let stats = worker_handle
+        .join()
+        .unwrap()
+        .expect("Worker should finish successfully");
 
     // Assertions
-    assert_eq!(stats.total_chunks, 1, "Must flush remaining tail as 1 chunk");
+    assert_eq!(
+        stats.total_chunks, 1,
+        "Must flush remaining tail as 1 chunk"
+    );
     assert_eq!(stats.total_samples, 5600, "Must count exact total samples");
-    assert_eq!(stats.total_duration_ms, 350, "Total duration must be 350ms, NOT 1000ms!");
+    assert_eq!(
+        stats.total_duration_ms, 350,
+        "Total duration must be 350ms, NOT 1000ms!"
+    );
     assert_eq!(stats.dropped_samples, 0);
 
     // Verify spool
-    let report = spool.verify_track_spool("test-lifecycle-1", TrackType::Interviewer).unwrap();
+    let report = spool
+        .verify_track_spool("test-lifecycle-1", TrackType::Interviewer)
+        .unwrap();
     assert!(report.is_valid);
     assert_eq!(report.total_chunks_found, 1);
     assert_eq!(report.verified_chunks, 1);
@@ -118,13 +129,21 @@ fn test_stop_after_partial_second_chunk() {
 
     // Stop recording
     is_running.store(false, Ordering::SeqCst);
-    let stats = worker_handle.join().unwrap().expect("Worker should finish successfully");
+    let stats = worker_handle
+        .join()
+        .unwrap()
+        .expect("Worker should finish successfully");
 
     assert_eq!(stats.total_chunks, 2);
     assert_eq!(stats.total_samples, 24000);
-    assert_eq!(stats.total_duration_ms, 1500, "Total duration must be 1500ms, NOT 2000ms!");
+    assert_eq!(
+        stats.total_duration_ms, 1500,
+        "Total duration must be 1500ms, NOT 2000ms!"
+    );
 
-    let report = spool.verify_track_spool("test-lifecycle-2", TrackType::Candidate).unwrap();
+    let report = spool
+        .verify_track_spool("test-lifecycle-2", TrackType::Candidate)
+        .unwrap();
     assert!(report.is_valid);
     assert_eq!(report.total_chunks_found, 2);
 }

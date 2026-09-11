@@ -8,7 +8,6 @@ Covers requirements R2, R3, R7 from docs/remediation-plan.md:
 5. Human review creates an immutable HumanQuestionAssessment and does not mutate the AI proposal.
 6. Reading interview (GET) and exporting report uses calculate_interview_score.
 """
-import math
 import pytest
 from fastapi.testclient import TestClient
 
@@ -150,9 +149,9 @@ def test_reject_duplicate_criterion_id(sample_rubric):
 
 # --- 2. API Endpoint Tests for Review, Revision Verification and State Isolation ---
 
+from backend.api.app import get_repository
 from backend.db.database import Database
 from backend.db.repository import Repository
-from backend.api.app import get_repository
 
 
 @pytest.fixture

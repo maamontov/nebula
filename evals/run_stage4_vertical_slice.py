@@ -16,15 +16,15 @@ Verifies the complete end-to-end slice according to Section 10 of docs/implement
 12. Final 100-point score calculation and structured JSON export with audit trail.
 """
 
-import sys
-import os
-import time
-import json
-import uuid
-import tempfile
 import asyncio
+import os
 import subprocess
+import sys
+import tempfile
+import time
+import uuid
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,11 +32,12 @@ load_dotenv()
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from starlette.testclient import TestClient
+
+from backend.api import app as api_module
 from backend.db.database import Database
 from backend.db.repository import Repository
 from backend.workers.pipeline import PipelineWorker
-from backend.api import app as api_module
-from starlette.testclient import TestClient
 
 
 def generate_russian_speech_wav(text: str, output_wav_path: str) -> None:

@@ -13,6 +13,7 @@ import {
   getInterview,
   enqueueJob,
   setSegmentSpeakerRole,
+  getActiveSession,
 } from '../services/api';
 import { Square, Pause, Play, CheckCircle, MessageSquare, Quote, Sparkles, AlertTriangle, ExternalLink, Loader2, ArrowDown } from 'lucide-react';
 
@@ -45,6 +46,24 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
   const [showScrollBottomBtn, setShowScrollBottomBtn] = useState(false);
+
+  // Restore active session state on mount/reload
+  useEffect(() => {
+    getActiveSession()
+      .then((sessionInfo) => {
+        if (sessionInfo && sessionInfo.session_id === interviewId) {
+          if (sessionInfo.is_paused !== undefined) {
+            setIsPaused(sessionInfo.is_paused);
+          }
+          if (sessionInfo.elapsed_ms !== undefined && sessionInfo.elapsed_ms > 0) {
+            setElapsedSec(Math.floor(sessionInfo.elapsed_ms / 1000));
+          }
+        }
+      })
+      .catch((err) => {
+        console.warn('Could not restore live session active state:', err);
+      });
+  }, [interviewId]);
 
   const handleSetRole = async (segId: string, role: SpeakerRole) => {
     try {

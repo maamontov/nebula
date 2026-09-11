@@ -51,10 +51,14 @@ class TrackManifest(BaseModel):
     """
     Manifest sealed at the end of recording to verify all chunks were received.
     """
+    model_config = {"extra": "allow"}
+
     interview_id: str
     track_id: TrackType
-    capture_epoch: int
+    capture_epoch: int = Field(default=0, ge=0)
     total_chunks: int = Field(ge=0)
     total_duration_ms: int = Field(ge=0)
     is_sealed: bool = Field(default=False, description="True once Stop is called and upload is complete")
     gaps: list[AudioGap] = Field(default_factory=list)
+    total_samples: int = Field(default=0, ge=0)
+    dropped_samples: int = Field(default=0, ge=0)

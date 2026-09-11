@@ -48,9 +48,21 @@ fn test_stateful_converter_chunk_invariance() {
     out3.extend(conv3.flush());
 
     // Invariant 1: Exactly 16,000 samples for 1 second of 16kHz audio
-    assert_eq!(out1.len(), 16000, "Full block output must match exactly 16000 samples");
-    assert_eq!(out2.len(), 16000, "Chunked output must match exactly 16000 samples");
-    assert_eq!(out3.len(), 16000, "Irregular chunked output must match exactly 16000 samples");
+    assert_eq!(
+        out1.len(),
+        16000,
+        "Full block output must match exactly 16000 samples"
+    );
+    assert_eq!(
+        out2.len(),
+        16000,
+        "Chunked output must match exactly 16000 samples"
+    );
+    assert_eq!(
+        out3.len(),
+        16000,
+        "Irregular chunked output must match exactly 16000 samples"
+    );
 
     // Invariant 2: Sample-by-sample difference between chunked and single block must be negligible (< 1e-4)
     for i in 0..16000 {
@@ -59,12 +71,18 @@ fn test_stateful_converter_chunk_invariance() {
         assert!(
             diff2 < 1e-4,
             "Sample mismatch at index {}: out1={} out2={} diff={}",
-            i, out1[i], out2[i], diff2
+            i,
+            out1[i],
+            out2[i],
+            diff2
         );
         assert!(
             diff3 < 1e-4,
             "Sample mismatch at index {}: out1={} out3={} diff={}",
-            i, out1[i], out3[i], diff3
+            i,
+            out1[i],
+            out3[i],
+            diff3
         );
     }
 }

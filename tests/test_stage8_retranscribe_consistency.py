@@ -4,8 +4,6 @@ Tests for Stage 8: Batch Retranscription, Revision Consistency, and Optimistic C
 """
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,14 +12,13 @@ from fastapi.testclient import TestClient
 from backend.api.app import app
 from backend.core.evidence_validator import validate_proposal
 from backend.db.database import Database
-from backend.db.repository import Repository, RepositoryConflictError
+from backend.db.repository import Repository
 from backend.workers.pipeline import PipelineWorker
 from contracts.audio import TrackType
 from contracts.domain import (
     AssessmentProposal,
     CriterionScoreProposal,
     EvidenceRef,
-    InterviewStatus,
     TranscriptRevision,
     TranscriptSegment,
 )
@@ -423,8 +420,6 @@ async def test_failed_batch_does_not_switch_active_transcript(repo: Repository):
 
     worker = PipelineWorker(repo, stt_adapter=mock_failing_stt)
 
-    # Save audio chunk record with invalid file path
-    chunk_file = Path("/tmp/nonexistent-audio-chunk.chunk")
     repo.enqueue_job(
         job_id="job-failing-batch-1",
         job_type="BATCH_RETRANSCRIBE",
@@ -529,16 +524,14 @@ def test_update_segment_speaker_role_fallback_to_actual_revision(client: TestCli
     )
     repo.set_active_transcript_revision(interview_id, "trans-rev-2")
 
-    # Call speaker-role endpoint without specifying revision_id
+    # Call speaker-role endpoint without specifying revision_id: must fail with 404 because seg-target-1 is not in active revision trans-rev-2
     resp = client.post(
         f"/api/v1/interviews/{interview_id}/segments/seg-target-1/speaker-role",
         json={"speaker_role": "candidate"},
     )
-    assert resp.status_code == 200, resp.text
-    data = resp.json()
-    assert data["status"] == "ok"
-    assert data["segment"]["speaker_role"] == "candidate"
-    assert data["segment"]["revision_id"] == "trans-rev-1"
+    assert resp.status_code == 404
+    assert "not found in active revision" in resp.text
+
 
 
 @pytest.mark.asyncio

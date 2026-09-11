@@ -5,16 +5,16 @@ End-to-end integration test for the Desktop Capture -> Server Ingestion -> STT P
 from __future__ import annotations
 
 import hashlib
-import json
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 from fastapi.testclient import TestClient
 
+from backend.adapters.stt import STTTranscriptionResult
 from backend.api.app import app
 from backend.db.database import Database
 from backend.db.repository import Repository
 from backend.workers.pipeline import PipelineWorker
-from backend.adapters.stt import STTTranscriptionResult
 
 
 @pytest.fixture

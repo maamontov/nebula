@@ -1,8 +1,9 @@
+import pytest
 from fastapi.testclient import TestClient
+
 from backend.api.app import app, get_repository
 from backend.db.database import Database
 from backend.db.repository import Repository
-import pytest
 
 
 @pytest.fixture

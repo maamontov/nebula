@@ -1,5 +1,5 @@
-use std::time::Instant;
 use crate::types::TrackType;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct MonotonicInterviewClock {
@@ -100,8 +100,10 @@ impl MonotonicInterviewClock {
         sample_rate: u32,
     ) -> (u64, u64) {
         let track_offset = self.track_start_offset_ms(track).unwrap_or(0);
-        let start_time_ms = track_offset + Self::samples_to_ms(sample_offset_within_track, sample_rate);
-        let end_time_ms = track_offset + Self::samples_to_ms(sample_offset_within_track + chunk_samples, sample_rate);
+        let start_time_ms =
+            track_offset + Self::samples_to_ms(sample_offset_within_track, sample_rate);
+        let end_time_ms = track_offset
+            + Self::samples_to_ms(sample_offset_within_track + chunk_samples, sample_rate);
         (start_time_ms, end_time_ms)
     }
 
@@ -152,3 +154,92 @@ pub struct DriftMetrics {
     pub inter_track_skew_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct SharedInterviewClock(std::sync::Arc<std::sync::RwLock<MonotonicInterviewClock>>);
+
+impl SharedInterviewClock {
+    pub fn new(epoch: u32) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(
+            MonotonicInterviewClock::new(epoch),
+        )))
+    }
+
+    pub fn from_clock(clock: MonotonicInterviewClock) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(clock)))
+    }
+
+    pub fn epoch(&self) -> u32 {
+        self.0.read().unwrap().epoch()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.0.read().unwrap().is_paused()
+    }
+
+    pub fn pause(&self) -> u64 {
+        self.0.write().unwrap().pause()
+    }
+
+    pub fn resume(&self) -> u32 {
+        self.0.write().unwrap().resume()
+    }
+
+    pub fn elapsed_ms(&self) -> u64 {
+        self.0.read().unwrap().elapsed_ms()
+    }
+
+    pub fn mark_track_start(&self, track: TrackType) -> u64 {
+        self.0.write().unwrap().mark_track_start(track)
+    }
+
+    pub fn set_track_start_offset_ms(&self, track: TrackType, offset_ms: u64) {
+        self.0
+            .write()
+            .unwrap()
+            .set_track_start_offset_ms(track, offset_ms);
+    }
+
+    pub fn track_start_offset_ms(&self, track: TrackType) -> Option<u64> {
+        self.0.read().unwrap().track_start_offset_ms(track)
+    }
+
+    pub fn calculate_chunk_timeline(
+        &self,
+        track: TrackType,
+        sample_offset_within_track: u64,
+        chunk_samples: u64,
+        sample_rate: u32,
+    ) -> (u64, u64) {
+        self.0.read().unwrap().calculate_chunk_timeline(
+            track,
+            sample_offset_within_track,
+            chunk_samples,
+            sample_rate,
+        )
+    }
+
+    pub fn calculate_timeline_skew_ms(
+        &self,
+        samples_interviewer: u64,
+        rate_interviewer: u32,
+        samples_candidate: u64,
+        rate_candidate: u32,
+    ) -> i64 {
+        self.0.read().unwrap().calculate_timeline_skew_ms(
+            samples_interviewer,
+            rate_interviewer,
+            samples_candidate,
+            rate_candidate,
+        )
+    }
+
+    pub fn snapshot(&self) -> MonotonicInterviewClock {
+        self.0.read().unwrap().clone()
+    }
+}
+
+impl From<MonotonicInterviewClock> for SharedInterviewClock {
+    fn from(clock: MonotonicInterviewClock) -> Self {
+        Self::from_clock(clock)
+    }
+}

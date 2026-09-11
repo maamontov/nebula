@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_DB_PATH = os.getenv("NEBULA_DB_PATH", str(PROJECT_ROOT / "data" / "nebula.db"))

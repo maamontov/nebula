@@ -1,9 +1,9 @@
+use audio_capture::AudioChunkMetadata;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use audio_capture::AudioChunkMetadata;
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +99,8 @@ impl SessionUploader {
                     &client,
                     &progress,
                     &is_running,
-                ).await;
+                )
+                .await;
 
                 if let Some(true) = sent_any {
                     // Reset backoff on progress
@@ -126,7 +127,8 @@ impl SessionUploader {
                 &client,
                 &progress,
                 &is_running,
-            ).await;
+            )
+            .await;
 
             let mut p = progress.lock().await;
             p.is_active = false;
@@ -244,7 +246,10 @@ impl SessionUploader {
                     payload_hex: hex::encode(&chunk_bytes),
                 };
 
-                let url = format!("{}/api/v1/interviews/{}/audio/chunks", backend_url, session_id);
+                let url = format!(
+                    "{}/api/v1/interviews/{}/audio/chunks",
+                    backend_url, session_id
+                );
                 let res = client.post(&url).json(&payload).send().await;
 
                 {
@@ -271,20 +276,67 @@ impl SessionUploader {
                             any_uploaded = true;
                         } else if status == reqwest::StatusCode::NOT_FOUND {
                             // Interview was deleted! Stop uploader permanently for this session
-                            eprintln!("[Uploader] Interview {} not found (404). Terminating uploader.", session_id);
+                            eprintln!(
+                                "[Uploader] Interview {} not found (404). Terminating uploader.",
+                                session_id
+                            );
                             is_running.store(false, Ordering::SeqCst);
                             let mut p = progress.lock().await;
                             p.last_error = Some("Интервью удалено на сервере (404)".into());
                             return None;
-                        } else if status == reqwest::StatusCode::CONFLICT {
+                        } else if status == reqwest::StatusCode::BAD_REQUEST
+                            || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+                            || status == reqwest::StatusCode::CONFLICT
+                        {
+                            // Terminal chunk payload error (400, 422, 409): write .err atomically and mark failed
                             let err_text = resp.text().await.unwrap_or_default();
-                            eprintln!("[Uploader] Conflict 409 on chunk {}: {}", metadata.sequence, err_text);
-                            let _ = std::fs::write(&err_path, &err_text);
+                            eprintln!(
+                                "[Uploader] Terminal failure HTTP {} on chunk {}: {}",
+                                status, metadata.sequence, err_text
+                            );
+                            let err_tmp = track_dir.join(format!("{}.err.tmp", seq_prefix));
+                            if let Ok(_) = std::fs::write(&err_tmp, &err_text) {
+                                let _ = std::fs::rename(&err_tmp, &err_path);
+                            }
                             total_failed += 1;
                             let mut p = progress.lock().await;
-                            p.last_error = Some(format!("Конфликт чанка: {}", err_text));
+                            p.last_error = Some(format!(
+                                "Ошибка валидации чанка (HTTP {}): {}",
+                                status, err_text
+                            ));
+                        } else if status == reqwest::StatusCode::UNAUTHORIZED
+                            || status == reqwest::StatusCode::FORBIDDEN
+                        {
+                            // Auth/Permission error: stop delivery temporarily without corrupting chunk
+                            let err_msg = format!(
+                                "Ошибка авторизации (HTTP {}): проверьте конфигурацию",
+                                status
+                            );
+                            eprintln!("[Uploader] {}", err_msg);
+                            let mut p = progress.lock().await;
+                            p.last_error = Some(err_msg);
+                            return None;
+                        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                            // Rate limit: check Retry-After header
+                            let retry_secs = resp
+                                .headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|h| h.to_str().ok())
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(2);
+                            let err_msg =
+                                format!("Превышен лимит (HTTP 429), повтор через {}с", retry_secs);
+                            eprintln!("[Uploader] {}", err_msg);
+                            let mut p = progress.lock().await;
+                            p.last_error = Some(err_msg);
+                            tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+                            return None;
                         } else {
-                            let err_msg = format!("Server error HTTP {}: seq {}", status, metadata.sequence);
+                            // 408, 5xx or other transient error: backoff and retry
+                            let err_msg = format!(
+                                "Временная ошибка сервера HTTP {}: seq {}",
+                                status, metadata.sequence
+                            );
                             let mut p = progress.lock().await;
                             p.last_error = Some(err_msg);
                             return None;
@@ -317,7 +369,7 @@ impl SessionUploader {
     pub async fn stop(&mut self) {
         self.is_running.store(false, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
         }
     }
 }

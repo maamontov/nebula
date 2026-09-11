@@ -22,15 +22,15 @@ Verifies:
 
 import asyncio
 import os
+import shutil
+import sqlite3
 import sys
+import tempfile
 import time
 import uuid
-import json
-import sqlite3
-import tempfile
-import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -38,12 +38,12 @@ load_dotenv()
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from starlette.testclient import TestClient
+
+from backend.api import app as api_module
 from backend.db.database import Database
 from backend.db.repository import Repository
 from backend.workers.pipeline import PipelineWorker
-from backend.adapters.resilient_llm import ResilientLLMAdapter
-from backend.api import app as api_module
-from starlette.testclient import TestClient
 from contracts.domain import InterviewStatus
 
 
@@ -108,7 +108,7 @@ def run_stage7_acceptance():
         assert integ_resp.json()["integrity_ok"] is True
         print(f"  ✓ Database initialized at: {db_path}")
         print(f"  ✓ Audio spool directory: {tmp_spool_root}")
-        print(f"  ✓ Initial PRAGMA integrity_check: OK")
+        print("  ✓ Initial PRAGMA integrity_check: OK")
 
         # -------------------------------------------------------------
         # STEP 2: Fault Injection & Crash Recovery (Lease Expiry)
@@ -148,7 +148,7 @@ def run_stage7_acceptance():
         # Simulate Crash of Worker 1:
         # Worker 1 dies abruptly without completing or releasing the job.
         # We manually expire the lease timestamp (locked_until backdated 10 minutes).
-        past_dt = datetime.now(timezone.utc) - timedelta(minutes=10)
+        past_dt = datetime.now(UTC) - timedelta(minutes=10)
         with db.transaction() as conn:
             conn.execute(
                 "UPDATE jobs SET locked_until = ? WHERE id = ?",
@@ -261,7 +261,7 @@ def run_stage7_acceptance():
 
         # Verify physical spool directory is completely erased
         assert not spool_interview_dir.exists()
-        print(f"  ✓ Confirmed physical disk spool directory was purged: {spool_interview_dir.exists() == False}")
+        print(f"  ✓ Confirmed physical disk spool directory was purged: {not spool_interview_dir.exists()}")
 
         # -------------------------------------------------------------
         # STEP 5: Late Worker Protection (Anti-Resurrection Invariant)
@@ -320,12 +320,12 @@ def run_stage7_acceptance():
         print("STAGE 7 RELIABILITY & PILOT READINESS ACCEPTANCE SUMMARY:")
         print("=" * 80)
         print(f"  • Total Duration:                  {elapsed:.2f}s")
-        print(f"  • Lease Recovery & Crash Re-claim: 100% (Passed)")
-        print(f"  • Hot WAL Online Backup:           100% (PRAGMA integrity_check == 'ok')")
-        print(f"  • Privacy Cascade DB Purge:        100% (All 6 child tables purged)")
-        print(f"  • Disk Audio Spool Deletion:       100% (Directory wiped)")
-        print(f"  • Late Worker Anti-Resurrection:   100% (0 zombie/orphan records)")
-        print(f"  • Result:                          ALL INVARIANTS SATISFIED (STAGE 7 READY)")
+        print("  • Lease Recovery & Crash Re-claim: 100% (Passed)")
+        print("  • Hot WAL Online Backup:           100% (PRAGMA integrity_check == 'ok')")
+        print("  • Privacy Cascade DB Purge:        100% (All 6 child tables purged)")
+        print("  • Disk Audio Spool Deletion:       100% (Directory wiped)")
+        print("  • Late Worker Anti-Resurrection:   100% (0 zombie/orphan records)")
+        print("  • Result:                          ALL INVARIANTS SATISFIED (STAGE 7 READY)")
         print("=" * 80)
 
     finally:

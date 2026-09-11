@@ -4,9 +4,9 @@ mod commands;
 mod uploader;
 
 use commands::{
-    get_active_session, get_audio_levels, get_system_config, get_upload_progress,
-    list_audio_devices, pause_capture, resume_capture, start_capture, stop_capture,
-    verify_spool, AppState,
+    get_active_session, get_audio_levels, get_session_manifests, get_system_config,
+    get_upload_progress, list_audio_devices, pause_capture, resume_capture, resume_spool_upload,
+    start_capture, stop_capture, verify_spool, AppState,
 };
 
 fn main() {
@@ -22,7 +22,9 @@ fn main() {
             get_upload_progress,
             get_active_session,
             get_system_config,
-            verify_spool
+            verify_spool,
+            resume_spool_upload,
+            get_session_manifests
         ])
         .run(tauri::generate_context!())
         .expect("error while running nebula desktop application");

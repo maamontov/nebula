@@ -102,9 +102,8 @@ def calculate_interview_score(
                     f"Duplicate criterion '{cs.criterion_id}' in assessment for question '{question.id}'."
                 )
             seen_criterion_ids.add(cs.criterion_id)
-            if cs.score is not None:
-                if math.isnan(cs.score) or math.isinf(cs.score):
-                    raise ScoringError(f"Score for criterion '{cs.criterion_id}' must be a finite number.")
+            if cs.score is not None and (math.isnan(cs.score) or math.isinf(cs.score)):
+                raise ScoringError(f"Score for criterion '{cs.criterion_id}' must be a finite number.")
             user_scores_map[cs.criterion_id] = cs
 
         crit_norm_scores: dict[str, float | None] = {}

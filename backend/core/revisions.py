@@ -7,9 +7,9 @@ Adheres strictly to docs/implementation-plan.md Section 6 & 10:
 - Flags dependent proposals as stale (is_stale=True) without destroying human overrides.
 """
 
-from dataclasses import dataclass, field
-from typing import Any
 import difflib
+from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass

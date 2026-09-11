@@ -1,12 +1,12 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Host, Stream};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::HeapRb;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
-use crate::clock::MonotonicInterviewClock;
+use crate::clock::{MonotonicInterviewClock, SharedInterviewClock};
 use crate::resampler::{f32_to_pcm_s16le, StatefulAudioConverter};
 use crate::spool::AudioSpoolManager;
 use crate::types::{AudioFormat, AudioGap, CaptureStats, TrackType};
@@ -18,24 +18,28 @@ pub struct DeviceInfo {
 }
 
 pub fn list_input_devices(host: &Host) -> Result<Vec<DeviceInfo>> {
-    let default_name = host.default_input_device().and_then(|d| d.name().ok());
     let mut devices = Vec::new();
-    for dev in host.input_devices()? {
-        if let Ok(name) = dev.name() {
-            let is_default = default_name.as_ref().map(|d| d == &name).unwrap_or(false);
-            devices.push(DeviceInfo { name, is_default });
+    let default_device = host.default_input_device().and_then(|d| d.name().ok());
+    if let Ok(input_devices) = host.input_devices() {
+        for dev in input_devices {
+            if let Ok(name) = dev.name() {
+                let is_default = default_device.as_deref() == Some(&name);
+                devices.push(DeviceInfo { name, is_default });
+            }
         }
     }
     Ok(devices)
 }
 
 pub fn list_output_devices(host: &Host) -> Result<Vec<DeviceInfo>> {
-    let default_name = host.default_output_device().and_then(|d| d.name().ok());
     let mut devices = Vec::new();
-    for dev in host.output_devices()? {
-        if let Ok(name) = dev.name() {
-            let is_default = default_name.as_ref().map(|d| d == &name).unwrap_or(false);
-            devices.push(DeviceInfo { name, is_default });
+    let default_device = host.default_output_device().and_then(|d| d.name().ok());
+    if let Ok(output_devices) = host.output_devices() {
+        for dev in output_devices {
+            if let Ok(name) = dev.name() {
+                let is_default = default_device.as_deref() == Some(&name);
+                devices.push(DeviceInfo { name, is_default });
+            }
         }
     }
     Ok(devices)
@@ -53,20 +57,20 @@ pub struct CaptureWorkerConfig {
 
 #[derive(Debug, Default)]
 pub struct AudioLevelMetrics {
-    rms_bits: std::sync::atomic::AtomicU32,
-    peak_bits: std::sync::atomic::AtomicU32,
+    rms: AtomicU64,
+    peak: AtomicU64,
 }
 
 impl AudioLevelMetrics {
     pub fn update(&self, rms: f32, peak: f32) {
-        self.rms_bits.store(rms.to_bits(), Ordering::Relaxed);
-        self.peak_bits.store(peak.to_bits(), Ordering::Relaxed);
+        self.rms.store(rms.to_bits() as u64, Ordering::Relaxed);
+        self.peak.store(peak.to_bits() as u64, Ordering::Relaxed);
     }
 
     pub fn get(&self) -> (f32, f32) {
         (
-            f32::from_bits(self.rms_bits.load(Ordering::Relaxed)),
-            f32::from_bits(self.peak_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.rms.load(Ordering::Relaxed) as u32),
+            f32::from_bits(self.peak.load(Ordering::Relaxed) as u32),
         )
     }
 }
@@ -77,7 +81,7 @@ impl AudioLevelMetrics {
 pub fn run_capture_worker<C: Consumer<Item = f32>>(
     consumer: C,
     spool_manager: Arc<AudioSpoolManager>,
-    clock: MonotonicInterviewClock,
+    clock: impl Into<SharedInterviewClock>,
     config: CaptureWorkerConfig,
     is_running: Arc<AtomicBool>,
     dropped_samples: Arc<AtomicU64>,
@@ -96,22 +100,103 @@ pub fn run_capture_worker<C: Consumer<Item = f32>>(
 pub fn run_capture_worker_extended<C: Consumer<Item = f32>>(
     mut consumer: C,
     spool_manager: Arc<AudioSpoolManager>,
-    clock: MonotonicInterviewClock,
+    clock: impl Into<SharedInterviewClock>,
     config: CaptureWorkerConfig,
     is_running: Arc<AtomicBool>,
     dropped_samples: Arc<AtomicU64>,
     level_metrics: Option<Arc<AudioLevelMetrics>>,
 ) -> Result<CaptureStats> {
+    let clock = clock.into();
     let target_sample_rate = 16000u32;
-    let samples_per_chunk = ((target_sample_rate as u64 * config.chunk_duration_ms) / 1000) as usize;
-    let mut converter = StatefulAudioConverter::new(config.channels, config.sample_rate, target_sample_rate);
+    let samples_per_chunk =
+        ((target_sample_rate as u64 * config.chunk_duration_ms) / 1000) as usize;
+    let mut converter =
+        StatefulAudioConverter::new(config.channels, config.sample_rate, target_sample_rate);
 
     let mut chunk_accumulator = Vec::with_capacity(samples_per_chunk * 2);
     let mut chunk_sequence = 0u64;
     let mut total_target_samples = 0u64;
     let mut raw_samples_buf = Vec::with_capacity(4096);
+    let mut was_paused = false;
 
     while is_running.load(Ordering::Relaxed) {
+        if clock.is_paused() {
+            if !was_paused {
+                // Pause boundary reached: drain available samples and flush pending accumulator
+                raw_samples_buf.clear();
+                while let Some(sample) = consumer.try_pop() {
+                    raw_samples_buf.push(sample);
+                }
+                if !raw_samples_buf.is_empty() {
+                    let converted = converter.process_input(&raw_samples_buf);
+                    chunk_accumulator.extend(converted);
+                }
+                while chunk_accumulator.len() >= samples_per_chunk {
+                    let chunk_samples: Vec<f32> =
+                        chunk_accumulator.drain(..samples_per_chunk).collect();
+                    let pcm_s16le_bytes = f32_to_pcm_s16le(&chunk_samples);
+
+                    let (start_time_ms, end_time_ms) = clock.calculate_chunk_timeline(
+                        config.track_id,
+                        total_target_samples,
+                        chunk_samples.len() as u64,
+                        target_sample_rate,
+                    );
+
+                    spool_manager.write_chunk(
+                        &config.interview_id,
+                        config.track_id,
+                        clock.epoch(),
+                        chunk_sequence,
+                        start_time_ms,
+                        end_time_ms,
+                        target_sample_rate,
+                        1,
+                        chunk_samples.len() as u64,
+                        AudioFormat::PcmS16Le,
+                        &pcm_s16le_bytes,
+                    )?;
+
+                    total_target_samples += chunk_samples.len() as u64;
+                    chunk_sequence += 1;
+                }
+                if !chunk_accumulator.is_empty() {
+                    let tail_samples_len = chunk_accumulator.len() as u64;
+                    let pcm_s16le_bytes = f32_to_pcm_s16le(&chunk_accumulator);
+
+                    let (start_time_ms, end_time_ms) = clock.calculate_chunk_timeline(
+                        config.track_id,
+                        total_target_samples,
+                        tail_samples_len,
+                        target_sample_rate,
+                    );
+
+                    spool_manager.write_chunk(
+                        &config.interview_id,
+                        config.track_id,
+                        clock.epoch(),
+                        chunk_sequence,
+                        start_time_ms,
+                        end_time_ms,
+                        target_sample_rate,
+                        1,
+                        tail_samples_len,
+                        AudioFormat::PcmS16Le,
+                        &pcm_s16le_bytes,
+                    )?;
+
+                    total_target_samples += tail_samples_len;
+                    chunk_sequence += 1;
+                    chunk_accumulator.clear();
+                }
+                was_paused = true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        } else {
+            was_paused = false;
+        }
+
         raw_samples_buf.clear();
         while let Some(sample) = consumer.try_pop() {
             raw_samples_buf.push(sample);
@@ -128,7 +213,8 @@ pub fn run_capture_worker_extended<C: Consumer<Item = f32>>(
             chunk_accumulator.extend(converted);
 
             while chunk_accumulator.len() >= samples_per_chunk {
-                let chunk_samples: Vec<f32> = chunk_accumulator.drain(..samples_per_chunk).collect();
+                let chunk_samples: Vec<f32> =
+                    chunk_accumulator.drain(..samples_per_chunk).collect();
                 let pcm_s16le_bytes = f32_to_pcm_s16le(&chunk_samples);
 
                 let (start_time_ms, end_time_ms) = clock.calculate_chunk_timeline(
@@ -138,19 +224,23 @@ pub fn run_capture_worker_extended<C: Consumer<Item = f32>>(
                     target_sample_rate,
                 );
 
-                spool_manager.write_chunk(
-                    &config.interview_id,
-                    config.track_id,
-                    clock.epoch(),
-                    chunk_sequence,
-                    start_time_ms,
-                    end_time_ms,
-                    target_sample_rate,
-                    1,
-                    chunk_samples.len() as u64,
-                    AudioFormat::PcmS16Le,
-                    &pcm_s16le_bytes,
-                ).with_context(|| format!("Failed to write chunk seq {} to spool", chunk_sequence))?;
+                spool_manager
+                    .write_chunk(
+                        &config.interview_id,
+                        config.track_id,
+                        clock.epoch(),
+                        chunk_sequence,
+                        start_time_ms,
+                        end_time_ms,
+                        target_sample_rate,
+                        1,
+                        chunk_samples.len() as u64,
+                        AudioFormat::PcmS16Le,
+                        &pcm_s16le_bytes,
+                    )
+                    .with_context(|| {
+                        format!("Failed to write chunk seq {} to spool", chunk_sequence)
+                    })?;
 
                 total_target_samples += chunk_samples.len() as u64;
                 chunk_sequence += 1;
@@ -190,19 +280,26 @@ pub fn run_capture_worker_extended<C: Consumer<Item = f32>>(
             target_sample_rate,
         );
 
-        spool_manager.write_chunk(
-            &config.interview_id,
-            config.track_id,
-            clock.epoch(),
-            chunk_sequence,
-            start_time_ms,
-            end_time_ms,
-            target_sample_rate,
-            1,
-            chunk_samples.len() as u64,
-            AudioFormat::PcmS16Le,
-            &pcm_s16le_bytes,
-        ).with_context(|| format!("Failed to write drained chunk seq {} to spool", chunk_sequence))?;
+        spool_manager
+            .write_chunk(
+                &config.interview_id,
+                config.track_id,
+                clock.epoch(),
+                chunk_sequence,
+                start_time_ms,
+                end_time_ms,
+                target_sample_rate,
+                1,
+                chunk_samples.len() as u64,
+                AudioFormat::PcmS16Le,
+                &pcm_s16le_bytes,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to write drained chunk seq {} to spool",
+                    chunk_sequence
+                )
+            })?;
 
         total_target_samples += chunk_samples.len() as u64;
         chunk_sequence += 1;
@@ -220,19 +317,26 @@ pub fn run_capture_worker_extended<C: Consumer<Item = f32>>(
             target_sample_rate,
         );
 
-        spool_manager.write_chunk(
-            &config.interview_id,
-            config.track_id,
-            clock.epoch(),
-            chunk_sequence,
-            start_time_ms,
-            end_time_ms,
-            target_sample_rate,
-            1,
-            tail_samples_len,
-            AudioFormat::PcmS16Le,
-            &pcm_s16le_bytes,
-        ).with_context(|| format!("Failed to write final partial chunk seq {} to spool", chunk_sequence))?;
+        spool_manager
+            .write_chunk(
+                &config.interview_id,
+                config.track_id,
+                clock.epoch(),
+                chunk_sequence,
+                start_time_ms,
+                end_time_ms,
+                target_sample_rate,
+                1,
+                tail_samples_len,
+                AudioFormat::PcmS16Le,
+                &pcm_s16le_bytes,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to write final partial chunk seq {} to spool",
+                    chunk_sequence
+                )
+            })?;
 
         total_target_samples += tail_samples_len;
         chunk_sequence += 1;
@@ -240,7 +344,8 @@ pub fn run_capture_worker_extended<C: Consumer<Item = f32>>(
     }
 
     // 5. Calculate total duration based on exact sample count (NOT full chunk count * chunk_duration)
-    let total_duration_ms = MonotonicInterviewClock::samples_to_ms(total_target_samples, target_sample_rate);
+    let total_duration_ms =
+        MonotonicInterviewClock::samples_to_ms(total_target_samples, target_sample_rate);
     let dropped = dropped_samples.load(Ordering::SeqCst);
 
     let mut gaps = Vec::new();
@@ -253,16 +358,18 @@ pub fn run_capture_worker_extended<C: Consumer<Item = f32>>(
         });
     }
 
-    spool_manager.seal_manifest_extended(
-        &config.interview_id,
-        config.track_id,
-        clock.epoch(),
-        chunk_sequence,
-        total_duration_ms,
-        total_target_samples,
-        dropped,
-        gaps.clone(),
-    ).with_context(|| "Failed to seal track manifest")?;
+    spool_manager
+        .seal_manifest_extended(
+            &config.interview_id,
+            config.track_id,
+            clock.epoch(),
+            chunk_sequence,
+            total_duration_ms,
+            total_target_samples,
+            dropped,
+            gaps.clone(),
+        )
+        .with_context(|| "Failed to seal track manifest")?;
 
     Ok(CaptureStats {
         interview_id: config.interview_id,
@@ -305,7 +412,8 @@ impl CaptureHandle {
             let (tx, rx) = std::sync::mpsc::channel();
             ctrl.send(StreamControlMsg::Pause(tx))
                 .map_err(|_| anyhow::anyhow!("Stream thread disconnected"))?;
-            rx.recv().map_err(|_| anyhow::anyhow!("Stream thread dropped ack"))??;
+            rx.recv()
+                .map_err(|_| anyhow::anyhow!("Stream thread dropped ack"))??;
         }
         Ok(())
     }
@@ -315,7 +423,8 @@ impl CaptureHandle {
             let (tx, rx) = std::sync::mpsc::channel();
             ctrl.send(StreamControlMsg::Resume(tx))
                 .map_err(|_| anyhow::anyhow!("Stream thread disconnected"))?;
-            rx.recv().map_err(|_| anyhow::anyhow!("Stream thread dropped ack"))??;
+            rx.recv()
+                .map_err(|_| anyhow::anyhow!("Stream thread dropped ack"))??;
         }
         Ok(())
     }
@@ -336,7 +445,9 @@ impl CaptureHandle {
 
         // 3. Join worker and propagate any I/O / worker errors
         let stats = match self.worker_thread.take() {
-            Some(th) => th.join().map_err(|_| anyhow::anyhow!("Capture worker thread panicked"))??,
+            Some(th) => th
+                .join()
+                .map_err(|_| anyhow::anyhow!("Capture worker thread panicked"))??,
             None => bail!("Capture worker was already joined"),
         };
 
@@ -363,10 +474,12 @@ pub fn start_device_capture(
     interview_id: String,
     track_id: TrackType,
     spool_manager: Arc<AudioSpoolManager>,
-    clock: MonotonicInterviewClock,
+    clock: impl Into<SharedInterviewClock>,
     chunk_duration_ms: u64,
 ) -> Result<CaptureHandle> {
-    let default_config = device.default_input_config()
+    let clock = clock.into();
+    let default_config = device
+        .default_input_config()
         .context("Failed to get default input config for device")?;
 
     let sample_rate = default_config.sample_rate().0;
@@ -397,15 +510,28 @@ pub fn start_device_capture(
     let device_clone = device.clone();
     let config_clone = default_config.clone();
 
+    let first_sample_f32 = Arc::new(AtomicBool::new(false));
+    let first_sample_f32_cb = first_sample_f32.clone();
+    let clock_f32_cb = clock.clone();
+
+    let first_sample_i16 = Arc::new(AtomicBool::new(false));
+    let first_sample_i16_cb = first_sample_i16.clone();
+    let clock_i16_cb = clock.clone();
+
     let (init_tx, init_rx) = std::sync::mpsc::channel();
     let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel::<StreamControlMsg>();
 
     let stream_thread = std::thread::spawn(move || {
         let stream_res: Result<Stream> = match sample_format {
-            cpal::SampleFormat::F32 => {
-                device_clone.build_input_stream(
+            cpal::SampleFormat::F32 => device_clone
+                .build_input_stream(
                     &config_clone.into(),
                     move |data: &[f32], _: &_| {
+                        if !data.is_empty() && !first_sample_f32_cb.swap(true, Ordering::SeqCst) {
+                            if clock_f32_cb.track_start_offset_ms(track_id).is_none() {
+                                clock_f32_cb.mark_track_start(track_id);
+                            }
+                        }
                         for &sample in data {
                             if producer.try_push(sample).is_err() {
                                 dropped_samples_cb.fetch_add(1, Ordering::Relaxed);
@@ -414,12 +540,17 @@ pub fn start_device_capture(
                     },
                     err_fn,
                     None,
-                ).map_err(|e| anyhow::anyhow!("Failed to build f32 input stream: {}", e))
-            }
-            cpal::SampleFormat::I16 => {
-                device_clone.build_input_stream(
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to build f32 input stream: {}", e)),
+            cpal::SampleFormat::I16 => device_clone
+                .build_input_stream(
                     &config_clone.into(),
                     move |data: &[i16], _: &_| {
+                        if !data.is_empty() && !first_sample_i16_cb.swap(true, Ordering::SeqCst) {
+                            if clock_i16_cb.track_start_offset_ms(track_id).is_none() {
+                                clock_i16_cb.mark_track_start(track_id);
+                            }
+                        }
                         for &sample in data {
                             let f_sample = sample as f32 / 32768.0;
                             if producer.try_push(f_sample).is_err() {
@@ -429,9 +560,12 @@ pub fn start_device_capture(
                     },
                     err_fn,
                     None,
-                ).map_err(|e| anyhow::anyhow!("Failed to build i16 input stream: {}", e))
-            }
-            _ => Err(anyhow::anyhow!("Unsupported sample format: {:?}", sample_format)),
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to build i16 input stream: {}", e)),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported sample format: {:?}",
+                sample_format
+            )),
         };
 
         let stream = match stream_res {
@@ -452,11 +586,15 @@ pub fn start_device_capture(
         while let Ok(msg) = ctrl_rx.recv() {
             match msg {
                 StreamControlMsg::Pause(ack) => {
-                    let res = stream.pause().map_err(|e| anyhow::anyhow!("Failed to pause stream: {}", e));
+                    let res = stream
+                        .pause()
+                        .map_err(|e| anyhow::anyhow!("Failed to pause stream: {}", e));
                     let _ = ack.send(res);
                 }
                 StreamControlMsg::Resume(ack) => {
-                    let res = stream.play().map_err(|e| anyhow::anyhow!("Failed to play stream: {}", e));
+                    let res = stream
+                        .play()
+                        .map_err(|e| anyhow::anyhow!("Failed to play stream: {}", e));
                     let _ = ack.send(res);
                 }
                 StreamControlMsg::Stop(ack) => {
@@ -469,8 +607,9 @@ pub fn start_device_capture(
         }
     });
 
-    init_rx.recv()
-        .map_err(|_| anyhow::anyhow!("Audio stream initialization thread terminated unexpectedly"))??;
+    init_rx.recv().map_err(|_| {
+        anyhow::anyhow!("Audio stream initialization thread terminated unexpectedly")
+    })??;
 
     let start_offset_ms = clock.track_start_offset_ms(track_id).unwrap_or(0);
     let config = CaptureWorkerConfig {
@@ -507,4 +646,3 @@ pub fn start_device_capture(
         level_metrics,
     })
 }
-

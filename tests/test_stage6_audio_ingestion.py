@@ -2,15 +2,13 @@ import hashlib
 import io
 import struct
 import wave
+
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.api.app import app, get_repository, get_trusted_spool_dir
-from backend.core.state_machine import transition_status, can_accept_new_chunks
 from backend.db.database import Database
 from backend.db.repository import Repository
-from contracts.domain import InterviewStatus
-from contracts.audio import AudioChunkMetadata, AudioFormat, TrackManifest, TrackType
 
 
 @pytest.fixture

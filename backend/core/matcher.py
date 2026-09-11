@@ -7,9 +7,9 @@ Adheres to docs/implementation-plan.md Sections 7, 10, and 11:
 - Explicitly flags ambiguities instead of guessing (Principle: Ambiguity is never hidden).
 """
 
-from dataclasses import dataclass, field
-from typing import Any
 import re
+from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -71,7 +71,7 @@ class QuestionMatcher:
         words = re.findall(r"[а-яА-Яa-zA-Z0-9_\-]+", text.lower())
         stopwords = {
             "и", "в", "на", "с", "по", "к", "для", "не", "что", "это", "как", "из", "о", "об",
-            "ли", "же", "от", "до", "при", "бы", "то", "же", "он", "она", "они", "мы", "вы",
+            "ли", "же", "от", "до", "при", "бы", "то", "он", "она", "они", "мы", "вы",
             "the", "a", "an", "and", "or", "in", "on", "at", "to", "for", "of", "with", "is"
         }
         return {w for w in words if len(w) > 2 and w not in stopwords}
@@ -125,7 +125,7 @@ class QuestionMatcher:
         interruptions = self.detect_interruptions(segments)
         active_question_id = questions[0].get("id") or questions[0].get("question_id")
 
-        for idx, seg in enumerate(segments):
+        for _idx, seg in enumerate(segments):
             seg_id = seg["id"]
 
             # If segment was already manually adjusted by a human reviewer, strictly preserve it!
@@ -150,10 +150,7 @@ class QuestionMatcher:
             track = str(seg.get("track_id", "")).lower()
             role = str(seg.get("speaker_role", "")).lower()
             if not role or role == "unknown":
-                if track == "shared":
-                    role = "unknown"
-                else:
-                    role = track
+                role = "unknown" if track == "shared" else track
 
             # Find if this segment experienced an interruption
             seg_int = next(

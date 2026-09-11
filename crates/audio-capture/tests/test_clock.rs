@@ -21,7 +21,8 @@ fn test_clock_drift_and_skew() {
     assert_eq!(skew, 0);
 
     // Track A has 16800 samples (1050ms), Track B has 48000 (1000ms)
-    let skew_diff = MonotonicInterviewClock::calculate_inter_track_skew_ms(16800, 16000, 48000, 48000);
+    let skew_diff =
+        MonotonicInterviewClock::calculate_inter_track_skew_ms(16800, 16000, 48000, 48000);
     assert_eq!(skew_diff, 50);
 }
 
@@ -48,4 +49,3 @@ fn test_clock_pause_resume() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     assert!(clock.elapsed_ms() > elapsed_before_pause);
 }
-

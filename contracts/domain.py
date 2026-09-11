@@ -24,7 +24,8 @@ class InterviewStatus(str, Enum):
 
 
 from typing import Any
-from pydantic import BaseModel, Field, model_validator
+
+from pydantic import model_validator
 
 
 class RubricCriterion(BaseModel):

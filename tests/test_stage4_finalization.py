@@ -11,15 +11,15 @@ Covers requirements R7, R8 from docs/remediation-plan.md:
 8. Immutability: finalized interview rejects segment additions, review overrides, and summary changes with 409.
 9. Export of finalized interview is strictly built from the immutable snapshot.
 """
-import json
 import hashlib
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.api.app import app, get_repository
 from backend.db.database import Database
 from backend.db.repository import Repository
-from contracts.domain import InterviewStatus
 
 
 @pytest.fixture

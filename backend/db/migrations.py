@@ -7,9 +7,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
-from pathlib import Path
 import sqlite3
+from datetime import UTC, datetime
+from pathlib import Path
 
 from backend.db.database import Database
 
@@ -42,16 +42,15 @@ def run_migrations(db: Database) -> int:
     finally:
         conn.close()
 
-    TARGET_VERSION = 7
-    if current_version < TARGET_VERSION:
+    TARGET_VERSION = 8
+    if current_version < TARGET_VERSION and db.db_path != ":memory:" and Path(db.db_path).exists():
         # Make verified pre-migration backup if not in-memory
-        if db.db_path != ":memory:" and Path(db.db_path).exists():
-            backup_dir = Path(os.getenv("NEBULA_BACKUP_DIR", "data/backups")).resolve()
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            backup_path = backup_dir / f"pre_migration_v{current_version}_to_v{TARGET_VERSION}_{timestamp}.db"
-            db.backup(str(backup_path))
-            logger.info("Created pre-migration backup at %s", backup_path)
+        backup_dir = Path(os.getenv("NEBULA_BACKUP_DIR", "data/backups")).resolve()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        backup_path = backup_dir / f"pre_migration_v{current_version}_to_v{TARGET_VERSION}_{timestamp}.db"
+        db.backup(str(backup_path))
+        logger.info("Created pre-migration backup at %s", backup_path)
 
     if current_version < 1:
         with db.transaction() as tx_conn:
@@ -178,7 +177,7 @@ def run_migrations(db: Database) -> int:
             tx_conn.execute("CREATE INDEX IF NOT EXISTS idx_report_revisions ON report_revisions(interview_id, revision_number);")
 
             # 6. Record migration version 1
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(UTC).isoformat()
             tx_conn.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, '001_interview_isolation', ?)",
                 (now_iso,),
@@ -202,7 +201,7 @@ def run_migrations(db: Database) -> int:
             if "exclusion_reason" not in ha_cols:
                 tx_conn.execute("ALTER TABLE human_assessments ADD COLUMN exclusion_reason TEXT;")
 
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(UTC).isoformat()
             tx_conn.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at) VALUES (2, '002_report_snapshot_and_exclusions', ?)",
                 (now_iso,),
@@ -237,7 +236,7 @@ def run_migrations(db: Database) -> int:
             )
             tx_conn.execute("CREATE INDEX IF NOT EXISTS idx_audio_chunks_interview ON audio_chunks(interview_id, track_id, sequence);")
 
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(UTC).isoformat()
             tx_conn.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at) VALUES (3, '003_audio_chunks', ?)",
                 (now_iso,),
@@ -265,7 +264,7 @@ def run_migrations(db: Database) -> int:
             if "fallback_metadata_json" not in prop_cols:
                 tx_conn.execute("ALTER TABLE assessment_proposals ADD COLUMN fallback_metadata_json TEXT;")
 
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(UTC).isoformat()
             tx_conn.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at) VALUES (4, '004_stage7_evidence_and_lease', ?)",
                 (now_iso,),
@@ -298,7 +297,7 @@ def run_migrations(db: Database) -> int:
                 WHERE track_id IN ('interviewer', 'candidate') AND (speaker_role IS NULL OR speaker_role = 'unknown');
             """)
 
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(UTC).isoformat()
             tx_conn.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at) VALUES (5, '005_single_source_and_speaker_roles', ?)",
                 (now_iso,),
@@ -368,7 +367,7 @@ def run_migrations(db: Database) -> int:
             tx_conn.execute("ALTER TABLE question_associations_v6 RENAME TO question_associations;")
             tx_conn.execute("CREATE INDEX IF NOT EXISTS idx_assoc_interview_question ON question_associations(interview_id, question_id);")
 
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(UTC).isoformat()
             tx_conn.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at) VALUES (6, '006_question_associations_composite_fk', ?)",
                 (now_iso,),
@@ -411,7 +410,7 @@ def run_migrations(db: Database) -> int:
             # 3. Seed default template if empty
             count = tx_conn.execute("SELECT COUNT(*) FROM job_templates").fetchone()[0]
             if count == 0:
-                now_iso = datetime.now(timezone.utc).isoformat()
+                now_iso = datetime.now(UTC).isoformat()
                 default_questions = [
                     {
                         "id": "q-backend-saga",
@@ -478,7 +477,7 @@ def run_migrations(db: Database) -> int:
                     )
                 )
 
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(UTC).isoformat()
             tx_conn.execute(
                 "INSERT INTO schema_migrations (version, name, applied_at) VALUES (7, '007_job_templates_and_interview_links', ?)",
                 (now_iso,),
@@ -487,6 +486,51 @@ def run_migrations(db: Database) -> int:
         if not db.verify_integrity():
             raise RuntimeError("Database integrity check failed after running migration 007!")
         current_version = 7
+
+    if current_version < 8:
+        with db.transaction() as tx_conn:
+            tx_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS summary_proposals (
+                    id TEXT PRIMARY KEY,
+                    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+                    transcript_revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
+                    rubric_revision_id TEXT NOT NULL DEFAULT 'rub-rev-1',
+                    model_profile_id TEXT NOT NULL,
+                    summary_data_json TEXT NOT NULL,
+                    decisions_snapshot_hash TEXT,
+                    is_confirmed INTEGER NOT NULL DEFAULT 0,
+                    confirmed_by TEXT,
+                    confirmed_markdown TEXT,
+                    confirmed_recommendation TEXT,
+                    is_stale INTEGER NOT NULL DEFAULT 0,
+                    stale_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    confirmed_at TEXT
+                )
+                """
+            )
+            columns = [row["name"] for row in tx_conn.execute("PRAGMA table_info(summary_proposals)").fetchall()]
+            if "transcript_revision_id" not in columns:
+                tx_conn.execute("ALTER TABLE summary_proposals ADD COLUMN transcript_revision_id TEXT NOT NULL DEFAULT 'trans-rev-1';")
+            if "rubric_revision_id" not in columns:
+                tx_conn.execute("ALTER TABLE summary_proposals ADD COLUMN rubric_revision_id TEXT NOT NULL DEFAULT 'rub-rev-1';")
+            if "decisions_snapshot_hash" not in columns:
+                tx_conn.execute("ALTER TABLE summary_proposals ADD COLUMN decisions_snapshot_hash TEXT;")
+            if "is_stale" not in columns:
+                tx_conn.execute("ALTER TABLE summary_proposals ADD COLUMN is_stale INTEGER NOT NULL DEFAULT 0;")
+            if "stale_reason" not in columns:
+                tx_conn.execute("ALTER TABLE summary_proposals ADD COLUMN stale_reason TEXT;")
+
+            now_iso = datetime.now(UTC).isoformat()
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (8, '008_summary_proposals_revisions_and_stale', ?)",
+                (now_iso,),
+            )
+
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 008!")
+        current_version = 8
 
     logger.info("Successfully ensured database schema up to version %d", current_version)
     return current_version

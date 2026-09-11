@@ -10,12 +10,13 @@ Adheres to docs/implementation-plan.md Section 4 and Section 8:
 
 import logging
 from typing import Any
-from backend.adapters.llm import OpenAICompatibleAdapter, LLMAdapterError
+
+from backend.adapters.llm import OpenAICompatibleAdapter
 from backend.core.profiles import (
-    get_plusvibe_provider,
-    get_plusvibe_gemini_model,
-    get_plusvibe_qwen_model,
     get_plusvibe_deepseek_model,
+    get_plusvibe_gemini_model,
+    get_plusvibe_provider,
+    get_plusvibe_qwen_model,
 )
 
 logger = logging.getLogger("nebula.resilient_llm")

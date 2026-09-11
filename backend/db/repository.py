@@ -4,15 +4,16 @@ Provides safe database operations with JSON serialization and timestamps.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
-import os
 import shutil
-from datetime import datetime, timezone
+import sqlite3
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-import uuid
 
 from backend.core.scoring import calculate_interview_score
 from backend.core.state_machine import InvalidStateTransitionError
@@ -29,11 +30,15 @@ from contracts.domain import (
 
 class RepositoryConflictError(Exception):
     """Raised when an operation conflicts with current state (e.g. modifying finalized interview)."""
-    pass
+
+
+class RepositoryNotFoundError(Exception):
+    """Raised when a requested entity is not found in the repository."""
+
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class Repository:
@@ -98,6 +103,7 @@ class Repository:
         role: str | None = None,
         template_id: str | None = None,
         template_version: int | None = None,
+        capture_mode: str | None = None,
     ) -> dict[str, Any]:
         now = utc_now_iso()
         with self.db.transaction() as conn:
@@ -105,7 +111,9 @@ class Repository:
             if not inv:
                 raise KeyError(f"Interview {interview_id} not found")
             if inv["status"] not in ("draft", "ready"):
-                raise ValueError(f"Cannot update interview in status '{inv['status']}', expected 'draft' or 'ready'")
+                raise RepositoryConflictError(
+                    f"Cannot update interview in status '{inv['status']}', expected 'draft' or 'ready'"
+                )
 
             new_title = title if title is not None else inv["title"]
             new_candidate = candidate_name if candidate_name is not None else inv["candidate_name"]
@@ -113,13 +121,34 @@ class Repository:
             new_template_id = template_id if template_id is not None else inv["template_id"]
             new_template_version = template_version if template_version is not None else inv["template_version"]
 
+            if capture_mode is not None:
+                if capture_mode not in ("single_source", "dual_source"):
+                    raise ValueError(f"Invalid capture_mode '{capture_mode}', expected 'single_source' or 'dual_source'")
+                new_capture_mode = capture_mode
+                new_expected_tracks = ["shared"] if capture_mode == "single_source" else ["interviewer", "candidate"]
+                new_expected_tracks_json = json.dumps(new_expected_tracks)
+            else:
+                new_capture_mode = inv["capture_mode"]
+                new_expected_tracks_json = inv["expected_tracks_json"]
+
             conn.execute(
                 """
                 UPDATE interviews
-                SET title = ?, candidate_name = ?, role = ?, template_id = ?, template_version = ?, updated_at = ?
+                SET title = ?, candidate_name = ?, role = ?, template_id = ?, template_version = ?,
+                    capture_mode = ?, expected_tracks_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (new_title, new_candidate, new_role, new_template_id, new_template_version, now, interview_id),
+                (
+                    new_title,
+                    new_candidate,
+                    new_role,
+                    new_template_id,
+                    new_template_version,
+                    new_capture_mode,
+                    new_expected_tracks_json,
+                    now,
+                    interview_id,
+                ),
             )
         return self.get_interview(interview_id)  # type: ignore[return-value]
 
@@ -356,22 +385,21 @@ class Repository:
         end_time_ms: int,
         text: str,
         is_final: bool = True,
-        revision_id: str = "trans-rev-1",
+        revision_id: str | None = None,
         speaker_role: str | None = None,
         parent_segment_id: str | None = None,
     ) -> None:
         if speaker_role is None:
-            if track_id in ("candidate", "interviewer"):
-                speaker_role = track_id
-            else:
-                speaker_role = "unknown"
+            speaker_role = track_id if track_id in ("candidate", "interviewer") else "unknown"
         now = utc_now_iso()
         with self.db.transaction() as conn:
-            inv = conn.execute("SELECT id, status FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+            inv = conn.execute("SELECT id, status, active_transcript_revision_id FROM interviews WHERE id = ?", (interview_id,)).fetchone()
             if not inv or inv["status"] == "deleted":
                 raise ValueError(f"Cannot add segment: interview {interview_id} does not exist or is deleted")
             if inv["status"] == "finalized":
                 raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+            effective_revision_id = revision_id or inv["active_transcript_revision_id"] or "trans-rev-1"
 
             conn.execute(
                 """
@@ -400,7 +428,7 @@ class Repository:
                     end_time_ms,
                     text,
                     1 if is_final else 0,
-                    revision_id,
+                    effective_revision_id,
                     speaker_role,
                     parent_segment_id,
                     now,
@@ -412,46 +440,150 @@ class Repository:
         interview_id: str,
         segment_id: str,
         speaker_role: str,
+        expected_revision_id: str | None = None,
         revision_id: str | None = None,
     ) -> dict[str, Any]:
-        """Updates speaker_role ('candidate', 'interviewer', 'unknown') for a transcript segment."""
-        inv = self.get_interview(interview_id)
-        if not inv or inv["status"] == "deleted":
-            raise ValueError(f"Interview {interview_id} not found or deleted")
-        if inv["status"] == "finalized":
-            raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
-
-        rev = revision_id or inv.get("active_transcript_revision_id") or "trans-rev-1"
+        """Updates speaker_role for a transcript segment by creating a new revision and preserving provenance."""
+        now = utc_now_iso()
         with self.db.transaction() as conn:
-            # Check if segment exists in the target revision
+            inv = conn.execute("SELECT id, status, active_transcript_revision_id FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+            if not inv or inv["status"] == "deleted":
+                raise ValueError(f"Interview {interview_id} not found or deleted")
+            if inv["status"] == "finalized":
+                raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+            active_rev = inv["active_transcript_revision_id"] or "trans-rev-1"
+            if expected_revision_id and expected_revision_id != active_rev:
+                raise RepositoryConflictError(
+                    f"Revision conflict: active transcript revision is '{active_rev}', but expected was '{expected_revision_id}'"
+                )
+
+            curr_rev = revision_id or active_rev
             row = conn.execute(
                 "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
-                (interview_id, rev, segment_id),
+                (interview_id, curr_rev, segment_id),
             ).fetchone()
             if not row:
-                # Fallback: find segment in any revision of this interview
-                any_row = conn.execute(
-                    "SELECT * FROM transcript_segments WHERE interview_id = ? AND id = ?",
-                    (interview_id, segment_id),
-                ).fetchone()
-                if any_row:
-                    rev = any_row["revision_id"]
-                    row = any_row
+                raise ValueError(f"Segment {segment_id} not found in active revision {curr_rev}")
 
-            if not row:
-                raise ValueError(f"Segment {segment_id} not found in interview {interview_id}")
+            rev_rows = conn.execute(
+                "SELECT id, revision_number FROM transcript_revisions WHERE interview_id = ?",
+                (interview_id,),
+            ).fetchall()
+            existing_ids = {r["id"] for r in rev_rows} | {curr_rev}
+            max_num = max([r["revision_number"] for r in rev_rows] + [1])
+            if curr_rev.startswith("trans-rev-"):
+                with contextlib.suppress(ValueError):
+                    max_num = max(max_num, int(curr_rev.split("-")[-1]))
+            next_num = max_num + 1
+            while f"trans-rev-{next_num}" in existing_ids:
+                next_num += 1
+            new_rev_id = f"trans-rev-{next_num}"
 
             conn.execute(
                 """
-                UPDATE transcript_segments
-                SET speaker_role = ?
-                WHERE interview_id = ? AND revision_id = ? AND id = ?
+                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
+                VALUES (?, ?, 1, 1, ?)
+                ON CONFLICT(id) DO NOTHING
                 """,
-                (speaker_role, interview_id, rev, segment_id),
+                (curr_rev, interview_id, now),
             )
+            conn.execute(
+                """
+                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (new_rev_id, interview_id, next_num, now),
+            )
+
+
+            curr_segs = conn.execute(
+                "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? ORDER BY start_time_ms ASC",
+                (interview_id, curr_rev),
+            ).fetchall()
+            for s in curr_segs:
+                role = speaker_role if s["id"] == segment_id else s["speaker_role"]
+                conn.execute(
+                    """
+                    INSERT INTO transcript_segments (
+                        id, interview_id, track_id, start_time_ms, end_time_ms, text,
+                        is_final, revision_id, speaker_role, parent_segment_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        s["id"],
+                        interview_id,
+                        s["track_id"],
+                        s["start_time_ms"],
+                        s["end_time_ms"],
+                        s["text"],
+                        s["is_final"],
+                        new_rev_id,
+                        role,
+                        s["parent_segment_id"],
+                        s["created_at"],
+                    ),
+                )
+
+            curr_assocs = conn.execute(
+                "SELECT * FROM question_associations WHERE interview_id = ? AND revision_id = ?",
+                (interview_id, curr_rev),
+            ).fetchall()
+            affected_questions = set()
+            for a in curr_assocs:
+                new_assoc_id = f"assoc-{uuid.uuid4().hex[:8]}"
+                conn.execute(
+                    """
+                    INSERT INTO question_associations (
+                        id, interview_id, revision_id, question_id, segment_id,
+                        confidence, is_ambiguous, is_manually_adjusted, notes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_assoc_id,
+                        interview_id,
+                        new_rev_id,
+                        a["question_id"],
+                        a["segment_id"],
+                        a["confidence"],
+                        a["is_ambiguous"],
+                        a["is_manually_adjusted"],
+                        a["notes"],
+                        a["created_at"],
+                    ),
+                )
+                if a["segment_id"] == segment_id:
+                    affected_questions.add(a["question_id"])
+
+            all_proposals = conn.execute(
+                "SELECT id, question_id, scores_json FROM assessment_proposals WHERE interview_id = ?",
+                (interview_id,),
+            ).fetchall()
+            for p in all_proposals:
+                if p["scores_json"] and segment_id in p["scores_json"]:
+                    affected_questions.add(p["question_id"])
+
+            conn.execute(
+                "UPDATE interviews SET active_transcript_revision_id = ?, updated_at = ? WHERE id = ?",
+                (new_rev_id, now, interview_id),
+            )
+
+            for q_id in affected_questions:
+                reason = f"Стенограмма обновлена до {new_rev_id}. Изменена роль спикера в сегменте {segment_id}."
+                conn.execute(
+                    "UPDATE assessment_proposals SET is_stale = 1, stale_reason = ? WHERE interview_id = ? AND question_id = ?",
+                    (reason, interview_id, q_id),
+                )
+                conn.execute(
+                    "UPDATE human_assessments SET is_stale = 1, stale_reason = ? WHERE interview_id = ? AND question_id = ?",
+                    (reason, interview_id, q_id),
+                )
+            conn.execute("UPDATE summary_proposals SET is_confirmed = 0 WHERE interview_id = ?", (interview_id,))
+
             updated_row = conn.execute(
                 "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
-                (interview_id, rev, segment_id),
+                (interview_id, new_rev_id, segment_id),
             ).fetchone()
             return dict(updated_row)
 
@@ -464,34 +596,31 @@ class Repository:
         text_part2: str,
         role_part1: str = "interviewer",
         role_part2: str = "candidate",
+        expected_revision_id: str | None = None,
         revision_id: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Splits a single mixed speech segment into two sequential segments with assigned speaker roles."""
-        inv = self.get_interview(interview_id)
-        if not inv or inv["status"] == "deleted":
-            raise ValueError(f"Interview {interview_id} not found or deleted")
-        if inv["status"] == "finalized":
-            raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
-
-        rev = revision_id or inv.get("active_transcript_revision_id") or "trans-rev-1"
+        """Splits a single speech segment into two sequential segments in a new revision."""
         now = utc_now_iso()
-
         with self.db.transaction() as conn:
+            inv = conn.execute("SELECT id, status, active_transcript_revision_id FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+            if not inv or inv["status"] == "deleted":
+                raise ValueError(f"Interview {interview_id} not found or deleted")
+            if inv["status"] == "finalized":
+                raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+            active_rev = inv["active_transcript_revision_id"] or "trans-rev-1"
+            if expected_revision_id and expected_revision_id != active_rev:
+                raise RepositoryConflictError(
+                    f"Revision conflict: active transcript revision is '{active_rev}', but expected was '{expected_revision_id}'"
+                )
+
+            curr_rev = revision_id or active_rev
             orig = conn.execute(
                 "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
-                (interview_id, rev, segment_id),
+                (interview_id, curr_rev, segment_id),
             ).fetchone()
             if not orig:
-                any_orig = conn.execute(
-                    "SELECT * FROM transcript_segments WHERE interview_id = ? AND id = ?",
-                    (interview_id, segment_id),
-                ).fetchone()
-                if any_orig:
-                    rev = any_orig["revision_id"]
-                    orig = any_orig
-
-            if not orig:
-                raise ValueError(f"Original segment {segment_id} not found")
+                raise ValueError(f"Original segment {segment_id} not found in active revision {curr_rev}")
 
             orig_dict = dict(orig)
             start_ms = orig_dict["start_time_ms"]
@@ -501,71 +630,215 @@ class Repository:
             if not (start_ms < split_time_ms < end_ms):
                 raise ValueError(f"Split time {split_time_ms} must be strictly between {start_ms} and {end_ms}")
 
-            # Update first part in-place
+            rev_rows = conn.execute(
+                "SELECT id, revision_number FROM transcript_revisions WHERE interview_id = ?",
+                (interview_id,),
+            ).fetchall()
+            existing_ids = {r["id"] for r in rev_rows} | {curr_rev}
+            max_num = max([r["revision_number"] for r in rev_rows] + [1])
+            if curr_rev.startswith("trans-rev-"):
+                with contextlib.suppress(ValueError):
+                    max_num = max(max_num, int(curr_rev.split("-")[-1]))
+            next_num = max_num + 1
+            while f"trans-rev-{next_num}" in existing_ids:
+                next_num += 1
+            new_rev_id = f"trans-rev-{next_num}"
+
             conn.execute(
                 """
-                UPDATE transcript_segments
-                SET end_time_ms = ?, text = ?, speaker_role = ?
-                WHERE interview_id = ? AND revision_id = ? AND id = ?
+                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
+                VALUES (?, ?, 1, 1, ?)
+                ON CONFLICT(id) DO NOTHING
                 """,
-                (split_time_ms, text_part1.strip(), role_part1, interview_id, rev, segment_id),
+                (curr_rev, interview_id, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (new_rev_id, interview_id, next_num, now),
             )
 
-            # Insert second part with parent_segment_id tracking provenance
+
             part2_id = f"seg-{uuid.uuid4().hex[:8]}"
+
+            curr_segs = conn.execute(
+                "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? ORDER BY start_time_ms ASC",
+                (interview_id, curr_rev),
+            ).fetchall()
+            for s in curr_segs:
+                if s["id"] == segment_id:
+                    conn.execute(
+                        """
+                        INSERT INTO transcript_segments (
+                            id, interview_id, track_id, start_time_ms, end_time_ms, text,
+                            is_final, revision_id, speaker_role, parent_segment_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                        """,
+                        (
+                            segment_id,
+                            interview_id,
+                            track_id,
+                            s["start_time_ms"],
+                            split_time_ms,
+                            text_part1.strip(),
+                            new_rev_id,
+                            role_part1,
+                            s["parent_segment_id"],
+                            s["created_at"],
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO transcript_segments (
+                            id, interview_id, track_id, start_time_ms, end_time_ms, text,
+                            is_final, revision_id, speaker_role, parent_segment_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                        """,
+                        (
+                            part2_id,
+                            interview_id,
+                            track_id,
+                            split_time_ms,
+                            end_ms,
+                            text_part2.strip(),
+                            new_rev_id,
+                            role_part2,
+                            segment_id,
+                            now,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO transcript_segments (
+                            id, interview_id, track_id, start_time_ms, end_time_ms, text,
+                            is_final, revision_id, speaker_role, parent_segment_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            s["id"],
+                            interview_id,
+                            s["track_id"],
+                            s["start_time_ms"],
+                            s["end_time_ms"],
+                            s["text"],
+                            s["is_final"],
+                            new_rev_id,
+                            s["speaker_role"],
+                            s["parent_segment_id"],
+                            s["created_at"],
+                        ),
+                    )
+
+            curr_assocs = conn.execute(
+                "SELECT * FROM question_associations WHERE interview_id = ? AND revision_id = ?",
+                (interview_id, curr_rev),
+            ).fetchall()
+            affected_questions = set()
+            for a in curr_assocs:
+                new_assoc_id = f"assoc-{uuid.uuid4().hex[:8]}"
+                conn.execute(
+                    """
+                    INSERT INTO question_associations (
+                        id, interview_id, revision_id, question_id, segment_id,
+                        confidence, is_ambiguous, is_manually_adjusted, notes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_assoc_id,
+                        interview_id,
+                        new_rev_id,
+                        a["question_id"],
+                        a["segment_id"],
+                        a["confidence"],
+                        a["is_ambiguous"],
+                        a["is_manually_adjusted"],
+                        a["notes"],
+                        a["created_at"],
+                    ),
+                )
+                if a["segment_id"] == segment_id:
+                    affected_questions.add(a["question_id"])
+                    assoc2_id = f"assoc-{uuid.uuid4().hex[:8]}"
+                    conn.execute(
+                        """
+                        INSERT INTO question_associations (
+                            id, interview_id, revision_id, question_id, segment_id,
+                            confidence, is_ambiguous, is_manually_adjusted, notes, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            assoc2_id,
+                            interview_id,
+                            new_rev_id,
+                            a["question_id"],
+                            part2_id,
+                            a["confidence"],
+                            a["is_ambiguous"],
+                            a["is_manually_adjusted"],
+                            a["notes"],
+                            now,
+                        ),
+                    )
+
+            all_proposals = conn.execute(
+                "SELECT id, question_id, scores_json FROM assessment_proposals WHERE interview_id = ?",
+                (interview_id,),
+            ).fetchall()
+            for p in all_proposals:
+                if p["scores_json"] and segment_id in p["scores_json"]:
+                    affected_questions.add(p["question_id"])
+
             conn.execute(
-                """
-                INSERT INTO transcript_segments (
-                    id, interview_id, track_id, start_time_ms, end_time_ms, text,
-                    is_final, revision_id, speaker_role, parent_segment_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-                """,
-                (
-                    part2_id,
-                    interview_id,
-                    track_id,
-                    split_time_ms,
-                    end_ms,
-                    text_part2.strip(),
-                    rev,
-                    role_part2,
-                    segment_id,
-                    now,
-                ),
+                "UPDATE interviews SET active_transcript_revision_id = ?, updated_at = ? WHERE id = ?",
+                (new_rev_id, now, interview_id),
             )
+
+            for q_id in affected_questions:
+                reason = f"Стенограмма обновлена до {new_rev_id}. Сегмент {segment_id} был разделён."
+                conn.execute(
+                    "UPDATE assessment_proposals SET is_stale = 1, stale_reason = ? WHERE interview_id = ? AND question_id = ?",
+                    (reason, interview_id, q_id),
+                )
+                conn.execute(
+                    "UPDATE human_assessments SET is_stale = 1, stale_reason = ? WHERE interview_id = ? AND question_id = ?",
+                    (reason, interview_id, q_id),
+                )
+            conn.execute("UPDATE summary_proposals SET is_confirmed = 0 WHERE interview_id = ?", (interview_id,))
 
             row1 = conn.execute(
                 "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
-                (interview_id, rev, segment_id),
+                (interview_id, new_rev_id, segment_id),
             ).fetchone()
             row2 = conn.execute(
                 "SELECT * FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
-                (interview_id, rev, part2_id),
+                (interview_id, new_rev_id, part2_id),
             ).fetchone()
 
             return dict(row1), dict(row2)
 
+
     def get_transcript_segments(self, interview_id: str, revision_id: str | None = None) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
-            if revision_id:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM transcript_segments
-                    WHERE interview_id = ? AND revision_id = ?
-                    ORDER BY start_time_ms ASC
-                    """,
-                    (interview_id, revision_id),
-                ).fetchall()
+            if revision_id is not None:
+                rev = revision_id
             else:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM transcript_segments
-                    WHERE interview_id = ?
-                    ORDER BY start_time_ms ASC
-                    """,
-                    (interview_id,),
-                ).fetchall()
+                inv = conn.execute("SELECT active_transcript_revision_id FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+                rev = inv["active_transcript_revision_id"] if inv and inv["active_transcript_revision_id"] else "trans-rev-1"
+
+            rows = conn.execute(
+                """
+                SELECT * FROM transcript_segments
+                WHERE interview_id = ? AND revision_id = ?
+                ORDER BY start_time_ms ASC
+                """,
+                (interview_id, rev),
+            ).fetchall()
             return [dict(r) for r in rows]
+
 
     def create_transcript_revision(
         self,
@@ -606,6 +879,18 @@ class Repository:
                 (revision_id, interview_id),
             )
 
+    def set_active_rubric_revision(self, interview_id: str, revision_id: str) -> None:
+        with self.db.transaction() as conn:
+            inv = conn.execute("SELECT id, status FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+            if not inv or inv["status"] == "deleted":
+                raise ValueError(f"Interview {interview_id} not found or deleted")
+            if inv["status"] == "finalized":
+                raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+            conn.execute(
+                "UPDATE interviews SET active_rubric_revision_id = ? WHERE id = ?",
+                (revision_id, interview_id),
+            )
+
     # -------------------------------------------------------------
     # Assessment Proposals
     # -------------------------------------------------------------
@@ -626,12 +911,30 @@ class Repository:
         validation_errors: list[str] | None = None,
         provider_id: str | None = None,
         fallback_metadata: dict[str, Any] | None = None,
+        owner_token: str | None = None,
+        job_id: str | None = None,
     ) -> None:
         now = utc_now_iso()
         with self.db.transaction() as conn:
             inv = conn.execute("SELECT id, status FROM interviews WHERE id = ?", (interview_id,)).fetchone()
             if not inv or inv["status"] == "deleted":
                 raise ValueError(f"Cannot save proposal: interview {interview_id} does not exist or is deleted")
+            if inv["status"] == "finalized":
+                raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+            if job_id is not None:
+                j_row = conn.execute(
+                    "SELECT id, status, locked_by, locked_until FROM jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if not j_row:
+                    raise RepositoryConflictError(f"Cannot save proposal: job {job_id} not found")
+                if j_row["status"] != "PROCESSING":
+                    raise RepositoryConflictError(f"Cannot save proposal: job {job_id} is no longer PROCESSING (status: {j_row['status']})")
+                if owner_token is not None and j_row["locked_by"] and j_row["locked_by"] != owner_token:
+                    raise RepositoryConflictError(f"Cannot save proposal: job {job_id} owner token mismatch")
+                if j_row["locked_until"] and j_row["locked_until"] < now:
+                    raise RepositoryConflictError(f"Cannot save proposal: job {job_id} lease expired")
 
             conn.execute(
                 """
@@ -676,16 +979,26 @@ class Repository:
                 ),
             )
 
-    def get_assessment_proposals(self, interview_id: str) -> list[dict[str, Any]]:
+    def get_assessment_proposals(self, interview_id: str, question_id: str | None = None) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM assessment_proposals
-                WHERE interview_id = ?
-                ORDER BY created_at ASC
-                """,
-                (interview_id,),
-            ).fetchall()
+            if question_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM assessment_proposals
+                    WHERE interview_id = ? AND question_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (interview_id, question_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM assessment_proposals
+                    WHERE interview_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (interview_id,),
+                ).fetchall()
             res = []
             for r in rows:
                 item = dict(r)
@@ -789,14 +1102,14 @@ class Repository:
                     """,
                     (stale_reason, interview_id, q_id),
                 )
-            # Invalidate dependent confirmed summary if interview transcript changed
+            # Invalidate dependent summary if interview transcript changed
             conn.execute(
                 """
                 UPDATE summary_proposals
-                SET is_confirmed = 0
+                SET is_confirmed = 0, is_stale = 1, stale_reason = ?
                 WHERE interview_id = ?
                 """,
-                (interview_id,),
+                (stale_reason, interview_id),
             )
 
     # -------------------------------------------------------------
@@ -869,6 +1182,17 @@ class Repository:
                 ),
             )
 
+            # Human edit invalidates dependent unconfirmed summary proposals
+            conn.execute(
+                """
+                UPDATE summary_proposals
+                SET is_stale = 1,
+                    stale_reason = 'Оценки были изменены экспертом'
+                WHERE interview_id = ? AND is_confirmed = 0
+                """,
+                (interview_id,),
+            )
+
     def get_human_assessments(self, interview_id: str) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
             rows = conn.execute(
@@ -897,29 +1221,124 @@ class Repository:
     # -------------------------------------------------------------
     # Executive Summary Proposals
     # -------------------------------------------------------------
+    def _compute_decisions_snapshot_hash_conn(self, conn: sqlite3.Connection, interview_id: str) -> str:
+        ha_rows = conn.execute(
+            """
+            SELECT question_id, updated_at, is_stale, is_excluded, scores_json
+            FROM human_assessments
+            WHERE interview_id = ?
+            ORDER BY question_id ASC
+            """,
+            (interview_id,),
+        ).fetchall()
+        prop_rows = conn.execute(
+            """
+            SELECT question_id, created_at, is_stale, is_rejected, scores_json
+            FROM assessment_proposals
+            WHERE interview_id = ?
+            ORDER BY question_id ASC, created_at ASC
+            """,
+            (interview_id,),
+        ).fetchall()
+        inv_row = conn.execute(
+            "SELECT active_transcript_revision_id, active_rubric_revision_id FROM interviews WHERE id = ?",
+            (interview_id,),
+        ).fetchone()
+
+        data = {
+            "trans_rev": inv_row["active_transcript_revision_id"] if inv_row else None,
+            "rub_rev": inv_row["active_rubric_revision_id"] if inv_row else None,
+            "ha": [dict(r) for r in ha_rows],
+            "prop": [dict(r) for r in prop_rows],
+        }
+        dumped = json.dumps(data, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+
+    def compute_decisions_snapshot_hash(self, interview_id: str) -> str:
+        with self.db.transaction() as conn:
+            return self._compute_decisions_snapshot_hash_conn(conn, interview_id)
+
     def save_summary_proposal(
         self,
         proposal_id: str,
         interview_id: str,
         model_profile_id: str,
         summary_data: dict[str, Any],
+        transcript_revision_id: str | None = None,
+        rubric_revision_id: str | None = None,
+        decisions_snapshot_hash: str | None = None,
+        is_stale: bool = False,
+        stale_reason: str | None = None,
+        owner_token: str | None = None,
+        job_id: str | None = None,
     ) -> None:
         now = utc_now_iso()
         with self.db.transaction() as conn:
+            inv = conn.execute(
+                "SELECT id, status, active_transcript_revision_id, active_rubric_revision_id FROM interviews WHERE id = ?",
+                (interview_id,),
+            ).fetchone()
+            if not inv or inv["status"] == "deleted":
+                raise ValueError(f"Cannot save summary proposal: interview {interview_id} does not exist or is deleted")
+            if inv["status"] == "finalized":
+                raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+            if job_id is not None:
+                j_row = conn.execute(
+                    "SELECT id, status, locked_by, locked_until FROM jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if not j_row:
+                    raise RepositoryConflictError(f"Cannot save summary proposal: job {job_id} not found")
+                if j_row["status"] != "PROCESSING":
+                    raise RepositoryConflictError(f"Cannot save summary proposal: job {job_id} is no longer PROCESSING (status: {j_row['status']})")
+                if owner_token is not None and j_row["locked_by"] and j_row["locked_by"] != owner_token:
+                    raise RepositoryConflictError(f"Cannot save summary proposal: job {job_id} owner token mismatch")
+                if j_row["locked_until"] and j_row["locked_until"] < now:
+                    raise RepositoryConflictError(f"Cannot save summary proposal: job {job_id} lease expired")
+
+            active_trans = inv["active_transcript_revision_id"] or "trans-rev-1"
+            active_rub = inv["active_rubric_revision_id"] or "rub-rev-1"
+            trans_rev = transcript_revision_id or active_trans
+            rub_rev = rubric_revision_id or active_rub
+
+            # Verify if decisions snapshot changed during generation
+            if decisions_snapshot_hash is not None:
+                current_hash = self._compute_decisions_snapshot_hash_conn(conn, interview_id)
+                if current_hash != decisions_snapshot_hash:
+                    is_stale = True
+                    stale_reason = stale_reason or "Оценки были изменены во время генерации резюме"
+
+            if trans_rev != active_trans:
+                is_stale = True
+                stale_reason = stale_reason or f"Стенограмма обновилась до {active_trans}"
+
             conn.execute(
                 """
                 INSERT INTO summary_proposals (
-                    id, interview_id, model_profile_id, summary_data_json, is_confirmed, created_at
-                ) VALUES (?, ?, ?, ?, 0, ?)
+                    id, interview_id, transcript_revision_id, rubric_revision_id,
+                    model_profile_id, summary_data_json, decisions_snapshot_hash,
+                    is_confirmed, is_stale, stale_reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
+                    transcript_revision_id = excluded.transcript_revision_id,
+                    rubric_revision_id = excluded.rubric_revision_id,
                     model_profile_id = excluded.model_profile_id,
-                    summary_data_json = excluded.summary_data_json
+                    summary_data_json = excluded.summary_data_json,
+                    decisions_snapshot_hash = excluded.decisions_snapshot_hash,
+                    is_stale = excluded.is_stale,
+                    stale_reason = excluded.stale_reason
                 """,
                 (
                     proposal_id,
                     interview_id,
+                    trans_rev,
+                    rub_rev,
                     model_profile_id,
                     json.dumps(summary_data, ensure_ascii=False),
+                    decisions_snapshot_hash,
+                    1 if is_stale else 0,
+                    stale_reason,
                     now,
                 ),
             )
@@ -934,6 +1353,27 @@ class Repository:
                 return None
             item = dict(row)
             item["summary_data"] = json.loads(item["summary_data_json"])
+            item["is_confirmed"] = bool(item.get("is_confirmed", 0))
+            item["is_stale"] = bool(item.get("is_stale", 0))
+
+            # If current latest proposal is not confirmed, check if there is a previously confirmed summary
+            # so human confirmed text is never lost when a new AI proposal is generated!
+            if not item["is_confirmed"]:
+                confirmed_row = conn.execute(
+                    """
+                    SELECT confirmed_markdown, confirmed_recommendation, confirmed_by, confirmed_at
+                    FROM summary_proposals
+                    WHERE interview_id = ? AND is_confirmed = 1
+                    ORDER BY confirmed_at DESC LIMIT 1
+                    """,
+                    (interview_id,),
+                ).fetchone()
+                if confirmed_row and confirmed_row["confirmed_markdown"]:
+                    item["confirmed_markdown"] = confirmed_row["confirmed_markdown"]
+                    item["confirmed_recommendation"] = confirmed_row["confirmed_recommendation"]
+                    item["confirmed_by"] = confirmed_row["confirmed_by"]
+                    item["confirmed_at"] = confirmed_row["confirmed_at"]
+
             return item
 
     def confirm_summary(
@@ -942,26 +1382,88 @@ class Repository:
         reviewer_id: str,
         confirmed_markdown: str,
         confirmed_recommendation: str,
+        summary_id: str | None = None,
+        expected_transcript_revision: str | None = None,
     ) -> None:
         now = utc_now_iso()
         with self.db.transaction() as conn:
-            inv = conn.execute("SELECT id, status FROM interviews WHERE id = ?", (interview_id,)).fetchone()
-            if not inv or inv["status"] == "deleted":
+            inv_row = conn.execute(
+                "SELECT id, status, active_transcript_revision_id, active_rubric_revision_id FROM interviews WHERE id = ?",
+                (interview_id,),
+            ).fetchone()
+            if not inv_row or inv_row["status"] == "deleted":
                 raise ValueError(f"Cannot confirm summary: interview {interview_id} does not exist or is deleted")
+            inv = dict(inv_row)
             if inv["status"] == "finalized":
                 raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
 
+            active_rev = inv.get("active_transcript_revision_id") or "trans-rev-1"
+            if expected_transcript_revision and expected_transcript_revision != active_rev:
+                raise RepositoryConflictError(
+                    f"Revision conflict: active transcript revision is '{active_rev}', "
+                    f"but summary confirmation was submitted for '{expected_transcript_revision}'."
+                )
+
+            if summary_id:
+                row = conn.execute(
+                    "SELECT * FROM summary_proposals WHERE id = ? AND interview_id = ?",
+                    (summary_id, interview_id),
+                ).fetchone()
+                if not row:
+                    raise RepositoryConflictError(f"Summary proposal {summary_id} not found for interview {interview_id}")
+            else:
+                row = conn.execute(
+                    "SELECT * FROM summary_proposals WHERE interview_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (interview_id,),
+                ).fetchone()
+
+            active_rub = inv.get("active_rubric_revision_id") or "rub-rev-1"
+            if not row:
+                # Human expert confirms manual summary without prior AI proposal
+                prop_id = f"sum-manual-{uuid.uuid4().hex[:8]}"
+                conn.execute(
+                    """
+                    INSERT INTO summary_proposals (
+                        id, interview_id, transcript_revision_id, rubric_revision_id,
+                        model_profile_id, summary_data_json, is_confirmed,
+                        confirmed_by, confirmed_markdown, confirmed_recommendation,
+                        is_stale, created_at, confirmed_at
+                    ) VALUES (?, ?, ?, ?, 'manual/expert', '{}', 1, ?, ?, ?, 0, ?, ?)
+                    """,
+                    (
+                        prop_id,
+                        interview_id,
+                        active_rev,
+                        active_rub,
+                        reviewer_id,
+                        confirmed_markdown,
+                        confirmed_recommendation,
+                        now,
+                        now,
+                    ),
+                )
+                return
+
+            if summary_id and row["transcript_revision_id"] and row["transcript_revision_id"] != active_rev:
+                raise RepositoryConflictError(
+                    f"Revision conflict: summary proposal is based on revision '{row['transcript_revision_id']}', but active revision is '{active_rev}'"
+                )
+
+            # Human confirmation resolves stale flag and binds to active revision
             conn.execute(
                 """
                 UPDATE summary_proposals
                 SET is_confirmed = 1,
+                    is_stale = 0,
+                    stale_reason = NULL,
+                    transcript_revision_id = ?,
                     confirmed_by = ?,
                     confirmed_markdown = ?,
                     confirmed_recommendation = ?,
                     confirmed_at = ?
-                WHERE interview_id = ?
+                WHERE id = ?
                 """,
-                (reviewer_id, confirmed_markdown, confirmed_recommendation, now, interview_id),
+                (active_rev, reviewer_id, confirmed_markdown, confirmed_recommendation, now, row["id"]),
             )
 
     # -------------------------------------------------------------
@@ -1154,6 +1656,15 @@ class Repository:
                         f"Human assessment for question '{q_id}' is stale: {stale_reason}. "
                         "Please re-confirm review against the latest transcript before finalizing."
                     )
+
+                active_trans_rev = inv.get("active_transcript_revision_id") or "trans-rev-1"
+                if ha.get("transcript_revision_id") and ha.get("transcript_revision_id") != active_trans_rev:
+                    raise RepositoryConflictError(
+                        f"Human assessment for question '{q_id}' was made on revision '{ha.get('transcript_revision_id')}', "
+                        f"but active transcript revision is '{active_trans_rev}'. "
+                        "Please re-confirm review against the latest transcript before finalizing."
+                    )
+
 
                 is_excluded = bool(ha.get("is_excluded"))
                 if is_excluded:
@@ -1449,25 +1960,41 @@ class Repository:
         now = utc_now_iso()
         owner_token = f"worker-{uuid.uuid4().hex}"
         with self.db.transaction() as conn:
-            # Find eligible job (prioritizing actively recording interviews to eliminate live delay)
+            # 1. Terminal failure for expired PROCESSING jobs that exceeded max_attempts
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'FAILED',
+                    error_message = 'Job lease expired and max attempts exceeded',
+                    locked_until = NULL,
+                    locked_by = NULL,
+                    updated_at = ?
+                WHERE status = 'PROCESSING' AND locked_until < ? AND attempts >= max_attempts
+                """,
+                (now, now),
+            )
+
+            # 2. Find eligible job: PENDING (whose retry backoff locked_until has passed)
+            # or expired PROCESSING (where attempts < max_attempts)
             row = conn.execute(
                 """
                 SELECT j.* FROM jobs j
                 LEFT JOIN interviews i ON j.interview_id = i.id
-                WHERE j.status = 'PENDING' OR (j.status = 'PROCESSING' AND j.locked_until < ?)
+                WHERE (j.status = 'PENDING' AND (j.locked_until IS NULL OR j.locked_until <= ?))
+                   OR (j.status = 'PROCESSING' AND j.locked_until < ? AND j.attempts < j.max_attempts)
                 ORDER BY
                     CASE WHEN i.status = 'recording' THEN 0 ELSE 1 END ASC,
                     j.created_at ASC
                 LIMIT 1
                 """,
-                (now,),
+                (now, now),
             ).fetchone()
             if not row:
                 return None
 
             job = dict(row)
             # Lock it with owner token
-            lock_until_dt = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + lock_duration_sec, tz=timezone.utc)
+            lock_until_dt = datetime.fromtimestamp(datetime.now(UTC).timestamp() + lock_duration_sec, tz=UTC)
             lock_until_str = lock_until_dt.isoformat()
             cursor = conn.execute(
                 """
@@ -1477,9 +2004,12 @@ class Repository:
                     locked_until = ?,
                     locked_by = ?,
                     updated_at = ?
-                WHERE id = ? AND (status = 'PENDING' OR (status = 'PROCESSING' AND locked_until < ?))
+                WHERE id = ? AND (
+                    (status = 'PENDING' AND (locked_until IS NULL OR locked_until <= ?))
+                    OR (status = 'PROCESSING' AND locked_until < ? AND attempts < max_attempts)
+                )
                 """,
-                (lock_until_str, owner_token, now, job["id"], now),
+                (lock_until_str, owner_token, now, job["id"], now, now),
             )
             if cursor.rowcount == 0:
                 # Concurrent race condition: another worker claimed it in between
@@ -1494,19 +2024,24 @@ class Repository:
         self,
         interview_id: str,
         track_id: str,
+        last_end_ms: int | None = None,
+        epoch: int | None = None,
         max_additional: int = 3,
         owner_token: str | None = None,
         lock_duration_sec: int = 60,
+        tolerance_ms: int = 100,
     ) -> list[dict[str, Any]]:
-        """Claims up to max_additional pending TRANSCRIBE_AUDIO jobs for the same interview and track."""
+        """Claims up to max_additional pending TRANSCRIBE_AUDIO jobs for the same interview, track, epoch, and consecutive timeline."""
         if max_additional <= 0:
             return []
         now = utc_now_iso()
         lock_until_dt = datetime.fromtimestamp(
-            datetime.now(timezone.utc).timestamp() + lock_duration_sec, tz=timezone.utc
+            datetime.now(UTC).timestamp() + lock_duration_sec, tz=UTC
         )
         lock_until_str = lock_until_dt.isoformat()
         results = []
+        current_end_ms = last_end_ms
+
         with self.db.transaction() as conn:
             rows = conn.execute(
                 """
@@ -1515,13 +2050,27 @@ class Repository:
                 ORDER BY created_at ASC
                 LIMIT ?
                 """,
-                (interview_id, max_additional),
+                (interview_id, max_additional * 5),  # Fetch a reasonable window to find consecutive matching chunks
             ).fetchall()
+
             for r in rows:
+                if len(results) >= max_additional:
+                    break
                 j = dict(r)
                 p = json.loads(j["payload_json"])
                 if p.get("track_id") != track_id:
                     continue
+                if epoch is not None and p.get("epoch") is not None and p.get("epoch") != epoch:
+                    # Epoch mismatch - break continuity
+                    break
+
+                chunk_start = p.get("start_ms", 0)
+                chunk_end = p.get("end_ms", chunk_start)
+                # Check continuity: chunk must start where previous ended (within tolerance)
+                if current_end_ms is not None and abs(chunk_start - current_end_ms) > tolerance_ms:
+                    # Timeline gap or jump detected, stop grouping
+                    break
+
                 cursor = conn.execute(
                     """
                     UPDATE jobs
@@ -1539,13 +2088,14 @@ class Repository:
                     j["attempts"] += 1
                     j["locked_by"] = owner_token
                     results.append(j)
+                    current_end_ms = chunk_end
         return results
 
     def renew_job_lease(self, job_id: str, owner_token: str, extension_sec: int = 60) -> bool:
         """Extends the lease duration for an actively executing job if owner token matches."""
         now = utc_now_iso()
         with self.db.transaction() as conn:
-            lock_until_dt = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + extension_sec, tz=timezone.utc)
+            lock_until_dt = datetime.fromtimestamp(datetime.now(UTC).timestamp() + extension_sec, tz=UTC)
             lock_until_str = lock_until_dt.isoformat()
             cursor = conn.execute(
                 """
@@ -1557,17 +2107,27 @@ class Repository:
             )
             return cursor.rowcount > 0
 
-    def reclaim_expired_jobs(self) -> int:
-        """Counts and resets expired PROCESSING jobs back to PENDING for retry."""
+    def reclaim_expired_jobs(self, retry_delay_sec: int = 5) -> int:
+        """Counts and resets expired PROCESSING jobs back to PENDING for retry, or FAILED if max attempts exceeded."""
         now = utc_now_iso()
+        retry_until_dt = datetime.fromtimestamp(datetime.now(UTC).timestamp() + retry_delay_sec, tz=UTC)
+        retry_until_str = retry_until_dt.isoformat()
         with self.db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'FAILED', error_message = 'Job lease expired and max attempts exceeded', locked_until = NULL, locked_by = NULL, updated_at = ?
+                WHERE status = 'PROCESSING' AND locked_until < ? AND attempts >= max_attempts
+                """,
+                (now, now),
+            )
             cursor = conn.execute(
                 """
                 UPDATE jobs
-                SET status = 'PENDING', locked_until = NULL, locked_by = NULL, updated_at = ?
+                SET status = 'PENDING', locked_until = ?, locked_by = NULL, updated_at = ?
                 WHERE status = 'PROCESSING' AND locked_until < ? AND attempts < max_attempts
                 """,
-                (now, now),
+                (retry_until_str, now, now),
             )
             return cursor.rowcount
 
@@ -1594,8 +2154,14 @@ class Repository:
                 if cursor.rowcount == 0:
                     raise RepositoryConflictError(f"Cannot complete job {job_id}: job not found")
 
-    def fail_job(self, job_id: str, error_message: str, owner_token: str | None = None) -> None:
-        """Marks job as FAILED or PENDING retry, verifying owner token if supplied."""
+    def fail_job(
+        self,
+        job_id: str,
+        error_message: str,
+        owner_token: str | None = None,
+        retry_delay_sec: int = 0,
+    ) -> None:
+        """Marks job as FAILED or PENDING retry with durable delay, verifying owner token if supplied."""
         now = utc_now_iso()
         with self.db.transaction() as conn:
             row = conn.execute("SELECT attempts, max_attempts, status, locked_by FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -1603,15 +2169,21 @@ class Repository:
                 raise RepositoryConflictError(f"Cannot fail job {job_id}: owner token mismatch")
             if row and row["attempts"] >= row["max_attempts"]:
                 status = "FAILED"
+                retry_until_str = None
             else:
-                status = "PENDING"  # Re-enqueue for retry
+                status = "PENDING"  # Re-enqueue for retry with backoff delay
+                if retry_delay_sec > 0:
+                    retry_until_dt = datetime.fromtimestamp(datetime.now(UTC).timestamp() + retry_delay_sec, tz=UTC)
+                    retry_until_str = retry_until_dt.isoformat()
+                else:
+                    retry_until_str = None
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, error_message = ?, locked_until = NULL, locked_by = NULL, updated_at = ?
+                SET status = ?, error_message = ?, locked_until = ?, locked_by = NULL, updated_at = ?
                 WHERE id = ?
                 """,
-                (status, error_message, now, job_id),
+                (status, error_message, retry_until_str, now, job_id),
             )
 
     def get_interview_jobs_status(self, interview_id: str) -> dict[str, Any]:
@@ -1729,11 +2301,16 @@ class Repository:
                 ),
             )
 
-    def get_associations(self, interview_id: str) -> list[dict[str, Any]]:
+    def get_associations(self, interview_id: str, revision_id: str | None = None) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
+            if revision_id is None:
+                inv = conn.execute("SELECT active_transcript_revision_id FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+                rev = inv["active_transcript_revision_id"] if inv and inv["active_transcript_revision_id"] else "trans-rev-1"
+            else:
+                rev = revision_id
             rows = conn.execute(
-                "SELECT * FROM question_associations WHERE interview_id = ? ORDER BY created_at ASC",
-                (interview_id,),
+                "SELECT * FROM question_associations WHERE interview_id = ? AND revision_id = ? ORDER BY created_at ASC",
+                (interview_id, rev),
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -1743,11 +2320,33 @@ class Repository:
         segment_id: str,
         new_question_id: str,
         notes: str = "Manually re-linked by reviewer",
+        expected_revision_id: str | None = None,
+        revision_id: str | None = None,
     ) -> None:
         with self.db.transaction() as conn:
+            inv = conn.execute("SELECT id, status, active_transcript_revision_id FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+            if not inv or inv["status"] == "deleted":
+                raise ValueError(f"Interview {interview_id} not found or deleted")
+            if inv["status"] == "finalized":
+                raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+            active_rev = inv["active_transcript_revision_id"] or "trans-rev-1"
+            if expected_revision_id and expected_revision_id != active_rev:
+                raise RepositoryConflictError(
+                    f"Revision conflict: active transcript revision is '{active_rev}', but expected was '{expected_revision_id}'"
+                )
+
+            target_rev = revision_id or active_rev
+            seg = conn.execute(
+                "SELECT id FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
+                (interview_id, target_rev, segment_id),
+            ).fetchone()
+            if not seg:
+                raise ValueError(f"Segment {segment_id} not found in revision {target_rev}")
+
             row = conn.execute(
-                "SELECT id FROM question_associations WHERE interview_id = ? AND segment_id = ?",
-                (interview_id, segment_id),
+                "SELECT id FROM question_associations WHERE interview_id = ? AND revision_id = ? AND segment_id = ?",
+                (interview_id, target_rev, segment_id),
             ).fetchone()
             if row:
                 conn.execute(
@@ -1769,7 +2368,9 @@ class Repository:
                     is_ambiguous=False,
                     is_manually_adjusted=True,
                     notes=notes,
+                    revision_id=target_rev,
                 )
+
 
     def save_audio_chunk(
         self,

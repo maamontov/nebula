@@ -37,7 +37,7 @@ import {
 
 interface SetupScreenProps {
   existingInterviewId?: string | null;
-  onInterviewStarted: (interviewId: string, plan: InterviewPlan) => void;
+  onInterviewStarted: (interviewId: string, plan: InterviewPlan, captureMode?: CaptureMode) => void;
   onBackToHome?: () => void;
 }
 
@@ -113,6 +113,9 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
             }
             if (data.plan) {
               setPlan(data.plan);
+            }
+            if (data.interview.capture_mode) {
+              setCaptureMode(data.interview.capture_mode);
             }
           }
         } else {
@@ -194,6 +197,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
           role: effectiveRole || 'Позиция не указана',
           plan: updatedPlan,
           template_id: selectedTemplateId || undefined,
+          capture_mode: captureMode,
         });
       }
 
@@ -283,6 +287,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
           role: effectiveRole,
           plan: updatedPlan,
           template_id: selectedTemplateId || undefined,
+          capture_mode: captureMode,
         });
       }
 
@@ -319,7 +324,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
         version: 'consent-v1.0-ru',
       });
 
-      onInterviewStarted(invId, plan);
+      onInterviewStarted(invId, plan, captureMode);
     } catch (err: any) {
       const message = typeof err === 'string'
         ? err

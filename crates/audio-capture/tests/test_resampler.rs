@@ -1,6 +1,6 @@
 use audio_capture::{
-    calculate_rms_f32, calculate_rms_i16, f32_to_pcm_s16le,
-    multi_channel_to_mono_f32, resample_linear_f32,
+    calculate_rms_f32, calculate_rms_i16, f32_to_pcm_s16le, multi_channel_to_mono_f32,
+    resample_linear_f32,
 };
 
 #[test]

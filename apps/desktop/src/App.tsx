@@ -5,7 +5,7 @@ import { JobTemplatesScreen } from './screens/JobTemplatesScreen';
 import { SetupScreen } from './screens/SetupScreen';
 import { LiveSessionScreen } from './screens/LiveSessionScreen';
 import { ReviewScreen } from './screens/ReviewScreen';
-import { InterviewPlan, InterviewStatus } from './types';
+import { InterviewPlan, InterviewStatus, CaptureMode } from './types';
 import { getActiveSession, getInterview } from './services/api';
 import { AlertCircle, X } from 'lucide-react';
 
@@ -23,6 +23,9 @@ export const App: React.FC = () => {
     candidateName: string;
     role: string;
     plan: InterviewPlan;
+    captureMode?: CaptureMode;
+    isPaused?: boolean;
+    elapsedMs?: number;
   } | null>(null);
 
   // Existing draft ID to resume in SetupScreen
@@ -40,7 +43,9 @@ export const App: React.FC = () => {
             const data = await getInterview(activeSessionId);
             if (data && data.interview) {
               setInterviewId(activeSessionId);
-              setInterviewStatus(data.interview.status);
+              const restoredStatus = sessionInfo.is_paused ? 'paused' : data.interview.status;
+              setInterviewStatus(restoredStatus);
+              const mode = data.interview.capture_mode as CaptureMode | undefined;
               if (data.plan) {
                 setPlan(data.plan);
                 setActiveRecordingSession({
@@ -48,6 +53,9 @@ export const App: React.FC = () => {
                   candidateName: data.plan.title,
                   role: data.plan.role,
                   plan: data.plan,
+                  captureMode: mode,
+                  isPaused: sessionInfo.is_paused,
+                  elapsedMs: sessionInfo.elapsed_ms,
                 });
               }
               if (
@@ -72,7 +80,7 @@ export const App: React.FC = () => {
 
   const getStatus = (): InterviewStatus => {
     if (activeRecordingSession && screen === 'live') {
-      return 'recording';
+      return activeRecordingSession.isPaused ? 'paused' : interviewStatus === 'paused' ? 'paused' : 'recording';
     }
     switch (screen) {
       case 'setup':
@@ -142,6 +150,17 @@ export const App: React.FC = () => {
         setSetupExistingInterviewId(id);
         setScreen('setup');
       } else if (actualStatus === 'recording' || actualStatus === 'paused') {
+        const mode = data.interview?.capture_mode as CaptureMode | undefined;
+        if (data.plan) {
+          setActiveRecordingSession({
+            interviewId: id,
+            candidateName: data.plan.title,
+            role: data.plan.role,
+            plan: data.plan,
+            captureMode: mode,
+            isPaused: actualStatus === 'paused',
+          });
+        }
         setScreen('live');
       } else {
         // processing, review, finalized
@@ -153,7 +172,7 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleInterviewStarted = (id: string, newPlan: InterviewPlan) => {
+  const handleInterviewStarted = (id: string, newPlan: InterviewPlan, captureMode?: CaptureMode) => {
     setInterviewId(id);
     setPlan(newPlan);
     setInterviewStatus('recording');
@@ -162,6 +181,9 @@ export const App: React.FC = () => {
       candidateName: newPlan.title,
       role: newPlan.role,
       plan: newPlan,
+      captureMode,
+      isPaused: false,
+      elapsedMs: 0,
     });
     setScreen('live');
   };
@@ -192,6 +214,7 @@ export const App: React.FC = () => {
             : undefined
         }
         isCapturing={Boolean(activeRecordingSession)}
+        captureMode={activeRecordingSession?.captureMode}
         currentScreen={screen}
         onNavigate={handleNavigate}
         activeRecordingSession={activeRecordingSession}

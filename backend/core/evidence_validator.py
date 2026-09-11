@@ -109,11 +109,10 @@ def validate_proposal(
             )
 
         # 4. Check score range
-        if score_item.score is not None:
-            if score_item.score < min_score or score_item.score > max_score:
-                errors.append(
-                    f"Score {score_item.score} for criterion '{score_item.criterion_id}' is out of allowed range [{min_score}, {max_score}]."
-                )
+        if score_item.score is not None and (score_item.score < min_score or score_item.score > max_score):
+            errors.append(
+                f"Score {score_item.score} for criterion '{score_item.criterion_id}' is out of allowed range [{min_score}, {max_score}]."
+            )
 
         # 5. If score is provided, evidence should ideally be present
         if score_item.score is not None and not score_item.evidence:
@@ -152,11 +151,10 @@ def validate_proposal(
                     f"Invalid evidence for criterion '{score_item.criterion_id}': {err_msg}"
                 )
 
-            if ev.start_char is not None and ev.end_char is not None:
-                if ev.start_char < 0 or ev.end_char > len(seg.text) or ev.start_char > ev.end_char:
-                    errors.append(
-                        f"Invalid char offsets [{ev.start_char}:{ev.end_char}] for segment length {len(seg.text)}."
-                    )
+            if ev.start_char is not None and ev.end_char is not None and (ev.start_char < 0 or ev.end_char > len(seg.text) or ev.start_char > ev.end_char):
+                errors.append(
+                    f"Invalid char offsets [{ev.start_char}:{ev.end_char}] for segment length {len(seg.text)}."
+                )
 
     if proposal.critical_errors:
         requires_review = True

@@ -11,13 +11,13 @@ Validates:
 8. Audit event log immutability
 """
 
-import sys
-import os
-import json
-import uuid
-import tempfile
 import asyncio
+import os
+import sys
+import tempfile
+import uuid
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,11 +25,13 @@ load_dotenv()
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from starlette.testclient import TestClient
+
+from backend.api import app as api_module
 from backend.db.database import Database
 from backend.db.repository import Repository
 from backend.workers.pipeline import PipelineWorker
-from backend.api import app as api_module
-from starlette.testclient import TestClient
+
 
 def run_stage3_e2e():
     print("=" * 70)
@@ -107,7 +109,7 @@ def run_stage3_e2e():
 
         interview = repo.get_interview(interview_id)
         assert interview["status"] == "recording"
-        print(f"[3/7] Transitioned lifecycle: draft -> ready -> recording (with verified consent)")
+        print("[3/7] Transitioned lifecycle: draft -> ready -> recording (with verified consent)")
 
         # 4. Ingest Transcript Segments
         repo.add_transcript_segment(
@@ -157,7 +159,7 @@ def run_stage3_e2e():
 
         segments = repo.get_transcript_segments(interview_id)
         assert len(segments) == 3
-        print(f"[4/7] Ingested 3 transcript segments successfully into SQLite")
+        print("[4/7] Ingested 3 transcript segments successfully into SQLite")
 
         # 5. Enqueue & Run Pipeline Worker for Question Evaluation via Gemini 3.8 Flash
         repo.enqueue_job(
@@ -184,7 +186,7 @@ def run_stage3_e2e():
             }
         )
 
-        print(f"[5/7] Enqueued 2 EVALUATE_QUESTION background jobs in durable SQLite queue")
+        print("[5/7] Enqueued 2 EVALUATE_QUESTION background jobs in durable SQLite queue")
 
         worker = PipelineWorker(repo)
         async def drain_queue():
@@ -245,7 +247,7 @@ def run_stage3_e2e():
             json={"current_status": "review", "target_status": "finalized"}
         )
         assert fin_resp.status_code == 200
-        print(f"[6/7] Human review & calibration completed; interview transitioned to finalized")
+        print("[6/7] Human review & calibration completed; interview transitioned to finalized")
 
         # 7. Final Report Calculation & Export Verification
         export_resp = client.get(f"/api/v1/interviews/{interview_id}/export")
@@ -260,11 +262,11 @@ def run_stage3_e2e():
         assert len(export_data["decisions"]) == 2
         assert len(export_data["audit_trail"]) >= 4
 
-        print(f"[7/7] Export verified:")
+        print("[7/7] Export verified:")
         print(f"  - Final 100-pt Score: {export_data['final_score_100']}/100")
         print(f"  - Human Approved Decisions: {len(export_data['decisions'])}")
         print(f"  - Audit Trail Events: {len(export_data['audit_trail'])}")
-        print(f"  - Export JSON Integrity: 100% OK")
+        print("  - Export JSON Integrity: 100% OK")
 
         print("=" * 70)
         print("STAGE 3 END-TO-END ACCEPTANCE SUCCEEDED!")

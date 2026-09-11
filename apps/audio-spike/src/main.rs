@@ -1,14 +1,13 @@
+use anyhow::{bail, Context, Result};
+use audio_capture::{
+    list_input_devices, list_output_devices, simulate_track_recording, start_device_capture,
+    AudioSpoolManager, MonotonicInterviewClock, SyntheticTrackConfig, TrackType,
+};
+use clap::{Parser, Subcommand};
+use cpal::traits::{DeviceTrait, HostTrait};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
-use cpal::traits::{DeviceTrait, HostTrait};
-use audio_capture::{
-    list_input_devices, list_output_devices, simulate_track_recording,
-    start_device_capture, AudioSpoolManager, MonotonicInterviewClock,
-    SyntheticTrackConfig, TrackType,
-};
 
 #[derive(Parser)]
 #[command(name = "nebula-audio-spike")]
@@ -148,9 +147,13 @@ fn main() -> Result<()> {
             }
             println!("\nStopping capture and sealing spool...");
             let stats = handle.stop()?;
-            println!("Capture stats: {} chunks, {} samples, {} ms, dropped: {}",
-                stats.total_chunks, stats.total_samples, stats.total_duration_ms, stats.dropped_samples);
-
+            println!(
+                "Capture stats: {} chunks, {} samples, {} ms, dropped: {}",
+                stats.total_chunks,
+                stats.total_samples,
+                stats.total_duration_ms,
+                stats.dropped_samples
+            );
 
             println!("\nVerifying captured spool...");
             let report = spool.verify_track_spool(&interview_id, TrackType::Interviewer)?;
@@ -168,9 +171,15 @@ fn main() -> Result<()> {
             println!("\nSUCCESS: Real audio recorded and verified successfully.");
         }
 
-        Commands::VerifySpool { spool_dir, interview_id } => {
+        Commands::VerifySpool {
+            spool_dir,
+            interview_id,
+        } => {
             let spool = AudioSpoolManager::new(&spool_dir);
-            println!("Verifying spool in {:?} for interview '{}'...", spool_dir, interview_id);
+            println!(
+                "Verifying spool in {:?} for interview '{}'...",
+                spool_dir, interview_id
+            );
 
             for track in [TrackType::Interviewer, TrackType::Candidate] {
                 match spool.verify_track_spool(&interview_id, track) {
@@ -182,7 +191,10 @@ fn main() -> Result<()> {
                         println!("  Valid: {}", report.is_valid);
                     }
                     Err(e) => {
-                        println!("\nTrack {:?}: Directory not found or unreadable ({})", track, e);
+                        println!(
+                            "\nTrack {:?}: Directory not found or unreadable ({})",
+                            track, e
+                        );
                     }
                 }
             }
@@ -195,7 +207,11 @@ fn main() -> Result<()> {
         } => {
             println!("==================================================");
             println!("Nebula Synthetic 2-Channel Stress & Drift Test");
-            println!("Simulated Duration: {} seconds ({} hours)", simulated_duration_sec, simulated_duration_sec as f64 / 3600.0);
+            println!(
+                "Simulated Duration: {} seconds ({} hours)",
+                simulated_duration_sec,
+                simulated_duration_sec as f64 / 3600.0
+            );
             println!("Candidate Drift: {:+.1} PPM", candidate_drift_ppm);
             println!("Output Spool: {:?}", output_dir);
             println!("==================================================\n");
@@ -223,28 +239,69 @@ fn main() -> Result<()> {
 
             println!("Simulating Track 1 (Interviewer)...");
             let t0 = std::time::Instant::now();
-            let res_i = simulate_track_recording(interview_id, &interviewer_cfg, spool.clone(), simulated_duration_sec, 2000)?;
-            println!("  Done in {:.2?}. Total chunks: {}, Drift: {} ms", t0.elapsed(), res_i.total_chunks, res_i.calculated_drift_ms);
+            let res_i = simulate_track_recording(
+                interview_id,
+                &interviewer_cfg,
+                spool.clone(),
+                simulated_duration_sec,
+                2000,
+            )?;
+            println!(
+                "  Done in {:.2?}. Total chunks: {}, Drift: {} ms",
+                t0.elapsed(),
+                res_i.total_chunks,
+                res_i.calculated_drift_ms
+            );
 
-            println!("Simulating Track 2 (Candidate with drift {:+.1} PPM)...", candidate_drift_ppm);
+            println!(
+                "Simulating Track 2 (Candidate with drift {:+.1} PPM)...",
+                candidate_drift_ppm
+            );
             let t1 = std::time::Instant::now();
-            let res_c = simulate_track_recording(interview_id, &candidate_cfg, spool.clone(), simulated_duration_sec, 2000)?;
-            println!("  Done in {:.2?}. Total chunks: {}, Drift: {} ms", t1.elapsed(), res_c.total_chunks, res_c.calculated_drift_ms);
+            let res_c = simulate_track_recording(
+                interview_id,
+                &candidate_cfg,
+                spool.clone(),
+                simulated_duration_sec,
+                2000,
+            )?;
+            println!(
+                "  Done in {:.2?}. Total chunks: {}, Drift: {} ms",
+                t1.elapsed(),
+                res_c.total_chunks,
+                res_c.calculated_drift_ms
+            );
 
             let skew_ms = res_c.calculated_drift_ms - res_i.calculated_drift_ms;
-            println!("\nResults over {} hours of audio:", simulated_duration_sec as f64 / 3600.0);
+            println!(
+                "\nResults over {} hours of audio:",
+                simulated_duration_sec as f64 / 3600.0
+            );
             println!("  Channel Skew (Candidate - Interviewer): {} ms", skew_ms);
-            println!("  Target threshold: |skew| <= 200 ms: {}", if skew_ms.abs() <= 200 { "PASSED" } else { "FAILED" });
+            println!(
+                "  Target threshold: |skew| <= 200 ms: {}",
+                if skew_ms.abs() <= 200 {
+                    "PASSED"
+                } else {
+                    "FAILED"
+                }
+            );
 
             println!("\nVerifying Interviewer Spool...");
             let rep_i = spool.verify_track_spool(interview_id, TrackType::Interviewer)?;
             assert!(rep_i.is_valid && rep_i.is_sealed);
-            println!("  ✓ {} chunks verified with valid SHA-256", rep_i.verified_chunks);
+            println!(
+                "  ✓ {} chunks verified with valid SHA-256",
+                rep_i.verified_chunks
+            );
 
             println!("Verifying Candidate Spool...");
             let rep_c = spool.verify_track_spool(interview_id, TrackType::Candidate)?;
             assert!(rep_c.is_valid && rep_c.is_sealed);
-            println!("  ✓ {} chunks verified with valid SHA-256", rep_c.verified_chunks);
+            println!(
+                "  ✓ {} chunks verified with valid SHA-256",
+                rep_c.verified_chunks
+            );
 
             println!("\n==================================================");
             println!("SYNTHETIC SPIKE PASSED: 100% integrity, clock drift within tolerance.");

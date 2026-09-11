@@ -1,5 +1,5 @@
 import React from 'react';
-import { InterviewStatus } from '../types';
+import { InterviewStatus, CaptureMode } from '../types';
 import { AudioMeters } from './AudioMeters';
 import { Sparkles, ShieldCheck, Briefcase, FileSpreadsheet, ArrowRight } from 'lucide-react';
 
@@ -8,12 +8,14 @@ interface HeaderProps {
   candidateName?: string;
   role?: string;
   isCapturing?: boolean;
+  captureMode?: CaptureMode;
   currentScreen?: 'home' | 'templates' | 'setup' | 'live' | 'review';
   onNavigate?: (screen: 'home' | 'templates' | 'live') => void;
   activeRecordingSession?: {
     interviewId: string;
     candidateName: string;
     role: string;
+    captureMode?: CaptureMode;
   } | null;
 }
 
@@ -22,6 +24,7 @@ export const Header: React.FC<HeaderProps> = ({
   candidateName = 'Новое собеседование',
   role = 'Позиция не выбрана',
   isCapturing = false,
+  captureMode,
   currentScreen = 'home',
   onNavigate,
   activeRecordingSession = null,
@@ -149,7 +152,7 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* Right: Audio Monitoring */}
       <div className="flex items-center space-x-4">
-        <AudioMeters isCapturing={isCapturing} />
+        <AudioMeters isCapturing={isCapturing} captureMode={captureMode || activeRecordingSession?.captureMode} />
       </div>
     </header>
   );

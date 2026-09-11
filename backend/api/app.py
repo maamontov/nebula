@@ -2,15 +2,20 @@
 FastAPI entry point for Nebula backend.
 Provides endpoints for health check, scoring, proposal validation, and lifecycle.
 """
+import contextlib
 import hashlib
 import json
-import uuid
 import os
+import uuid
 from typing import Any
+
 from dotenv import load_dotenv
 
 # Ensure environment variables (.env) are loaded
 load_dotenv()
+import re
+from pathlib import Path
+
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -31,9 +36,8 @@ from backend.core.state_machine import (
 )
 from backend.db.database import get_db
 from backend.db.repository import Repository, RepositoryConflictError
-from contracts.audio import AudioChunkMetadata
+from contracts.audio import AudioChunkMetadata, TrackManifest
 from contracts.domain import (
-
     AssessmentProposal,
     HumanCriterionScore,
     HumanQuestionAssessment,
@@ -44,9 +48,6 @@ from contracts.domain import (
     RubricRevision,
     TranscriptRevision,
 )
-
-import re
-from pathlib import Path
 
 app = FastAPI(
     title="Nebula Backend API",
@@ -130,6 +131,7 @@ class UpdateInterviewDraftRequest(BaseModel):
     candidate_name: str | None = None
     role: str | None = None
     plan: dict[str, Any] | None = None
+    capture_mode: str | None = None
     template_id: str | None = None
     template_version: int | None = None
 
@@ -169,6 +171,7 @@ class AddSegmentRequest(BaseModel):
 
 class UpdateSpeakerRoleRequest(BaseModel):
     speaker_role: str
+    expected_revision_id: str | None = None
 
 
 class SplitSegmentRequest(BaseModel):
@@ -177,6 +180,8 @@ class SplitSegmentRequest(BaseModel):
     text_part2: str
     role_part1: str = "interviewer"
     role_part2: str = "candidate"
+    expected_revision_id: str | None = None
+
 
 
 class ApproveAssessmentRequest(BaseModel):
@@ -212,6 +217,8 @@ class TransitionStateRequest(BaseModel):
 class ReassociateSegmentRequest(BaseModel):
     new_question_id: str
     notes: str = "Manually reassociated by reviewer"
+    expected_revision_id: str | None = None
+
 
 
 class BatchRetranscribeRequest(BaseModel):
@@ -261,7 +268,7 @@ class IngestAudioChunkRequest(BaseModel):
 
 
 class StopInterviewRequest(BaseModel):
-    manifests: list[dict[str, Any]] = Field(default_factory=list)
+    manifests: list[TrackManifest] = Field(default_factory=list)
 
 
 @app.get("/healthz")
@@ -480,14 +487,24 @@ async def update_interview_endpoint(
             detail=f"Cannot edit interview in status '{inv['status']}', expected 'draft' or 'ready'",
         )
 
-    repo.update_interview_draft(
-        interview_id=interview_id,
-        title=payload.title,
-        candidate_name=payload.candidate_name,
-        role=payload.role,
-        template_id=payload.template_id,
-        template_version=payload.template_version,
-    )
+    if payload.capture_mode is not None and payload.capture_mode not in ("single_source", "dual_source"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid capture_mode '{payload.capture_mode}', expected 'single_source' or 'dual_source'",
+        )
+
+    try:
+        repo.update_interview_draft(
+            interview_id=interview_id,
+            title=payload.title,
+            candidate_name=payload.candidate_name,
+            role=payload.role,
+            template_id=payload.template_id,
+            template_version=payload.template_version,
+            capture_mode=payload.capture_mode,
+        )
+    except RepositoryConflictError as err:
+        raise HTTPException(status_code=409, detail=str(err)) from err
 
     if payload.plan is not None:
         latest_plan = repo.get_latest_plan(interview_id)
@@ -503,7 +520,12 @@ async def update_interview_endpoint(
         event_id=f"audit-{uuid.uuid4().hex[:8]}",
         interview_id=interview_id,
         event_type="INTERVIEW_DRAFT_UPDATED",
-        payload={"title": payload.title, "candidate": payload.candidate_name, "role": payload.role},
+        payload={
+            "title": payload.title,
+            "candidate": payload.candidate_name,
+            "role": payload.role,
+            "capture_mode": payload.capture_mode,
+        },
     )
     return repo.get_interview(interview_id)
 
@@ -675,7 +697,7 @@ async def delete_interview_endpoint(
     except ValueError as val_err:
         raise HTTPException(status_code=400, detail=str(val_err))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Interview physical cleanup failed: {str(exc)}")
+        raise HTTPException(status_code=500, detail=f"Interview physical cleanup failed: {exc!s}")
 
     return {"status": "deleted", "interview_id": interview_id, "success": True}
 
@@ -699,10 +721,8 @@ def check_interview_readiness(
     expected_tracks = ["candidate", "interviewer"]
     if inv:
         if inv.get("expected_tracks_json"):
-            try:
+            with contextlib.suppress(Exception):
                 expected_tracks = json.loads(inv["expected_tracks_json"])
-            except Exception:
-                pass
         elif inv.get("capture_mode") == "single_source":
             expected_tracks = ["shared"]
 
@@ -1057,25 +1077,75 @@ async def stop_interview_endpoint(
     current_status = InterviewStatus(inv["status"])
     try:
         new_status = transition_status(current_status, InterviewStatus.PROCESSING)
+    except InvalidStateTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    expected_tracks = ["candidate", "interviewer"]
+    if inv.get("expected_tracks_json"):
+        with contextlib.suppress(Exception):
+            expected_tracks = json.loads(inv["expected_tracks_json"])
+    elif inv.get("capture_mode") == "single_source":
+        expected_tracks = ["shared"]
+
+    base_spool = Path(spool_dir).resolve()
+    interview_dir = (base_spool / interview_id).resolve()
+    try:
+        interview_dir.relative_to(base_spool)
+    except (ValueError, RuntimeError):
+        raise HTTPException(status_code=400, detail="Spool path traversal detected")
+
+    if (base_spool / interview_id).is_symlink():
+        raise HTTPException(status_code=400, detail="Symlinks in spool are forbidden")
+
+    if payload and payload.manifests:
+        for manifest in payload.manifests:
+            if manifest.interview_id != interview_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Manifest interview_id '{manifest.interview_id}' does not match URL '{interview_id}'",
+                )
+            track_val = manifest.track_id.value if hasattr(manifest.track_id, "value") else str(manifest.track_id)
+            if track_val not in expected_tracks:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unexpected track '{track_val}' for interview {interview_id}. Expected: {expected_tracks}",
+                )
+            if manifest.total_chunks < 0 or manifest.total_duration_ms < 0 or manifest.total_samples < 0 or manifest.dropped_samples < 0:
+                raise HTTPException(status_code=422, detail="Manifest counters cannot be negative")
+
+            track_path = base_spool / interview_id / track_val
+            if track_path.is_symlink():
+                raise HTTPException(status_code=400, detail="Symlinks in spool are forbidden")
+            try:
+                track_path.resolve().relative_to(base_spool)
+            except (ValueError, RuntimeError):
+                raise HTTPException(status_code=400, detail="Spool path traversal detected")
+
+        # Atomic writes of all manifests
+        interview_dir.mkdir(parents=True, exist_ok=True)
+        for manifest in payload.manifests:
+            track_val = manifest.track_id.value if hasattr(manifest.track_id, "value") else str(manifest.track_id)
+            track_path = interview_dir / track_val
+            if track_path.is_symlink():
+                raise HTTPException(status_code=400, detail="Symlinks in spool are forbidden")
+            track_path.mkdir(parents=True, exist_ok=True)
+            manifest_path = track_path / "manifest.json"
+            tmp_path = track_path / f"manifest.json.tmp.{uuid.uuid4().hex}"
+            data = manifest.model_dump_json(indent=2)
+            tmp_path.write_text(data, encoding="utf-8")
+            os.replace(tmp_path, manifest_path)
+
+    if current_status != new_status:
         repo.update_interview_status(interview_id, new_status)
-
-        if payload and payload.manifests:
-            for manifest_dict in payload.manifests:
-                track = manifest_dict.get("track_id", "unknown")
-                track_dir = Path(spool_dir) / interview_id / track
-                track_dir.mkdir(parents=True, exist_ok=True)
-                manifest_path = track_dir / "manifest.json"
-                manifest_path.write_text(json.dumps(manifest_dict, indent=2, ensure_ascii=False), encoding="utf-8")
-
         repo.record_audit_event(
             event_id=f"audit-{uuid.uuid4().hex[:8]}",
             interview_id=interview_id,
             event_type="INTERVIEW_STOPPED",
             payload={"from": current_status.value, "to": new_status.value},
         )
-        return {"status": new_status.value}
-    except InvalidStateTransitionError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+
+    return {"status": new_status.value}
+
 
 
 @app.post("/api/v1/interviews/{interview_id}/segments")
@@ -1130,6 +1200,7 @@ async def update_segment_speaker_role_endpoint(
             interview_id=interview_id,
             segment_id=segment_id,
             speaker_role=role,
+            expected_revision_id=payload.expected_revision_id,
         )
         return {"status": "ok", "segment": updated}
     except ValueError as e:
@@ -1160,6 +1231,7 @@ async def split_segment_endpoint(
             text_part2=payload.text_part2,
             role_part1=payload.role_part1,
             role_part2=payload.role_part2,
+            expected_revision_id=payload.expected_revision_id,
         )
         return {"status": "ok", "segment_part1": seg1, "segment_part2": seg2}
     except ValueError as e:
@@ -1180,6 +1252,18 @@ async def enqueue_job_endpoint(
     if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
         raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
 
+    if payload.type == "EVALUATE_QUESTION":
+        q_id = payload.payload.get("question_id")
+        plan = repo.get_latest_plan(interview_id)
+        if plan and "payload" in plan and "questions" in plan["payload"]:
+            known_q_ids = {q["id"] for q in plan["payload"]["questions"]}
+            if q_id not in known_q_ids:
+                raise HTTPException(status_code=400, detail=f"Question '{q_id}' not found in interview plan")
+        # Fix active revisions on server and strip arbitrary candidate_text
+        payload.payload["rubric_revision_id"] = payload.payload.get("rubric_revision_id") or inv.get("active_rubric_revision_id") or "rub-rev-1"
+        payload.payload["transcript_revision_id"] = payload.payload.get("transcript_revision_id") or inv.get("active_transcript_revision_id") or "trans-rev-1"
+        payload.payload.pop("candidate_text", None)
+
     try:
         repo.enqueue_job(
             job_id=payload.id,
@@ -1191,6 +1275,7 @@ async def enqueue_job_endpoint(
         return {"status": "enqueued", "job_id": payload.id}
     except RepositoryConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
+
 
 
 @app.get("/api/v1/interviews/{interview_id}/jobs/status")
@@ -1638,6 +1723,7 @@ async def confirm_summary_endpoint(
             reviewer_id=payload.reviewer_id,
             confirmed_markdown=payload.confirmed_markdown,
             confirmed_recommendation=payload.confirmed_recommendation,
+            expected_transcript_revision=payload.expected_transcript_revision,
         )
 
         repo.record_audit_event(
@@ -1765,12 +1851,19 @@ async def reassociate_segment_endpoint(
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
 
-    repo.reassociate_segment(
-        interview_id=interview_id,
-        segment_id=segment_id,
-        new_question_id=payload.new_question_id,
-        notes=payload.notes,
-    )
+    try:
+        repo.reassociate_segment(
+            interview_id=interview_id,
+            segment_id=segment_id,
+            new_question_id=payload.new_question_id,
+            notes=payload.notes,
+            expected_revision_id=payload.expected_revision_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RepositoryConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
     repo.record_audit_event(
         event_id=f"audit-{uuid.uuid4().hex[:8]}",
         interview_id=interview_id,
@@ -1782,6 +1875,7 @@ async def reassociate_segment_endpoint(
         },
     )
     return {"status": "reassociated", "segment_id": segment_id, "question_id": payload.new_question_id}
+
 
 
 @app.get("/api/v1/interviews/{interview_id}/health")
@@ -1881,7 +1975,7 @@ async def backup_database_endpoint(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Backup failed: {e!s}")
 
 
 @app.get("/api/v1/system/integrity")

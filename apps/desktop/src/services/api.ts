@@ -652,7 +652,8 @@ export async function reassociateSegment(
   interviewId: string,
   segmentId: string,
   newQuestionId: string,
-  notes: string = "Ручная привязка интервьюером"
+  notes: string = "Ручная привязка интервьюером",
+  expectedRevisionId?: string
 ): Promise<{ status: string }> {
   const res = await fetch(`${API_BASE}/interviews/${interviewId}/segments/${segmentId}/associate`, {
     method: 'POST',
@@ -660,6 +661,7 @@ export async function reassociateSegment(
     body: JSON.stringify({
       new_question_id: newQuestionId,
       notes,
+      ...(expectedRevisionId ? { expected_revision_id: expectedRevisionId } : {}),
     }),
   });
   if (!res.ok) throw new Error(`Reassociate error: ${res.statusText}`);
@@ -868,12 +870,16 @@ export async function checkDatabaseIntegrity(): Promise<{
 export async function setSegmentSpeakerRole(
   interviewId: string,
   segmentId: string,
-  speakerRole: SpeakerRole
+  speakerRole: SpeakerRole,
+  expectedRevisionId?: string
 ): Promise<{ status: string; segment: TranscriptSegment }> {
   const res = await fetch(`${API_BASE}/interviews/${interviewId}/segments/${segmentId}/speaker-role`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ speaker_role: speakerRole }),
+    body: JSON.stringify({
+      speaker_role: speakerRole,
+      ...(expectedRevisionId ? { expected_revision_id: expectedRevisionId } : {}),
+    }),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -888,6 +894,7 @@ export async function splitSegment(
     text_part2: string;
     role_part1: SpeakerRole;
     role_part2: SpeakerRole;
+    expected_revision_id?: string;
   }
 ): Promise<{ status: string; segment_part1: TranscriptSegment; segment_part2: TranscriptSegment }> {
   const res = await fetch(`${API_BASE}/interviews/${interviewId}/segments/${segmentId}/split`, {
@@ -936,6 +943,7 @@ export async function updateInterviewDraft(
     plan?: InterviewPlan;
     template_id?: string;
     template_version?: number;
+    capture_mode?: CaptureMode;
   }
 ): Promise<any> {
   const res = await fetch(`${API_BASE}/interviews/${id}`, {

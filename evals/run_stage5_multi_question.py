@@ -12,14 +12,14 @@ Verifies:
 8. Multi-question human review, weighted score calculation, and final JSON export.
 """
 
-import sys
-import os
-import time
-import json
-import uuid
-import tempfile
 import asyncio
+import os
+import sys
+import tempfile
+import time
+import uuid
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,14 +27,14 @@ load_dotenv()
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from starlette.testclient import TestClient
+
+from backend.adapters.resilient_llm import ResilientLLMAdapter
+from backend.api import app as api_module
+from backend.core.matcher import QuestionMatcher
 from backend.db.database import Database
 from backend.db.repository import Repository
-from backend.core.matcher import QuestionMatcher
-from backend.core.audio_health import AudioHealthMonitor, ChannelMetrics
-from backend.adapters.resilient_llm import ResilientLLMAdapter
 from backend.workers.pipeline import PipelineWorker
-from backend.api import app as api_module
-from starlette.testclient import TestClient
 
 
 def run_stage5_acceptance():
@@ -197,14 +197,14 @@ def run_stage5_acceptance():
 
         segments = repo.get_transcript_segments(interview_id)
         assert len(segments) == 8
-        print(f"[Step 3/7] Ingested 8 multi-question transcript segments (total duration ~78s)")
+        print("[Step 3/7] Ingested 8 multi-question transcript segments (total duration ~78s)")
 
         # 4. Question Association, Clarification & Interruption Verification
         matcher = QuestionMatcher()
         interruptions = matcher.detect_interruptions(segments)
         assert len(interruptions) > 0, "Expected at least 1 speech interruption detected"
         interruption = interruptions[0]
-        print(f"[Step 4/7] Interruption detected:")
+        print("[Step 4/7] Interruption detected:")
         print(f"  - Overlap tracks: {interruption.interrupted_track} interrupted by {interruption.interrupting_track}")
         print(f"  - Overlap duration: {interruption.overlap_duration_ms} ms (at {interruption.overlap_start_ms}ms - {interruption.overlap_end_ms}ms)")
 
@@ -236,7 +236,7 @@ def run_stage5_acceptance():
         assert health_resp.status_code == 200
         health_data = health_resp.json()
         assert health_data["is_healthy"] is True
-        print(f"[Step 5/7] Audio channel health verified:")
+        print("[Step 5/7] Audio channel health verified:")
         print(f"  - Interviewer status: {health_data['interviewer']['status']}")
         print(f"  - Candidate status:   {health_data['candidate']['status']}")
 
@@ -340,7 +340,7 @@ def run_stage5_acceptance():
         assert len(export_data["audit_trail"]) >= 8
 
         total_time = time.perf_counter() - start_time
-        print(f"[Step 7/7] Multi-Question Live Session Finalized:")
+        print("[Step 7/7] Multi-Question Live Session Finalized:")
         print(f"  - Final 100-pt Score: {export_data['final_score_100']}/100")
         print(f"  - Questions Assessed: {len(export_data['decisions'])}")
         print(f"  - Audit Trail Events: {len(export_data['audit_trail'])}")

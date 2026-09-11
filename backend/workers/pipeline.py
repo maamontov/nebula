@@ -7,10 +7,12 @@ Processes background jobs with lease timeouts, retry backoff, and idempotent exe
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from pathlib import Path
+import sqlite3
 import struct
 import uuid
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -23,16 +25,14 @@ from backend.adapters.resilient_llm import ResilientLLMAdapter
 from backend.adapters.stt import OpenAICompatibleSTTAdapter, STTRateLimitError
 from backend.core.audio_utils import pcm_s16le_to_wav_bytes
 from backend.core.evidence_validator import validate_proposal
-
 from backend.core.matcher import QuestionMatcher
-from backend.core.revisions import TranscriptDiffEngine
-from backend.core.summary_generator import ExecutiveSummaryGenerator
 from backend.core.profiles import (
-    get_plusvibe_gemini_model,
     get_plusvibe_provider,
     get_plusvibe_whisper_stt,
 )
-from backend.db.repository import Repository
+from backend.core.revisions import TranscriptDiffEngine
+from backend.core.summary_generator import ExecutiveSummaryGenerator
+from backend.db.repository import Repository, RepositoryConflictError
 from contracts.audio import TrackType
 from contracts.domain import (
     AssessmentProposal,
@@ -70,6 +70,24 @@ class PipelineWorker:
         self.llm_adapter = llm_adapter or ResilientLLMAdapter()
         self._running = False
 
+    async def _lease_heartbeat(
+        self,
+        job_id: str,
+        owner_token: str,
+        grouped_ids: list[str],
+        interval_sec: float = 15.0,
+    ) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval_sec)
+                self.repo.renew_job_lease(job_id, owner_token, extension_sec=60)
+                for gid in list(grouped_ids):
+                    self.repo.renew_job_lease(gid, owner_token, extension_sec=60)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Error renewing lease for job %s: %s", job_id, exc)
+
     async def process_one_job(self) -> bool:
         """Claims and executes a single job with atomic lease lock. Returns True if job was processed."""
         job = self.repo.claim_next_job(lock_duration_sec=60)
@@ -89,17 +107,26 @@ class PipelineWorker:
             self.repo.fail_job(job_id, "Interview was deleted (privacy lifecycle)", owner_token=owner_token)
             return True
 
+        active_grouped_ids: list[str] = []
+        heartbeat_task = None
+        if owner_token:
+            heartbeat_task = asyncio.create_task(
+                self._lease_heartbeat(job_id, owner_token, active_grouped_ids)
+            )
+
         try:
             if job_type == "TRANSCRIBE_AUDIO":
-                grouped_ids = await self._handle_transcribe(interview_id, payload, owner_token=owner_token)
+                grouped_ids = await self._handle_transcribe(
+                    interview_id, payload, owner_token=owner_token, active_grouped_ids=active_grouped_ids
+                )
                 for gid in grouped_ids:
                     self.repo.complete_job(gid, owner_token=owner_token)
             elif job_type == "EVALUATE_QUESTION":
-                await self._handle_evaluate(interview_id, payload)
+                await self._handle_evaluate(interview_id, payload, owner_token=owner_token, job_id=job_id)
             elif job_type == "BATCH_RETRANSCRIBE":
-                await self._handle_batch_retranscribe(interview_id, payload)
+                await self._handle_batch_retranscribe(interview_id, payload, owner_token=owner_token, job_id=job_id)
             elif job_type == "GENERATE_SUMMARY":
-                await self._handle_generate_summary(interview_id, payload)
+                await self._handle_generate_summary(interview_id, payload, owner_token=owner_token, job_id=job_id)
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
 
@@ -117,9 +144,14 @@ class PipelineWorker:
                 payload={"job_id": job_id},
             )
             return True
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Job %s (%s) failed: %s", job_id, job_type, exc)
+        except Exception as exc:
+            logger.exception("Job %s (%s) failed", job_id, job_type)
             self.repo.fail_job(job_id, str(exc), owner_token=owner_token)
+            for gid in active_grouped_ids:
+                try:
+                    self.repo.fail_job(gid, f"Parent batch job {job_id} failed: {exc}", owner_token=owner_token)
+                except (sqlite3.Error, RepositoryConflictError, RuntimeError) as fail_err:
+                    logger.debug("Failed to mark child job %s as failed: %s", gid, fail_err)
             self.repo.record_audit_event(
                 event_id=f"audit-{uuid.uuid4().hex[:8]}",
                 interview_id=interview_id,
@@ -131,12 +163,18 @@ class PipelineWorker:
                 logger.info("Pacing worker loop due to rate limit: sleeping %.1fs", retry_wait)
                 await asyncio.sleep(retry_wait)
             return False
+        finally:
+            if heartbeat_task:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
 
     async def _handle_transcribe(
         self,
         interview_id: str,
         payload: dict[str, Any],
         owner_token: str | None = None,
+        active_grouped_ids: list[str] | None = None,
     ) -> list[str]:
         audio_bytes = bytes.fromhex(payload["audio_hex"])
         track_id = payload.get("track_id", "candidate")
@@ -146,6 +184,7 @@ class PipelineWorker:
         channels = payload.get("channels", 1)
         format_val = payload.get("format", "pcm_s16le")
         language = payload.get("language", "ru")
+        epoch = payload.get("epoch")
 
         is_real_stt = (
             isinstance(self.stt_adapter, OpenAICompatibleSTTAdapter)
@@ -163,18 +202,40 @@ class PipelineWorker:
             adjacent = self.repo.claim_adjacent_transcribe_jobs(
                 interview_id=interview_id,
                 track_id=track_id,
+                last_end_ms=end_ms,
+                epoch=epoch,
                 max_additional=3,
                 owner_token=owner_token,
             )
-            for adj_job in adjacent:
+            for idx, adj_job in enumerate(adjacent):
+                if active_grouped_ids is not None:
+                    active_grouped_ids.append(adj_job["id"])
                 adj_payload = adj_job.get("payload", {})
                 adj_hex = adj_payload.get("audio_hex", "")
                 if not adj_hex:
-                    continue
+                    # Release unused remaining adjacent jobs
+                    for unhandled in adjacent[idx:]:
+                        with self.repo.db.transaction() as conn:
+                            conn.execute(
+                                "UPDATE jobs SET status = 'PENDING', locked_until = NULL, locked_by = NULL WHERE id = ? AND locked_by = ?",
+                                (unhandled["id"], owner_token),
+                            )
+                        if active_grouped_ids and unhandled["id"] in active_grouped_ids:
+                            active_grouped_ids.remove(unhandled["id"])
+                    break
                 adj_bytes = bytes.fromhex(adj_hex)
                 # If an adjacent chunk is silence, complete it and stop grouping at natural speech pause
                 if is_pcm_silence(adj_bytes):
                     grouped_job_ids.append(adj_job["id"])
+                    # Release any remaining adjacent jobs that were claimed but not grouped
+                    for unhandled in adjacent[idx + 1:]:
+                        with self.repo.db.transaction() as conn:
+                            conn.execute(
+                                "UPDATE jobs SET status = 'PENDING', locked_until = NULL, locked_by = NULL WHERE id = ? AND locked_by = ?",
+                                (unhandled["id"], owner_token),
+                            )
+                        if active_grouped_ids and unhandled["id"] in active_grouped_ids:
+                            active_grouped_ids.remove(unhandled["id"])
                     break
                 audio_bytes += adj_bytes
                 end_ms = adj_payload.get("end_ms", end_ms)
@@ -236,7 +297,13 @@ class PipelineWorker:
         return grouped_job_ids
 
 
-    async def _handle_evaluate(self, interview_id: str, payload: dict[str, Any]) -> None:
+    async def _handle_evaluate(
+        self,
+        interview_id: str,
+        payload: dict[str, Any],
+        owner_token: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
         inv = self.repo.get_interview(interview_id)
         if not inv:
             logger.warning("Interview %s was deleted before evaluation. Discarding.", interview_id)
@@ -275,11 +342,9 @@ class PipelineWorker:
             else:
                 rubric_description = "Technical depth & correctness"
 
-        # 2. Fetch transcript segments and associations for this interview
+        # 2. Fetch transcript segments and associations strictly for this revision
         all_segments = self.repo.get_transcript_segments(interview_id, revision_id=trans_rev)
-        if not all_segments:
-            all_segments = self.repo.get_transcript_segments(interview_id)
-        assocs = self.repo.get_associations(interview_id)
+        assocs = self.repo.get_associations(interview_id, revision_id=trans_rev)
 
         # Identify candidate speech segments associated with this question (strictly exclude interviewer/unknown)
         associated_seg_ids = {a["segment_id"] for a in assocs if a.get("question_id") == question_id}
@@ -305,24 +370,13 @@ class PipelineWorker:
                     notes=r.notes,
                     revision_id=trans_rev,
                 )
-            assocs = self.repo.get_associations(interview_id)
+            assocs = self.repo.get_associations(interview_id, revision_id=trans_rev)
             associated_seg_ids = {a["segment_id"] for a in assocs if a.get("question_id") == question_id}
             candidate_segments_data = [
                 s for s in all_segments
                 if s["id"] in associated_seg_ids and is_candidate_segment(s)
             ]
 
-        # Backwards-compatibility fallback if provided in payload directly (e.g. mock unit tests)
-        if not candidate_segments_data and payload.get("candidate_text"):
-            candidate_segments_data = [
-                {
-                    "id": payload.get("segment_id", "seg-default"),
-                    "track_id": "candidate",
-                    "start_time_ms": 0,
-                    "end_time_ms": 10000,
-                    "text": payload["candidate_text"],
-                }
-            ]
 
         first_crit_id = criteria[0]["id"] if criteria else "criterion-core"
 
@@ -338,13 +392,22 @@ class PipelineWorker:
                 }
                 for c in (criteria if criteria else [{"id": first_crit_id}])
             ]
-            prop_id = f"prop-{uuid.uuid4().hex[:8]}"
+            prop_id = f"prop-eval-{job_id}" if job_id else f"prop-{uuid.uuid4().hex[:8]}"
             provider_val = getattr(self.provider, "id", None)
             prov_id = provider_val if isinstance(provider_val, str) else "system"
             model_val = getattr(getattr(self.llm_adapter, "model", None), "upstream_model_id", None)
             if not isinstance(model_val, str):
                 model_val = getattr(self.llm_adapter, "model_id", None)
-            mod_id = model_val if isinstance(model_val, str) else "system-no-answer"
+            mod_id = model_val if isinstance(model_val, str) else "default-evaluator"
+            current_inv = self.repo.get_interview(interview_id)
+            is_stale = False
+            stale_reason = None
+            if current_inv:
+                curr_rub = current_inv.get("active_rubric_revision_id") or "rub-rev-1"
+                curr_trans = current_inv.get("active_transcript_revision_id") or "trans-rev-1"
+                if curr_rub != rubric_rev or curr_trans != trans_rev:
+                    is_stale = True
+                    stale_reason = f"Revision mismatch during evaluation (eval: {rubric_rev}/{trans_rev}, current: {curr_rub}/{curr_trans})"
 
             self.repo.save_assessment_proposal(
                 proposal_id=prop_id,
@@ -355,11 +418,16 @@ class PipelineWorker:
                 critical_errors=[],
                 rubric_revision_id=rubric_rev,
                 transcript_revision_id=trans_rev,
+                is_stale=is_stale,
+                stale_reason=stale_reason,
                 is_rejected=False,
                 validation_errors=[],
                 provider_id=prov_id,
+                owner_token=owner_token,
+                job_id=job_id,
             )
             return
+
 
         # 3. Build candidate speech text with explicit individual segment IDs
         transcript_content = "\n".join(
@@ -479,8 +547,9 @@ Respond strictly with a JSON object conforming to:
                 )
             )
 
+        prop_id = f"prop-eval-{job_id}" if job_id else f"prop-{uuid.uuid4().hex[:8]}"
         proposal = AssessmentProposal(
-            id=f"prop-{uuid.uuid4().hex[:8]}",
+            id=prop_id,
             interview_id=interview_id,
             question_id=question_id,
             rubric_revision_id=rubric_rev,
@@ -490,20 +559,17 @@ Respond strictly with a JSON object conforming to:
             critical_errors=critical_errors,
         )
 
-        # Build TranscriptRevision with all segments available in interview
+        # Build TranscriptRevision with only allowed candidate segments for this question
         transcript_segment_objs: list[TranscriptSegment] = []
-        source_segments = all_segments if all_segments else candidate_segments_data
-        for s in source_segments:
-            cand = is_candidate_segment(s)
-            track = TrackType.CANDIDATE if cand else TrackType.INTERVIEWER
+        for s in candidate_segments_data:
             transcript_segment_objs.append(
                 TranscriptSegment(
                     id=s["id"],
-                    track_id=track,
+                    track_id=TrackType.CANDIDATE,
                     start_time_ms=s.get("start_time_ms", 0),
                     end_time_ms=s.get("end_time_ms", 0),
                     text=s.get("text", "").strip(),
-                    speaker_role="candidate" if cand else str(s.get("speaker_role", "unknown")),
+                    speaker_role="candidate",
                 )
             )
 
@@ -512,6 +578,7 @@ Respond strictly with a JSON object conforming to:
             interview_id=interview_id,
             segments=transcript_segment_objs,
         )
+
 
         allowed_criteria_ids = {c["id"] for c in criteria if "id" in c} if criteria else None
         validation = validate_proposal(proposal, transcript_obj, allowed_criteria_ids=allowed_criteria_ids)
@@ -554,9 +621,17 @@ Respond strictly with a JSON object conforming to:
             validation_errors=validation_errors,
             provider_id=prov_id,
             fallback_metadata=fallback_metadata,
+            owner_token=owner_token,
+            job_id=job_id,
         )
 
-    async def _handle_batch_retranscribe(self, interview_id: str, payload: dict[str, Any]) -> None:
+    async def _handle_batch_retranscribe(
+        self,
+        interview_id: str,
+        payload: dict[str, Any],
+        owner_token: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
         existing_revs = self.repo.get_transcript_revisions(interview_id)
         existing_rev_ids = {r["id"] for r in existing_revs}
         new_rev_id = payload.get("new_revision_id")
@@ -630,6 +705,7 @@ Respond strictly with a JSON object conforming to:
                 else:
                     seg_start = seg.get("start_time_ms", 0)
                     seg_end = seg.get("end_time_ms", 0)
+                    roles_overlapping = set()
                     best_overlap = 0
                     inherited_role = "unknown"
                     for old_s in old_segs:
@@ -638,10 +714,18 @@ Respond strictly with a JSON object conforming to:
                             o_start = max(seg_start, old_s.get("start_time_ms", 0))
                             o_end = min(seg_end, old_s.get("end_time_ms", 0))
                             overlap = max(0, o_end - o_start)
-                            if overlap > best_overlap:
-                                best_overlap = overlap
-                                inherited_role = old_role
-                    assigned_role = inherited_role if best_overlap > 0 else "unknown"
+                            if overlap > 0:
+                                roles_overlapping.add(old_role)
+                                if overlap > best_overlap:
+                                    best_overlap = overlap
+                                    inherited_role = old_role
+                    if len(roles_overlapping) > 1:
+                        assigned_role = "unknown"
+                    elif len(roles_overlapping) == 1:
+                        assigned_role = inherited_role
+                    else:
+                        assigned_role = "unknown"
+
 
             self.repo.add_transcript_segment(
                 segment_id=seg["id"],
@@ -743,20 +827,60 @@ Respond strictly with a JSON object conforming to:
             },
         )
 
-    async def _handle_generate_summary(self, interview_id: str, payload: dict[str, Any]) -> None:
+    async def _handle_generate_summary(
+        self,
+        interview_id: str,
+        payload: dict[str, Any],
+        owner_token: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
         interview = self.repo.get_interview(interview_id)
         candidate_name = interview.get("candidate_name", "Кандидат") if interview else "Кандидат"
         role = interview.get("role", "Инженер") if interview else "Инженер"
+        active_trans_rev = (interview.get("active_transcript_revision_id") or "trans-rev-1") if interview else "trans-rev-1"
+        active_rub_rev = (interview.get("active_rubric_revision_id") or "rub-rev-1") if interview else "rub-rev-1"
+
+        # Capture decisions snapshot before generation
+        snapshot_hash = self.repo.compute_decisions_snapshot_hash(interview_id)
 
         human_assessments = self.repo.get_human_assessments(interview_id)
         proposals = self.repo.get_assessment_proposals(interview_id)
 
+        limitations: list[str] = []
         decisions_map: dict[str, dict[str, Any]] = {}
+
+        # 1. Filter proposals: strictly current active revisions, non-stale, non-rejected
         for p in proposals:
+            if p.get("is_rejected") or p.get("is_stale"):
+                continue
+            p_trans = p.get("transcript_revision_id") or "trans-rev-1"
+            p_rub = p.get("rubric_revision_id") or "rub-rev-1"
+            if p_trans != active_trans_rev or p_rub != active_rub_rev:
+                continue
             decisions_map[p["question_id"]] = p
-        # Human decisions take precedence
+
+        # 2. Human decisions take precedence and can mark exclusions
         for h in human_assessments:
-            decisions_map[h["question_id"]] = h
+            h_trans = h.get("transcript_revision_id") or "trans-rev-1"
+            h_rub = h.get("rubric_revision_id") or "rub-rev-1"
+            if h.get("is_stale") or h_trans != active_trans_rev or h_rub != active_rub_rev:
+                decisions_map.pop(h["question_id"], None)
+                continue
+
+            if h.get("is_excluded"):
+                decisions_map.pop(h["question_id"], None)
+                ex_reason = h.get("exclusion_reason") or "Исключен экспертом"
+                limitations.append(f"Вопрос {h['question_id']} исключен из оценки: {ex_reason}")
+            else:
+                decisions_map[h["question_id"]] = h
+
+        # Check for unassessed planned questions
+        plan = self.repo.get_latest_plan(interview_id)
+        if plan and "payload" in plan:
+            for q in plan["payload"].get("questions", []):
+                q_id = q.get("id")
+                if q_id and q_id not in decisions_map and not any(q_id in lim for lim in limitations):
+                    limitations.append(f"Вопрос {q_id} не был оценен или пропущен.")
 
         summary_gen = ExecutiveSummaryGenerator(
             llm_adapter=self.llm_adapter if isinstance(self.llm_adapter, ResilientLLMAdapter) else None
@@ -766,18 +890,38 @@ Respond strictly with a JSON object conforming to:
             role=role,
             decisions=list(decisions_map.values()),
             audio_health_summary=payload.get("audio_health", {}),
+            limitations=limitations,
         )
+
+        # Programmatically validate quotes against actual candidate segments of active revision
+        all_segs = self.repo.get_transcript_segments(interview_id, revision_id=active_trans_rev)
+        cand_segs = [s for s in all_segs if s.get("speaker_role") == "candidate"]
+        cand_text = " ".join([s.get("text", "") for s in cand_segs]).lower()
+
+        for group_name in ("key_strengths", "growth_areas"):
+            for item in summary_res.get(group_name, []):
+                quote = item.get("evidence_quote")
+                if quote and str(quote).strip():
+                    cleaned_quote = str(quote).strip().lower()
+                    if cleaned_quote not in cand_text:
+                        logger.warning("Stripped hallucinated/unverified quote from summary %s: %s", group_name, quote)
+                        item["evidence_quote"] = None
 
         if not self.repo.get_interview(interview_id):
             logger.warning("Interview %s was deleted before saving summary proposal.", interview_id)
             return
 
-        prop_id = f"sum-{uuid.uuid4().hex[:8]}"
+        prop_id = f"sum-prop-{job_id}" if job_id else f"sum-{uuid.uuid4().hex[:8]}"
         self.repo.save_summary_proposal(
             proposal_id=prop_id,
             interview_id=interview_id,
             model_profile_id=summary_res.get("model_profile_id", "google/gemini-3.8-flash"),
             summary_data=summary_res,
+            transcript_revision_id=active_trans_rev,
+            rubric_revision_id=active_rub_rev,
+            decisions_snapshot_hash=snapshot_hash,
+            owner_token=owner_token,
+            job_id=job_id,
         )
 
     async def run_loop(self, poll_interval_sec: float = 1.0) -> None:
@@ -795,11 +939,11 @@ Respond strictly with a JSON object conforming to:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    from backend.adapters.resilient_llm import ResilientLLMAdapter
+    from backend.adapters.stt import OpenAICompatibleSTTAdapter
+    from backend.core.profiles import get_plusvibe_whisper_stt
     from backend.db.database import get_db
     from backend.db.repository import Repository
-    from backend.adapters.stt import OpenAICompatibleSTTAdapter
-    from backend.adapters.resilient_llm import ResilientLLMAdapter
-    from backend.core.profiles import get_plusvibe_whisper_stt
 
     db = get_db()
     db.init_schema()

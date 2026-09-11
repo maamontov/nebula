@@ -1,8 +1,8 @@
+use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use sha2::{Digest, Sha256};
-use anyhow::{Context, Result, bail};
 
 use crate::types::{AudioChunkMetadata, AudioFormat, TrackManifest, TrackType};
 
@@ -73,9 +73,11 @@ impl AudioSpoolManager {
         let chunk_file_name = format!("{:08}.chunk", sequence);
         let tmp_file_name = format!("{:08}.tmp", sequence);
         let meta_file_name = format!("{:08}.meta.json", sequence);
+        let tmp_meta_file_name = format!("{:08}.meta.tmp", sequence);
 
         let tmp_path = track_dir.join(&tmp_file_name);
         let chunk_path = track_dir.join(&chunk_file_name);
+        let tmp_meta_path = track_dir.join(&tmp_meta_file_name);
         let meta_path = track_dir.join(&meta_file_name);
 
         // 1. Write chunk to temp file atomically
@@ -87,14 +89,24 @@ impl AudioSpoolManager {
             file.sync_all()?;
         }
 
-        // 2. Rename tmp -> final chunk file (atomic on POSIX/Windows)
+        // 2. Rename tmp -> final chunk file
         fs::rename(&tmp_path, &chunk_path)
             .with_context(|| format!("Failed to rename {:?} to {:?}", tmp_path, chunk_path))?;
 
-        // 3. Write metadata sidecar JSON
-        let meta_json = serde_json::to_string_pretty(&metadata)?;
-        fs::write(&meta_path, meta_json)
-            .with_context(|| format!("Failed to write metadata to {:?}", meta_path))?;
+        // 3. Write metadata sidecar JSON to temp file atomically
+        {
+            let meta_json = serde_json::to_string_pretty(&metadata)?;
+            let mut meta_file = File::create(&tmp_meta_path)
+                .with_context(|| format!("Failed to create tmp meta file: {:?}", tmp_meta_path))?;
+            meta_file
+                .write_all(meta_json.as_bytes())
+                .with_context(|| format!("Failed to write metadata to {:?}", tmp_meta_path))?;
+            meta_file.sync_all()?;
+        }
+
+        // 4. Rename tmp meta -> final meta file (atomic readiness marker)
+        fs::rename(&tmp_meta_path, &meta_path)
+            .with_context(|| format!("Failed to rename {:?} to {:?}", tmp_meta_path, meta_path))?;
 
         Ok(metadata)
     }
@@ -133,6 +145,9 @@ impl AudioSpoolManager {
         gaps: Vec<crate::types::AudioGap>,
     ) -> Result<TrackManifest> {
         let track_dir = self.get_track_dir(interview_id, track_id);
+        fs::create_dir_all(&track_dir)
+            .with_context(|| format!("Failed to create track directory {:?}", track_dir))?;
+
         let manifest = TrackManifest {
             interview_id: interview_id.to_string(),
             track_id,
@@ -146,22 +161,59 @@ impl AudioSpoolManager {
         };
 
         let manifest_path = track_dir.join("manifest.json");
+        let tmp_manifest_path = track_dir.join("manifest.json.tmp");
         let json_str = serde_json::to_string_pretty(&manifest)?;
-        fs::write(&manifest_path, json_str)?;
+
+        {
+            let mut file = File::create(&tmp_manifest_path).with_context(|| {
+                format!("Failed to create tmp manifest file {:?}", tmp_manifest_path)
+            })?;
+            file.write_all(json_str.as_bytes()).with_context(|| {
+                format!("Failed to write tmp manifest to {:?}", tmp_manifest_path)
+            })?;
+            file.sync_all()?;
+        }
+
+        fs::rename(&tmp_manifest_path, &manifest_path)
+            .with_context(|| format!("Failed to rename tmp manifest to {:?}", manifest_path))?;
 
         Ok(manifest)
     }
 
+    /// Cleans up uncommitted temporary files (.tmp, .meta.tmp, manifest.json.tmp) left by crashed writes.
+    pub fn clean_temp_files(&self, interview_id: &str, track_id: TrackType) -> Result<usize> {
+        let track_dir = self.get_track_dir(interview_id, track_id);
+        if !track_dir.exists() {
+            return Ok(0);
+        }
+        let mut cleaned = 0;
+        for entry in fs::read_dir(&track_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
+                if file_name.ends_with(".tmp")
+                    || file_name.ends_with(".meta.tmp")
+                    || file_name == "manifest.json.tmp"
+                {
+                    let _ = fs::remove_file(&path);
+                    cleaned += 1;
+                }
+            }
+        }
+        Ok(cleaned)
+    }
+
     /// Loads a sealed track manifest from disk.
     pub fn load_manifest(&self, interview_id: &str, track_id: TrackType) -> Result<TrackManifest> {
-        let manifest_path = self.get_track_dir(interview_id, track_id).join("manifest.json");
+        let manifest_path = self
+            .get_track_dir(interview_id, track_id)
+            .join("manifest.json");
         if !manifest_path.exists() {
             bail!("Manifest does not exist at {:?}", manifest_path);
         }
         let data = fs::read_to_string(&manifest_path)?;
         Ok(serde_json::from_str(&data)?)
     }
-
 
     /// Verifies all chunks in a track directory against their metadata and checksums.
     pub fn verify_track_spool(
