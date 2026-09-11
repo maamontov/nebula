@@ -42,7 +42,7 @@ def run_migrations(db: Database) -> int:
     finally:
         conn.close()
 
-    TARGET_VERSION = 9
+    TARGET_VERSION = 11
     if current_version < TARGET_VERSION and db.db_path != ":memory:" and Path(db.db_path).exists():
         # Make verified pre-migration backup if not in-memory
         backup_dir = Path(os.getenv("NEBULA_BACKUP_DIR", "data/backups")).resolve()
@@ -559,6 +559,94 @@ def run_migrations(db: Database) -> int:
         if not db.verify_integrity():
             raise RuntimeError("Database integrity check failed after running migration 009!")
         current_version = 9
+
+    if current_version < 10:
+        with db.transaction() as tx_conn:
+            tx_conn.execute("PRAGMA foreign_keys = OFF;")
+            tx_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS followup_requests (
+                    id TEXT PRIMARY KEY,
+                    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+                    question_id TEXT NOT NULL,
+                    rubric_revision_id TEXT NOT NULL,
+                    transcript_revision_id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    candidate_fingerprint TEXT,
+                    context_hash TEXT NOT NULL,
+                    context_json TEXT NOT NULL,
+                    job_id TEXT UNIQUE REFERENCES jobs(id) ON DELETE SET NULL,
+                    outcome TEXT,
+                    model_profile_id TEXT,
+                    provider_id TEXT,
+                    prompt_version TEXT NOT NULL DEFAULT 'v1',
+                    schema_version TEXT NOT NULL DEFAULT 'v1',
+                    usage_tokens INTEGER,
+                    latency_ms INTEGER,
+                    error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    UNIQUE (interview_id, question_id, mode, context_hash)
+                )
+                """
+            )
+            tx_conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_followup_requests_interview_q ON followup_requests(interview_id, question_id, created_at);"
+            )
+            tx_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS followup_suggestions (
+                    id TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL REFERENCES followup_requests(id) ON DELETE CASCADE,
+                    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+                    question_id TEXT NOT NULL,
+                    rubric_revision_id TEXT NOT NULL,
+                    transcript_revision_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    question_text TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    criterion_ids_json TEXT NOT NULL,
+                    source_refs_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'suggested',
+                    asked_text TEXT,
+                    ordinal INTEGER NOT NULL DEFAULT 0,
+                    decision_version INTEGER NOT NULL DEFAULT 1,
+                    decided_at TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (request_id, ordinal)
+                )
+                """
+            )
+            tx_conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_followup_suggestions_interview_q ON followup_suggestions(interview_id, question_id, status);"
+            )
+            now_iso = datetime.now(UTC).isoformat()
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (10, '010_adaptive_followups', ?)",
+                (now_iso,),
+            )
+
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 010!")
+        current_version = 10
+
+    if current_version < 11:
+        with db.transaction() as tx_conn:
+            columns = [row["name"] for row in tx_conn.execute("PRAGMA table_info(jobs)").fetchall()]
+            if "started_at" not in columns:
+                tx_conn.execute("ALTER TABLE jobs ADD COLUMN started_at TEXT;")
+            if "completed_at" not in columns:
+                tx_conn.execute("ALTER TABLE jobs ADD COLUMN completed_at TEXT;")
+            now_iso = datetime.now(UTC).isoformat()
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (11, '011_job_telemetry', ?)",
+                (now_iso,),
+            )
+
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 011!")
+        current_version = 11
 
     logger.info("Successfully ensured database schema up to version %d", current_version)
     return current_version

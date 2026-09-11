@@ -26,6 +26,7 @@ class ExecutiveSummaryGenerator:
         role: str,
         decisions: list[dict[str, Any]],
         audio_health_summary: dict[str, Any] | None = None,
+        limitations: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Generates structured executive summary from confirmed human/AI decisions.
@@ -67,6 +68,8 @@ class ExecutiveSummaryGenerator:
             f"{json.dumps(questions_context, ensure_ascii=False, indent=2)}\n"
             f"Статус качества звука: {json.dumps(audio_health_summary or {}, ensure_ascii=False)}\n"
         )
+        if limitations:
+            user_prompt += f"Ограничения сессии:\n{json.dumps(limitations, ensure_ascii=False, indent=2)}\n"
 
         json_schema = {
             "type": "object",

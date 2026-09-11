@@ -1,5 +1,5 @@
 import { isTauri, invoke } from '@tauri-apps/api/core';
-import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus, SpeakerRole, CaptureMode, TrackManifest, JobTemplate, PaginatedInterviews, ReportRevisionSummary } from '../types';
+import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus, SpeakerRole, CaptureMode, TrackManifest, JobTemplate, PaginatedInterviews, ReportRevisionSummary, FollowUpSuggestion, FollowUpsStateResponse, GenerateFollowUpsRequest, PatchFollowUpSuggestionRequest, FollowUpMode, JobStatusResponse } from '../types';
 
 const API_BASE = 'http://127.0.0.1:8000/api/v1';
 
@@ -372,6 +372,7 @@ export async function getInterview(id: string): Promise<{
     total_planned_weight: number;
     evaluated_weight: number;
   };
+  asked_followups?: FollowUpSuggestion[];
 }> {
   const res = await fetch(`${API_BASE}/interviews/${id}`);
   if (!res.ok) throw new Error(`Get interview error: ${res.statusText}`);
@@ -455,13 +456,21 @@ export async function stopInterview(
   return res.json();
 }
 
-export async function getInterviewJobsStatus(interviewId: string): Promise<{
-  interview_id: string;
-  counts: Record<string, number>;
-  pending_or_processing: number;
-  is_pipeline_idle: boolean;
-}> {
-  const res = await fetch(`${API_BASE}/interviews/${interviewId}/jobs/status`);
+export async function getInterviewJobsStatus(
+  interviewId: string,
+  options?: { jobIds?: string[]; limit?: number }
+): Promise<JobStatusResponse> {
+  const params = new URLSearchParams();
+  if (options?.jobIds && options.jobIds.length > 0) {
+    for (const jid of options.jobIds) {
+      params.append('job_ids', jid);
+    }
+  }
+  if (options?.limit !== undefined) {
+    params.set('limit', String(options.limit));
+  }
+  const query = params.toString() ? `?${params.toString()}` : '';
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/jobs/status${query}`);
   if (!res.ok) throw new Error(`Get jobs status error: ${res.statusText}`);
   return res.json();
 }
@@ -506,7 +515,7 @@ export async function enqueueJob(
   jobType: string,
   payload: Record<string, unknown>,
   maxAttempts: number = 3
-): Promise<{ status: string; job_id: string }> {
+): Promise<{ status: string; job_id: string; existing?: boolean }> {
   const jobId = `job-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   const res = await fetch(`${API_BASE}/interviews/${interviewId}/jobs/enqueue`, {
     method: 'POST',
@@ -1093,5 +1102,81 @@ export async function copyQuestionToTemplate(
   return res.json();
 }
 
+// -------------------------------------------------------------
+// Adaptive Follow-up Questions API
+// -------------------------------------------------------------
+export async function getFollowUpsState(
+  interviewId: string,
+  questionId: string,
+  mode?: FollowUpMode
+): Promise<FollowUpsStateResponse> {
+  const url = mode
+    ? `${API_BASE}/interviews/${interviewId}/followups?question_id=${encodeURIComponent(questionId)}&mode=${encodeURIComponent(mode)}`
+    : `${API_BASE}/interviews/${interviewId}/followups?question_id=${encodeURIComponent(questionId)}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(errBody.detail || `Get follow-ups state error: ${res.statusText}`);
+  }
+  return res.json();
+}
 
+export async function generateFollowUps(
+  interviewId: string,
+  data: GenerateFollowUpsRequest
+): Promise<{
+  status: string;
+  request_id?: string;
+  job_id?: string;
+  mode?: string;
+  is_cached?: boolean;
+  wait_reason?: string;
+  cooldown_remaining_sec?: number;
+  can_generate?: boolean;
+}> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/followups/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(errBody.detail || `Generate follow-ups error: ${res.statusText}`);
+  }
+  return res.json();
+}
 
+export async function patchFollowUpSuggestion(
+  interviewId: string,
+  suggestionId: string,
+  data: PatchFollowUpSuggestionRequest
+): Promise<FollowUpSuggestion> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/followups/${suggestionId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    if (res.status === 409) {
+      const errBody = await res.json().catch(() => ({ detail: 'Конфликт версии решения карточки' }));
+      throw new Error(`409: ${errBody.detail || 'Конфликт версии решения'}`);
+    }
+    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(errBody.detail || `Patch suggestion error: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function retryFollowUpRequest(
+  interviewId: string,
+  requestId: string
+): Promise<{ status: string; request_id: string; job_id: string }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/followups/requests/${requestId}/retry`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(errBody.detail || `Retry follow-up request error: ${res.statusText}`);
+  }
+  return res.json();
+}

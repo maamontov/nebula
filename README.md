@@ -70,8 +70,8 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 
 ### Статус верификации и границы готовности
 - **Автоматически проверено (100% Green)**:
-  - 124 теста Python/pytest (FastAPI эндпоинты, изоляция SQLite, детерминированный скоринг, валидатор доказательств, optimistic concurrency control, конечный автомат сессий, атомарный лизинг воркера, полная сквозная регрессионная матрица из 14 сценариев, поддержка single-source и сквозной тест десктопного пайплайна `test_desktop_pipeline_e2e.py`).
-  - 23 теста Rust (`cargo test --all`), включая lock-free ringbuffer, WAV spooling, IPC-контракты Tauri desktop и синтетическую часовую 2-канальную запись с компенсацией дрейфа тактовых генераторов (3600с симулированы за 40с без потерь).
+  - 212 тестов Python/pytest (FastAPI эндпоинты, изоляция SQLite, детерминированный скоринг, валидатор доказательств, optimistic concurrency control, конечный автомат сессий, атомарный лизинг воркера, полная сквозная регрессионная матрица из 14 сценариев, поддержка single-source, сквозной тест десктопного пайплайна `test_desktop_pipeline_e2e.py`, адаптивные follow-up вопросы и 27 тестов устранения задержек AI и дедупликации).
+  - 24 теста Rust (`cargo test --workspace`), включая lock-free ringbuffer, WAV spooling, IPC-контракты Tauri desktop и синтетическую часовую 2-канальную запись с компенсацией дрейфа тактовых генераторов (3600с симулированы за 57с без потерь).
   - Production-сборка десктопного фронтенда (`tsc && vite build` — 0 ошибок сборки и типизации).
 - **Проверено на физическом окружении**:
   - macOS Sonoma/Sequoia (Apple Silicon, нативный CoreAudio capture).
@@ -83,6 +83,10 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 ### Документация
 - [Концепция продукта](docs/product-concept.md)
 - [План реализации](docs/implementation-plan.md)
+- [Аудит задержек AI и дефектов очереди](docs/ai-latency-audit.md)
+- [План устранения задержек AI (Этапы 1–6)](docs/ai-latency-implementation-plan.md)
+- [План: Адаптивные уточняющие и наводящие вопросы](docs/adaptive-followup-questions-plan.md)
+- [Отчёт: Адаптивные уточняющие и наводящие вопросы](docs/adaptive-followup-questions-report.md)
 - [План исправлений по результатам ревью](docs/remediation-plan.md)
 - [Доработка рабочего пути Desktop → STT](docs/desktop-pipeline-remediation-plan.md)
 - [Исправление запуска и режим одного источника](docs/startup-and-single-source-plan.md)
@@ -163,8 +167,8 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 
 ### Verification Status & Readiness Boundaries
 - **Automated Verification (100% Green)**:
-  - 124 Python/pytest tests (FastAPI endpoints, SQLite isolation, deterministic scoring engine, evidence validator, optimistic concurrency control, session state machine, atomic worker lease/lock handling, full 14-scenario end-to-end regression matrix, single-source mode, and `test_desktop_pipeline_e2e.py`).
-  - 23 Rust tests (`cargo test --all`), covering lock-free ringbuffer, WAV spooling, Tauri desktop IPC contracts, and synthetic 1-hour 2-channel recording with clock drift compensation (3600s simulated in 40s without sample loss).
+  - 212 Python/pytest tests (FastAPI endpoints, SQLite isolation, deterministic scoring engine, evidence validator, optimistic concurrency control, session state machine, atomic worker lease/lock handling, full 14-scenario end-to-end regression matrix, single-source mode, desktop pipeline e2e test `test_desktop_pipeline_e2e.py`, adaptive follow-up questions, and 27 AI latency elimination & dedup tests).
+  - 24 Rust tests (`cargo test --workspace`), covering lock-free ringbuffer, WAV spooling, Tauri desktop IPC contracts, and synthetic 1-hour 2-channel recording with clock drift compensation (3600s simulated in 57s without sample loss).
   - Desktop frontend production build verified (`tsc && vite build` — 0 errors, full TypeScript type safety).
 - **Physical Environment Verification**:
   - macOS Sonoma/Sequoia (Apple Silicon, native CoreAudio capture).
@@ -176,6 +180,10 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 ### Documentation
 - [Product Concept](docs/product-concept.md)
 - [Implementation Plan](docs/implementation-plan.md)
+- [AI Latency Audit and Queue Bottlenecks](docs/ai-latency-audit.md)
+- [AI Latency Remediation Plan (Stages 1–6)](docs/ai-latency-implementation-plan.md)
+- [Plan: Adaptive Follow-Up Questions (Russian)](docs/adaptive-followup-questions-plan.md)
+- [Report: Adaptive Follow-Up Questions](docs/adaptive-followup-questions-report.md)
 - [Remediation Plan (Russian)](docs/remediation-plan.md)
 - [Desktop → STT Integration Remediation (Russian)](docs/desktop-pipeline-remediation-plan.md)
 - [Startup and Single-Source Plan (Russian)](docs/startup-and-single-source-plan.md)

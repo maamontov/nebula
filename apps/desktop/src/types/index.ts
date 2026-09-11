@@ -155,6 +155,73 @@ export interface InterviewDetails {
   finalized_checksum?: string;
   created_at?: string;
   updated_at?: string;
+  asked_followups?: FollowUpSuggestion[];
+}
+
+export type FollowUpKind = 'clarify' | 'deepen' | 'guide';
+
+export type FollowUpMode = 'probe' | 'guide';
+
+export type FollowUpTrigger = 'auto' | 'manual';
+
+export type FollowUpStatus = 'suggested' | 'asked' | 'dismissed';
+
+export interface FollowUpSuggestion {
+  id: string;
+  interview_id: string;
+  question_id: string;
+  request_id: string;
+  kind: FollowUpKind;
+  suggested_text: string;
+  rationale: string;
+  evidence_quote?: string | null;
+  evidence_segment_id?: string | null;
+  status: FollowUpStatus;
+  asked_text?: string | null;
+  decision_version: number;
+  is_stale: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FollowUpsStateResponse {
+  interview_id: string;
+  question_id: string;
+  mode?: FollowUpMode;
+  active_mode?: FollowUpMode;
+  active_rubric_revision_id?: string;
+  active_transcript_revision_id?: string;
+  active_request_id?: string | null;
+  status: string;
+  error_message?: string | null;
+  can_generate?: boolean;
+  wait_reason?: string | null;
+  candidate_fingerprint?: string | null;
+  context_hash?: string | null;
+  has_new_answer: boolean;
+  cooldown_remaining_sec?: number | null;
+  cooldown_seconds_remaining?: number;
+  latest_request?: {
+    id: string;
+    job_id?: string;
+    outcome?: string;
+    error_message?: string;
+  } | null;
+  suggestions: FollowUpSuggestion[];
+  history?: FollowUpSuggestion[];
+}
+
+export interface GenerateFollowUpsRequest {
+  question_id: string;
+  mode: FollowUpMode;
+  trigger: FollowUpTrigger;
+  client_context_hash?: string | null;
+}
+
+export interface PatchFollowUpSuggestionRequest {
+  status: FollowUpStatus;
+  asked_text?: string | null;
+  expected_decision_version: number;
 }
 
 export interface JobTemplate {
@@ -212,4 +279,33 @@ export interface ReportRevisionSummary {
   created_at: string;
   is_current?: boolean;
   reopen_reason?: string;
+}
+
+export interface JobDetail {
+  id: string;
+  job_id: string;
+  type: string;
+  status: string;
+  attempts: number;
+  max_attempts: number;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  locked_until: string | null;
+  error_message: string | null;
+  question_id?: string | null;
+  rubric_revision_id?: string | null;
+  transcript_revision_id?: string | null;
+  queue_wait_sec?: number | null;
+  elapsed_sec?: number | null;
+}
+
+export interface JobStatusResponse {
+  interview_id: string;
+  counts: Record<string, number>;
+  counts_by_type?: Record<string, Record<string, number>>;
+  pending_or_processing: number;
+  is_pipeline_idle: boolean;
+  oldest_pending_age_sec?: number | null;
+  active_jobs?: JobDetail[];
 }

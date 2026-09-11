@@ -149,6 +149,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     locked_until TEXT,
     locked_by TEXT,
     error_message TEXT,
+    started_at TEXT,
+    completed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -218,3 +220,53 @@ CREATE TABLE IF NOT EXISTS transcript_assembly_state (
 );
 
 CREATE INDEX IF NOT EXISTS idx_transcript_assembly ON transcript_assembly_state(interview_id, track_id, capture_epoch);
+
+CREATE TABLE IF NOT EXISTS followup_requests (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    rubric_revision_id TEXT NOT NULL,
+    transcript_revision_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    candidate_fingerprint TEXT,
+    context_hash TEXT NOT NULL,
+    context_json TEXT NOT NULL,
+    job_id TEXT UNIQUE REFERENCES jobs(id) ON DELETE SET NULL,
+    outcome TEXT,
+    model_profile_id TEXT,
+    provider_id TEXT,
+    prompt_version TEXT NOT NULL DEFAULT 'v1',
+    schema_version TEXT NOT NULL DEFAULT 'v1',
+    usage_tokens INTEGER,
+    latency_ms INTEGER,
+    error_code TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE (interview_id, question_id, mode, context_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_followup_requests_interview_q ON followup_requests(interview_id, question_id, created_at);
+
+CREATE TABLE IF NOT EXISTS followup_suggestions (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL REFERENCES followup_requests(id) ON DELETE CASCADE,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    rubric_revision_id TEXT NOT NULL,
+    transcript_revision_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    question_text TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    criterion_ids_json TEXT NOT NULL,
+    source_refs_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'suggested',
+    asked_text TEXT,
+    ordinal INTEGER NOT NULL DEFAULT 0,
+    decision_version INTEGER NOT NULL DEFAULT 1,
+    decided_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (request_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_followup_suggestions_interview_q ON followup_suggestions(interview_id, question_id, status);

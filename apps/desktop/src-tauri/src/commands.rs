@@ -408,9 +408,17 @@ pub async fn stop_capture(
         );
     }
 
-    // Stop uploader with final drain
+    // Stop uploader with final drain or preserve in background if backlog remains
     if let Some(mut uploader) = session.uploader.take() {
         uploader.stop().await;
+        let prog = uploader.get_progress().await;
+        if prog.total_discovered > (prog.total_acked + prog.total_failed) {
+            let mut bg = state.background_uploaders.lock().await;
+            if !bg.contains_key(&session.session_id) {
+                uploader.start();
+                bg.insert(session.session_id.clone(), uploader);
+            }
+        }
     }
 
     let is_single = session.capture_mode == "single_source";

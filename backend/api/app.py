@@ -5,6 +5,7 @@ Provides endpoints for health check, scoring, proposal validation, and lifecycle
 import contextlib
 import hashlib
 import json
+import math
 import os
 import uuid
 from typing import Any
@@ -13,16 +14,24 @@ from dotenv import load_dotenv
 
 # Ensure environment variables (.env) are loaded
 load_dotenv()
+import logging
 import re
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
+logger = logging.getLogger("nebula.api")
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend.core.audio_health import AudioHealthMonitor, ChannelMetrics
 from backend.core.evidence_validator import (
     validate_proposal,
+)
+from backend.core.followup_generator import (
+    build_followup_context,
+    compute_candidate_fingerprint,
+    is_candidate_segment,
 )
 from backend.core.matcher import QuestionMatcher
 from backend.core.revisions import TranscriptDiffEngine
@@ -47,6 +56,13 @@ from contracts.domain import (
     RubricCriterion,
     RubricRevision,
     TranscriptRevision,
+)
+from contracts.followups import (
+    FollowUpMode,
+    FollowUpsStateResponse,
+    FollowUpTrigger,
+    GenerateFollowUpsRequest,
+    PatchFollowUpSuggestionRequest,
 )
 
 app = FastAPI(
@@ -682,6 +698,7 @@ async def get_interview_endpoint(
         "assessment_proposals": proposals,
         "human_assessments": human_assessments,
         "scoring": scoring,
+        "asked_followups": repo.get_asked_followup_history(interview_id),
     }
 
 
@@ -1274,6 +1291,12 @@ async def enqueue_job_endpoint(
     if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
         raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
 
+    if payload.type == "GENERATE_FOLLOWUPS":
+        raise HTTPException(
+            status_code=400,
+            detail="GENERATE_FOLLOWUPS must be requested via dedicated /followups/generate endpoint",
+        )
+
     if payload.type == "EVALUATE_QUESTION":
         q_id = payload.payload.get("question_id")
         plan = repo.get_latest_plan(interview_id)
@@ -1282,9 +1305,45 @@ async def enqueue_job_endpoint(
             if q_id not in known_q_ids:
                 raise HTTPException(status_code=400, detail=f"Question '{q_id}' not found in interview plan")
         # Fix active revisions on server and strip arbitrary candidate_text
-        payload.payload["rubric_revision_id"] = payload.payload.get("rubric_revision_id") or inv.get("active_rubric_revision_id") or "rub-rev-1"
-        payload.payload["transcript_revision_id"] = payload.payload.get("transcript_revision_id") or inv.get("active_transcript_revision_id") or "trans-rev-1"
+        rubric_rev = payload.payload.get("rubric_revision_id") or inv.get("active_rubric_revision_id") or "rub-rev-1"
+        transcript_rev = payload.payload.get("transcript_revision_id") or inv.get("active_transcript_revision_id") or "trans-rev-1"
+        payload.payload["rubric_revision_id"] = rubric_rev
+        payload.payload["transcript_revision_id"] = transcript_rev
         payload.payload.pop("candidate_text", None)
+
+        all_segments = repo.get_transcript_segments(interview_id, revision_id=transcript_rev)
+        assocs = repo.get_associations(interview_id, revision_id=transcript_rev)
+
+        associated_seg_ids = {a["segment_id"] for a in assocs if a.get("question_id") == q_id}
+        candidate_segments = [
+            s for s in all_segments
+            if s["id"] in associated_seg_ids and is_candidate_segment(s)
+        ]
+
+        if not candidate_segments and plan and "payload" in plan and all_segments:
+            questions = plan["payload"].get("questions", [])
+            if questions:
+                matcher = QuestionMatcher()
+                match_results = matcher.associate_segments(questions, all_segments, existing_associations=assocs)
+                matched_ids = {r.segment_id for r in match_results if r.question_id == q_id}
+                candidate_segments = [s for s in all_segments if s["id"] in matched_ids and is_candidate_segment(s)]
+
+        candidate_fp = compute_candidate_fingerprint(candidate_segments, rubric_rev, transcript_rev)
+        payload.payload["candidate_fingerprint"] = candidate_fp
+
+        existing_job = repo.find_active_evaluate_job(
+            interview_id=interview_id,
+            question_id=q_id,
+            candidate_fingerprint=candidate_fp,
+            rubric_revision_id=rubric_rev,
+            transcript_revision_id=transcript_rev,
+        )
+        if existing_job:
+            return {
+                "status": "already_queued",
+                "job_id": existing_job["id"],
+                "existing": True,
+            }
 
     try:
         repo.enqueue_job(
@@ -1294,7 +1353,7 @@ async def enqueue_job_endpoint(
             payload=payload.payload,
             max_attempts=payload.max_attempts,
         )
-        return {"status": "enqueued", "job_id": payload.id}
+        return {"status": "enqueued", "job_id": payload.id, "existing": False}
     except RepositoryConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
@@ -1303,13 +1362,292 @@ async def enqueue_job_endpoint(
 @app.get("/api/v1/interviews/{interview_id}/jobs/status")
 async def get_jobs_status_endpoint(
     interview_id: str,
+    job_ids: list[str] | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
     repo: Repository = Depends(get_repository),
 ):
     validate_safe_id(interview_id, "interview_id")
+    if job_ids:
+        for jid in job_ids:
+            validate_safe_id(jid, "job_id")
     inv = repo.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
-    return repo.get_interview_jobs_status(interview_id)
+    return repo.get_interview_jobs_status(interview_id, job_ids=job_ids, limit=limit)
+
+
+
+# ---------------------------------------------------------------------------
+# Adaptive Follow-up and Guiding Questions Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/interviews/{interview_id}/followups", response_model=FollowUpsStateResponse)
+async def get_followups_endpoint(
+    interview_id: str,
+    question_id: str,
+    mode: FollowUpMode = FollowUpMode.PROBE,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    validate_safe_id(question_id, "question_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    plan = repo.get_latest_plan(interview_id)
+    plan_payload = plan["payload"] if plan else None
+    if not plan_payload or "questions" not in plan_payload:
+        raise HTTPException(status_code=400, detail="Interview plan not available")
+
+    q_ids = {q.get("id") for q in plan_payload["questions"]}
+    if question_id not in q_ids:
+        raise HTTPException(status_code=400, detail=f"Question '{question_id}' not found in plan")
+
+    active_trans_rev = inv.get("active_transcript_revision_id") or "trans-rev-1"
+    active_rub_rev = inv.get("active_rubric_revision_id") or "rub-rev-1"
+    segments = repo.get_transcript_segments(interview_id, revision_id=active_trans_rev)
+    associations = repo.get_associations(interview_id, revision_id=active_trans_rev)
+    history = repo.get_asked_followup_history(interview_id)
+
+    fu_context = build_followup_context(
+        interview_id=interview_id,
+        question_id=question_id,
+        mode=mode,
+        rubric_questions=plan_payload["questions"],
+        transcript_segments=segments,
+        existing_associations=associations,
+        decisions_history=history,
+        role_title=inv.get("role") or "",
+        active_rubric_revision_id=active_rub_rev,
+        active_transcript_revision_id=active_trans_rev,
+    )
+
+    state = repo.get_followup_state(
+        interview_id=interview_id,
+        question_id=question_id,
+        mode=mode.value if hasattr(mode, "value") else str(mode),
+    )
+
+    if not fu_context.candidate_segments:
+        state["can_generate"] = False
+        has_shared_unknown = any(
+            str(s.get("track_id", "")).lower() == "shared" and (s.get("speaker_role") or "unknown").lower() == "unknown"
+            for s in segments
+        )
+        if has_shared_unknown:
+            state["wait_reason"] = "needs_role_assignment"
+        elif any(is_candidate_segment(s) for s in segments):
+            state["wait_reason"] = "needs_association"
+        else:
+            state["wait_reason"] = "waiting_for_candidate"
+    elif fu_context.is_context_too_large:
+        state["can_generate"] = False
+        state["wait_reason"] = "context_too_large"
+
+    state["candidate_fingerprint"] = fu_context.candidate_fingerprint
+    state["context_hash"] = fu_context.context_hash
+
+    latest_req = state.get("latest_request")
+    state["active_request_id"] = latest_req.get("id") if latest_req else None
+    job_info = latest_req.get("job") if latest_req else None
+    is_job_failed = bool(job_info and job_info.get("status") == "FAILED")
+    is_req_failed = bool(latest_req and latest_req.get("outcome") in ("failed", "error"))
+
+    if state.get("wait_reason") == "generating":
+        state["status"] = "processing"
+    elif is_req_failed or is_job_failed:
+        state["status"] = "error"
+    else:
+        state["status"] = "idle"
+
+    error_msg = None
+    if is_req_failed or is_job_failed:
+        err_code = (latest_req.get("error_code") if latest_req else None) or ""
+        raw_job_err = (job_info.get("error_message") if job_info else None) or ""
+        combined = f"{err_code} {raw_job_err}".lower()
+        if "auth" in combined:
+            error_msg = "Ошибка авторизации провайдера модели"
+        elif "rate" in combined or "429" in combined:
+            error_msg = "Превышен лимит запросов к модели (rate limit)"
+        elif "timeout" in combined:
+            error_msg = "Превышено время ожидания ответа модели"
+        elif "validation" in combined:
+            error_msg = "Ответ модели не соответствует требуемому формату"
+        else:
+            error_msg = "Сбой генерации подсказок"
+    state["error_message"] = error_msg
+
+    cd = state.get("cooldown_remaining_sec") or 0.0
+    state["cooldown_seconds_remaining"] = int(math.ceil(cd))
+
+    return state
+
+
+@app.post("/api/v1/interviews/{interview_id}/followups/generate")
+async def generate_followups_endpoint(
+    interview_id: str,
+    payload: GenerateFollowUpsRequest,
+    response: Response,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    validate_safe_id(payload.question_id, "question_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    status_str = str(inv["status"]).lower()
+    if status_str in ("finalized", "deleted"):
+        raise HTTPException(status_code=409, detail=f"Interview is {status_str} and immutable")
+    if status_str in ("processing", "review"):
+        raise HTTPException(status_code=409, detail=f"Cannot generate followups in status '{status_str}'")
+
+    if payload.trigger == FollowUpTrigger.AUTO and status_str != "recording":
+        raise HTTPException(status_code=409, detail="Auto follow-ups only permitted in recording status")
+    if payload.trigger == FollowUpTrigger.MANUAL and status_str not in ("recording", "paused"):
+        raise HTTPException(status_code=409, detail="Manual follow-ups only permitted in recording or paused status")
+
+    active_trans_rev = inv.get("active_transcript_revision_id") or "trans-rev-1"
+    active_rub_rev = inv.get("active_rubric_revision_id") or "rub-rev-1"
+
+    if payload.expected_rubric_revision_id and payload.expected_rubric_revision_id != active_rub_rev:
+        raise HTTPException(status_code=409, detail="Rubric revision conflict")
+    if payload.expected_transcript_revision_id and payload.expected_transcript_revision_id != active_trans_rev:
+        raise HTTPException(status_code=409, detail="Transcript revision conflict")
+
+    plan = repo.get_latest_plan(interview_id)
+    plan_payload = plan["payload"] if plan else None
+    if not plan_payload or "questions" not in plan_payload:
+        raise HTTPException(status_code=400, detail="Interview plan not available")
+
+    q_ids = {q.get("id") for q in plan_payload["questions"]}
+    if payload.question_id not in q_ids:
+        raise HTTPException(status_code=400, detail=f"Question '{payload.question_id}' not found in plan")
+
+    segments = repo.get_transcript_segments(interview_id, revision_id=active_trans_rev)
+    associations = repo.get_associations(interview_id, revision_id=active_trans_rev)
+    history = repo.get_asked_followup_history(interview_id)
+
+    fu_context = build_followup_context(
+        interview_id=interview_id,
+        question_id=payload.question_id,
+        mode=payload.mode,
+        rubric_questions=plan_payload["questions"],
+        transcript_segments=segments,
+        existing_associations=associations,
+        decisions_history=history,
+        role_title=inv.get("role") or "",
+        active_rubric_revision_id=active_rub_rev,
+        active_transcript_revision_id=active_trans_rev,
+    )
+
+    if fu_context.is_context_too_large:
+        raise HTTPException(status_code=400, detail="Candidate response context is too large for follow-up generation")
+
+    if not fu_context.candidate_segments:
+        has_shared_unknown = any(
+            str(s.get("track_id", "")).lower() == "shared" and (s.get("speaker_role") or "unknown").lower() == "unknown"
+            for s in segments
+        )
+        reason = "needs_role_assignment" if has_shared_unknown else "waiting_for_candidate"
+        return {"status": "waiting", "wait_reason": reason, "can_generate": False}
+
+    try:
+        req_dict, is_new, wait_reason, cooldown_remaining = repo.create_followup_request_and_job(
+            interview_id=interview_id,
+            question_id=payload.question_id,
+            mode=payload.mode.value if hasattr(payload.mode, "value") else str(payload.mode),
+            trigger=payload.trigger.value if hasattr(payload.trigger, "value") else str(payload.trigger),
+            candidate_fingerprint=fu_context.candidate_fingerprint,
+            context_hash=fu_context.context_hash,
+            context_json=fu_context.context_json,
+            rubric_revision_id=fu_context.rubric_revision_id,
+            transcript_revision_id=fu_context.transcript_revision_id,
+            cooldown_sec=30,
+        )
+    except RepositoryConflictError as err:
+        raise HTTPException(status_code=409, detail=str(err))
+
+    if wait_reason == "cooldown_active":
+        return {
+            "status": "cooldown_active",
+            "wait_reason": "cooldown_active",
+            "cooldown_remaining_sec": cooldown_remaining,
+        }
+
+    if wait_reason == "generating":
+        return {
+            "status": "generating",
+            "wait_reason": "generating",
+            "request": req_dict,
+        }
+
+    mode_str = payload.mode.value if hasattr(payload.mode, "value") else str(payload.mode)
+    if is_new:
+        response.status_code = 202
+        return {
+            "status": "enqueued",
+            "request_id": req_dict["id"],
+            "job_id": req_dict["job_id"],
+            "mode": mode_str,
+            "is_cached": False,
+        }
+    return {
+        "status": "cached",
+        "request_id": req_dict["id"],
+        "job_id": req_dict.get("job_id"),
+        "mode": mode_str,
+        "is_cached": True,
+        "outcome": req_dict.get("outcome"),
+    }
+
+
+@app.patch("/api/v1/interviews/{interview_id}/followups/{suggestion_id}")
+async def patch_followup_suggestion_endpoint(
+    interview_id: str,
+    suggestion_id: str,
+    payload: PatchFollowUpSuggestionRequest,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    validate_safe_id(suggestion_id, "suggestion_id")
+    try:
+        updated = repo.update_suggestion_decision(
+            interview_id=interview_id,
+            suggestion_id=suggestion_id,
+            status=payload.status.value if hasattr(payload.status, "value") else str(payload.status),
+            asked_text=payload.asked_text,
+            expected_decision_version=payload.expected_decision_version,
+            expected_rubric_revision_id=payload.expected_rubric_revision_id,
+            expected_transcript_revision_id=payload.expected_transcript_revision_id,
+        )
+        return updated
+    except KeyError as err:
+        raise HTTPException(status_code=404, detail=str(err))
+    except RepositoryConflictError as err:
+        raise HTTPException(status_code=409, detail=str(err))
+
+
+@app.post("/api/v1/interviews/{interview_id}/followups/requests/{request_id}/retry")
+async def retry_followup_request_endpoint(
+    interview_id: str,
+    request_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    validate_safe_id(interview_id, "interview_id")
+    validate_safe_id(request_id, "request_id")
+    try:
+        retried = repo.retry_followup_request(interview_id=interview_id, request_id=request_id)
+        return {
+            "status": "retried",
+            "request_id": retried["id"],
+            "job_id": retried.get("job_id"),
+            "request": retried,
+        }
+    except KeyError as err:
+        raise HTTPException(status_code=404, detail=str(err))
+    except RepositoryConflictError as err:
+        raise HTTPException(status_code=409, detail=str(err))
 
 
 
@@ -1421,6 +1759,7 @@ async def export_interview_endpoint(
             "report_revision": rev,
             "summary": snapshot.get("executive_summary") or rev.get("summary_markdown"),
             "human_assessments": snapshot.get("human_assessments"),
+            "followup_questions": snapshot.get("followup_questions", []),
             "audit_trail": repo.get_audit_events(interview_id),
         }
 
@@ -1443,6 +1782,7 @@ async def export_interview_endpoint(
             "report_revision": latest_report,
             "summary": snapshot.get("executive_summary"),
             "human_assessments": snapshot.get("human_assessments"),
+            "followup_questions": snapshot.get("followup_questions", []),
             "audit_trail": repo.get_audit_events(interview_id),
         }
 
@@ -1491,6 +1831,7 @@ async def export_interview_endpoint(
         "report_revision": latest_report,
         "sha256_checksum": None,
         "summary": summary_prop.get("summary_data") if summary_prop else None,
+        "followup_questions": repo.get_asked_followup_history(interview_id),
         "audit_trail": audit_events,
     }
 

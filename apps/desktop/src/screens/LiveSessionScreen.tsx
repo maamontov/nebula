@@ -12,10 +12,18 @@ import {
   updateInterviewStatus,
   getInterview,
   enqueueJob,
+  getInterviewJobsStatus,
   setSegmentSpeakerRole,
   getActiveSession,
 } from '../services/api';
+import { FollowUpSuggestions } from '../components/FollowUpSuggestions';
 import { Square, Pause, Play, CheckCircle, MessageSquare, Quote, Sparkles, AlertTriangle, ExternalLink, Loader2, ArrowDown } from 'lucide-react';
+
+interface QuestionEvalJobState {
+  jobId: string;
+  status: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  errorMessage?: string | null;
+}
 
 interface LiveSessionScreenProps {
   interviewId: string;
@@ -38,6 +46,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   const [activeQuestionIdx, setActiveQuestionIdx] = useState(0);
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
+  const [evalJobs, setEvalJobs] = useState<Record<string, QuestionEvalJobState>>({});
   const [isStopping, setIsStopping] = useState(false);
   const [stoppingStage, setStoppingStage] = useState<string | null>(null);
   const [evalSuccessNotice, setEvalSuccessNotice] = useState<string | null>(null);
@@ -68,6 +77,90 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
         console.warn('Could not restore live session active state:', err);
       });
   }, [interviewId]);
+
+  // Restore active EVALUATE_QUESTION jobs on mount
+  useEffect(() => {
+    let isSubscribed = true;
+    getInterviewJobsStatus(interviewId, { limit: 100 })
+      .then((res) => {
+        if (!isSubscribed || !res.active_jobs) return;
+        const restored: Record<string, QuestionEvalJobState> = {};
+        for (const j of res.active_jobs) {
+          if (j.type === 'EVALUATE_QUESTION' && j.question_id) {
+            if (j.status === 'PENDING' || j.status === 'PROCESSING') {
+              restored[j.question_id] = {
+                jobId: j.id,
+                status: j.status as 'PENDING' | 'PROCESSING',
+                errorMessage: j.error_message,
+              };
+            }
+          }
+        }
+        if (Object.keys(restored).length > 0) {
+          setEvalJobs((prev) => ({ ...restored, ...prev }));
+        }
+      })
+      .catch((err) => {
+        console.warn('Could not restore evaluation jobs status:', err);
+      });
+
+    return () => {
+      isSubscribed = false;
+    };
+  }, [interviewId]);
+
+  // Poll active evaluation jobs until terminal state
+  useEffect(() => {
+    const activeEntries = Object.entries(evalJobs).filter(
+      ([_, j]) => j.status === 'PENDING' || j.status === 'PROCESSING'
+    );
+    if (activeEntries.length === 0) return;
+
+    let isSubscribed = true;
+    const jobIds = activeEntries.map(([_, j]) => j.jobId);
+
+    const timer = setInterval(async () => {
+      try {
+        const res = await getInterviewJobsStatus(interviewId, { jobIds });
+        if (!isSubscribed) return;
+
+        const updated: Record<string, QuestionEvalJobState> = {};
+        let hasCompleted = false;
+
+        for (const activeJob of res.active_jobs || []) {
+          const qId = activeJob.question_id;
+          if (qId) {
+            updated[qId] = {
+              jobId: activeJob.id,
+              status: activeJob.status as any,
+              errorMessage: activeJob.error_message,
+            };
+            if (activeJob.status === 'COMPLETED') {
+              hasCompleted = true;
+            }
+          }
+        }
+
+        if (Object.keys(updated).length > 0) {
+          setEvalJobs((prev) => ({ ...prev, ...updated }));
+        }
+
+        if (hasCompleted) {
+          const data = await getInterview(interviewId);
+          if (isSubscribed) {
+            setProposals(data.assessment_proposals || []);
+          }
+        }
+      } catch (err) {
+        console.warn('Evaluation jobs poll error:', err);
+      }
+    }, 1200);
+
+    return () => {
+      isSubscribed = false;
+      clearInterval(timer);
+    };
+  }, [evalJobs, interviewId]);
 
   const handleSetRole = async (segId: string, role: SpeakerRole) => {
     try {
@@ -246,32 +339,66 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
 
   const currentQ = plan.questions[activeQuestionIdx] || plan.questions[0];
   const currentProp = proposals.find((p) => p.question_id === currentQ?.id);
+  const currentJob = currentQ ? evalJobs[currentQ.id] : null;
+  const isJobRunning = currentJob?.status === 'PENDING' || currentJob?.status === 'PROCESSING';
+  const isJobFailed = currentJob?.status === 'FAILED';
 
   const handleEvaluateCurrent = async () => {
-    if (!currentQ) return;
-    setIsEvaluating(true);
+    if (!currentQ || isEvaluating || isJobRunning) return;
     setEvalSuccessNotice(null);
 
-    try {
-      // Find candidate speech segments (both dual-track and manually assigned candidate role)
-      const candidateSegments = segments.filter(
-        (s) => s.track_id === 'candidate' || s.speaker_role === 'candidate'
-      );
-      if (candidateSegments.length === 0) {
-        setEvalSuccessNotice('Нет распознанных ответов кандидата для оценки.');
-        setTimeout(() => setEvalSuccessNotice(null), 4000);
-        return;
-      }
+    // Filter candidate speech segments (both dual-track and manually assigned candidate role)
+    const candidateSegments = segments.filter((s) => {
+      if (s.speaker_role === 'candidate') return true;
+      if (s.speaker_role === 'interviewer') return false;
+      return s.track_id === 'candidate';
+    });
 
-      await enqueueJob(interviewId, 'EVALUATE_QUESTION', {
+    const unconfirmedShared = segments.filter(
+      (s) => s.track_id === 'shared' && (!s.speaker_role || s.speaker_role === 'unknown')
+    );
+
+    if (candidateSegments.length === 0) {
+      if (unconfirmedShared.length > 0) {
+        setEvalSuccessNotice('Подтвердите роль кандидата для реплик в стенограмме перед оценкой.');
+      } else {
+        setEvalSuccessNotice('Нет распознанных ответов кандидата для оценки.');
+      }
+      setTimeout(() => setEvalSuccessNotice(null), 4000);
+      return;
+    }
+
+    setIsEvaluating(true);
+    try {
+      const res = await enqueueJob(interviewId, 'EVALUATE_QUESTION', {
         question_id: currentQ.id,
         rubric_description: currentQ.criteria.map((c) => c.title).join(', '),
       });
 
-      setEvalSuccessNotice('Задание на оценку отправлено в очередь!');
+      setEvalJobs((prev) => ({
+        ...prev,
+        [currentQ.id]: {
+          jobId: res.job_id,
+          status: 'PENDING',
+        },
+      }));
+
+      if (res.existing) {
+        setEvalSuccessNotice('Оценка этого вопроса уже выполняется в очереди.');
+      } else {
+        setEvalSuccessNotice('Задание на оценку отправлено в очередь!');
+      }
       setTimeout(() => setEvalSuccessNotice(null), 4000);
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to trigger evaluation:', e);
+      setEvalJobs((prev) => ({
+        ...prev,
+        [currentQ.id]: {
+          jobId: prev[currentQ.id]?.jobId || 'failed-job',
+          status: 'FAILED',
+          errorMessage: e.message || 'Ошибка запуска оценки',
+        },
+      }));
     } finally {
       setIsEvaluating(false);
     }
@@ -486,6 +613,19 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
         {/* Column 3: Live AI Copilot & Evidence (4 cols) */}
         <div className="col-span-4 p-4 space-y-4 overflow-y-auto bg-slate-950/80 flex flex-col justify-between">
           <div className="space-y-4">
+            {/* Adaptive Follow-up Questions Copilot */}
+            {currentQ && (
+              <FollowUpSuggestions
+                interviewId={interviewId}
+                questionId={currentQ.id}
+                questionTitle={currentQ.title || currentQ.prompt}
+                segments={segments}
+                onLocateSegment={scrollToSegment}
+                isPaused={isPaused}
+                disabled={isStopping}
+              />
+            )}
+
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-2">
                 <Sparkles className="w-4 h-4 text-indigo-400" />
@@ -504,13 +644,28 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
               </div>
               <button
                 onClick={handleEvaluateCurrent}
-                disabled={isEvaluating}
+                disabled={isEvaluating || isJobRunning}
                 className="w-full flex items-center justify-center space-x-2 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-950 disabled:text-slate-500 text-white text-xs font-semibold rounded-lg shadow-sm transition"
               >
                 {isEvaluating ? (
                   <>
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    <span>Обработка оценки...</span>
+                    <span>Отправка запроса...</span>
+                  </>
+                ) : currentJob?.status === 'PENDING' ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                    <span className="text-amber-200">В очереди на оценку...</span>
+                  </>
+                ) : currentJob?.status === 'PROCESSING' ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                    <span>Оценка выполняется...</span>
+                  </>
+                ) : isJobFailed ? (
+                  <>
+                    <Sparkles className="w-3.5 h-3.5 text-rose-400" />
+                    <span>Повторить оценку вопроса #{activeQuestionIdx + 1}</span>
                   </>
                 ) : (
                   <>
@@ -519,6 +674,12 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                   </>
                 )}
               </button>
+              {isJobFailed && currentJob?.errorMessage && (
+                <div className="text-[11px] text-rose-400 bg-rose-950/60 border border-rose-800/80 p-2 rounded-lg flex items-center space-x-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+                  <span>{currentJob.errorMessage}</span>
+                </div>
+              )}
             </div>
 
             {currentProp ? (

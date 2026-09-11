@@ -22,13 +22,34 @@ from dotenv import load_dotenv
 # Ensure environment variables (.env) are loaded
 load_dotenv()
 
-from backend.adapters.llm import LLMRateLimitError, OpenAICompatibleAdapter
+import time
+from datetime import UTC, datetime
+
+import httpx
+
+from backend.adapters.llm import (
+    LLMAuthenticationError,
+    LLMRateLimitError,
+    LLMTransientError,
+    OpenAICompatibleAdapter,
+)
 from backend.adapters.resilient_llm import ResilientLLMAdapter
-from backend.adapters.stt import OpenAICompatibleSTTAdapter, STTRateLimitError
+from backend.adapters.stt import (
+    OpenAICompatibleSTTAdapter,
+    STTAuthenticationError,
+    STTRateLimitError,
+    STTTransientError,
+)
 from backend.core.audio_utils import pcm_s16le_to_wav_bytes
 from backend.core.evidence_validator import validate_proposal
+from backend.core.followup_generator import (
+    FollowUpContext,
+    format_followup_prompt,
+    validate_followup_response,
+)
 from backend.core.matcher import QuestionMatcher
 from backend.core.profiles import (
+    get_plusvibe_gemini_model,
     get_plusvibe_provider,
     get_plusvibe_whisper_stt,
 )
@@ -45,8 +66,14 @@ from contracts.domain import (
     AssessmentProposal,
     CriterionScoreProposal,
     EvidenceRef,
+    PlannedQuestion,
+    RubricCriterion,
     TranscriptRevision,
     TranscriptSegment,
+)
+from contracts.followups import (
+    FollowUpLLMResponse,
+    FollowUpMode,
 )
 
 logger = logging.getLogger("nebula.pipeline")
@@ -62,20 +89,48 @@ def is_pcm_silence(audio_bytes: bytes, threshold_mean_abs: float = 12.0) -> bool
     return mean_abs < threshold_mean_abs
 
 
+DEFAULT_JOB_DEADLINES: dict[str, float] = {
+    "TRANSCRIBE_AUDIO": 30.0,
+    "TRANSCRIBE_TURN": 30.0,
+    "EVALUATE_QUESTION": 30.0,
+    "GENERATE_FOLLOWUPS": 20.0,
+    "GENERATE_SUMMARY": 60.0,
+    "BATCH_RETRANSCRIBE": 120.0,
+}
+
+
 class PipelineWorker:
     def __init__(
         self,
         repository: Repository,
         stt_adapter: OpenAICompatibleSTTAdapter | None = None,
         llm_adapter: OpenAICompatibleAdapter | ResilientLLMAdapter | None = None,
+        followup_llm_adapter: OpenAICompatibleAdapter | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        provider_concurrency_cap: int = 5,
     ) -> None:
         self.repo = repository
         self.provider = get_plusvibe_provider()
-        self.stt_adapter = stt_adapter or OpenAICompatibleSTTAdapter(
-            get_plusvibe_whisper_stt(), api_key_env="PLUSVIBE_API_KEY"
+        self._provider_concurrency_cap = provider_concurrency_cap
+        self._provider_semaphore = asyncio.Semaphore(provider_concurrency_cap)
+        self._owns_http_client = http_client is None
+        self._http_client = http_client or httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=10.0)
         )
-        self.llm_adapter = llm_adapter or ResilientLLMAdapter()
+
+        self.stt_adapter = stt_adapter or OpenAICompatibleSTTAdapter(
+            get_plusvibe_whisper_stt(),
+            api_key_env="PLUSVIBE_API_KEY",
+            http_client=self._http_client,
+        )
+        self.llm_adapter = llm_adapter or ResilientLLMAdapter(http_client=self._http_client)
+        self.followup_llm_adapter = followup_llm_adapter or OpenAICompatibleAdapter(
+            self.provider,
+            get_plusvibe_gemini_model(),
+            http_client=self._http_client,
+        )
         self._running = False
+        self._stop_event = asyncio.Event()
 
     async def _lease_heartbeat(
         self,
@@ -83,11 +138,17 @@ class PipelineWorker:
         owner_token: str,
         grouped_ids: list[str],
         interval_sec: float = 15.0,
+        cancel_event: asyncio.Event | None = None,
     ) -> None:
         try:
             while True:
                 await asyncio.sleep(interval_sec)
-                self.repo.renew_job_lease(job_id, owner_token, extension_sec=60)
+                ok = self.repo.renew_job_lease(job_id, owner_token, extension_sec=60)
+                if not ok:
+                    logger.warning("Lease renewal failed for job %s (lost ownership or expired). Signalling abort.", job_id)
+                    if cancel_event:
+                        cancel_event.set()
+                    break
                 for gid in list(grouped_ids):
                     self.repo.renew_job_lease(gid, owner_token, extension_sec=60)
         except asyncio.CancelledError:
@@ -95,9 +156,17 @@ class PipelineWorker:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error renewing lease for job %s: %s", job_id, exc)
 
-    async def process_one_job(self) -> bool:
+    async def process_one_job(
+        self,
+        include_types: list[str] | tuple[str, ...] | None = None,
+        exclude_types: list[str] | tuple[str, ...] | None = None,
+    ) -> bool:
         """Claims and executes a single job with atomic lease lock. Returns True if job was processed."""
-        job = self.repo.claim_next_job(lock_duration_sec=60)
+        job = self.repo.claim_next_job(
+            lock_duration_sec=60,
+            include_types=include_types,
+            exclude_types=exclude_types,
+        )
         if not job:
             return False
 
@@ -116,28 +185,50 @@ class PipelineWorker:
 
         active_grouped_ids: list[str] = []
         heartbeat_task = None
+        cancel_event = asyncio.Event()
         if owner_token:
             heartbeat_task = asyncio.create_task(
-                self._lease_heartbeat(job_id, owner_token, active_grouped_ids)
+                self._lease_heartbeat(job_id, owner_token, active_grouped_ids, cancel_event=cancel_event)
             )
 
+        t_start = time.perf_counter()
+        now_dt = datetime.now(UTC)
+        queue_wait_ms: int | None = None
+        if job.get("created_at"):
+            with contextlib.suppress(Exception):
+                c_dt = datetime.fromisoformat(job["created_at"])
+                queue_wait_ms = max(0, int((now_dt - c_dt).total_seconds() * 1000))
+
         try:
-            if job_type == "TRANSCRIBE_AUDIO":
-                await self._handle_transcribe_audio(
-                    interview_id, payload, owner_token=owner_token, job_id=job_id
-                )
-            elif job_type == "TRANSCRIBE_TURN":
-                await self._handle_transcribe_turn(
-                    interview_id, payload, owner_token=owner_token, job_id=job_id
-                )
-            elif job_type == "EVALUATE_QUESTION":
-                await self._handle_evaluate(interview_id, payload, owner_token=owner_token, job_id=job_id)
-            elif job_type == "BATCH_RETRANSCRIBE":
-                await self._handle_batch_retranscribe(interview_id, payload, owner_token=owner_token, job_id=job_id)
-            elif job_type == "GENERATE_SUMMARY":
-                await self._handle_generate_summary(interview_id, payload, owner_token=owner_token, job_id=job_id)
-            else:
-                raise ValueError(f"Unknown job type: {job_type}")
+            async def _run_handler():
+                if job_type == "TRANSCRIBE_AUDIO":
+                    return await self._handle_transcribe_audio(
+                        interview_id, payload, owner_token=owner_token, job_id=job_id
+                    )
+                elif job_type == "TRANSCRIBE_TURN":
+                    return await self._handle_transcribe_turn(
+                        interview_id, payload, owner_token=owner_token, job_id=job_id
+                    )
+                elif job_type == "EVALUATE_QUESTION":
+                    return await self._handle_evaluate(interview_id, payload, owner_token=owner_token, job_id=job_id)
+                elif job_type == "BATCH_RETRANSCRIBE":
+                    return await self._handle_batch_retranscribe(interview_id, payload, owner_token=owner_token, job_id=job_id)
+                elif job_type == "GENERATE_SUMMARY":
+                    return await self._handle_generate_summary(interview_id, payload, owner_token=owner_token, job_id=job_id)
+                elif job_type == "GENERATE_FOLLOWUPS":
+                    return await self._handle_generate_followups(interview_id, payload, owner_token=owner_token, job_id=job_id)
+                else:
+                    raise ValueError(f"Unknown job type: {job_type}")
+
+            deadline_sec = DEFAULT_JOB_DEADLINES.get(job_type, 60.0)
+            res_meta = await asyncio.wait_for(_run_handler(), timeout=deadline_sec)
+
+            if cancel_event.is_set():
+                raise RepositoryConflictError(f"Job {job_id} lease lost during execution, aborting commit")
+
+            handler_meta: dict[str, Any] = {}
+            if isinstance(res_meta, dict):
+                handler_meta.update(res_meta)
 
             # Re-verify interview wasn't deleted while job was running
             if not self.repo.get_interview(interview_id):
@@ -145,32 +236,81 @@ class PipelineWorker:
                 self.repo.fail_job(job_id, "Interview was deleted during execution", owner_token=owner_token)
                 return True
 
+            execution_duration_ms = int((time.perf_counter() - t_start) * 1000)
             self.repo.complete_job(job_id, owner_token=owner_token)
+            completed_payload: dict[str, Any] = {
+                "job_id": job_id,
+                "attempt": job.get("attempts", 1),
+                "queue_wait_ms": queue_wait_ms,
+                "execution_duration_ms": execution_duration_ms,
+            }
+            completed_payload.update(handler_meta)
             self.repo.record_audit_event(
                 event_id=f"audit-{uuid.uuid4().hex[:8]}",
                 interview_id=interview_id,
                 event_type=f"JOB_COMPLETED_{job_type}",
-                payload={"job_id": job_id},
+                payload=completed_payload,
             )
             return True
         except Exception as exc:
             logger.exception("Job %s (%s) failed", job_id, job_type)
-            self.repo.fail_job(job_id, str(exc), owner_token=owner_token)
+            is_terminal = getattr(exc, "is_terminal", False)
+            if isinstance(exc, (LLMAuthenticationError, STTAuthenticationError)):
+                is_terminal = True
+
+            retry_delay_sec = 0
+            if isinstance(
+                exc,
+                (STTRateLimitError, LLMRateLimitError, LLMTransientError, STTTransientError, asyncio.TimeoutError),
+            ):
+                retry_delay_sec = int(getattr(exc, "retry_after", 10.0) or 10.0)
+            elif hasattr(exc, "retry_delay_sec"):
+                retry_delay_sec = int(exc.retry_delay_sec)
+
+            err_msg = str(exc).strip()
+            if not err_msg and isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+                err_msg = f"Job execution timed out (deadline {deadline_sec}s exceeded)"
+            elif not err_msg:
+                err_msg = exc.__class__.__name__
+
+            try:
+                self.repo.fail_job(
+                    job_id,
+                    err_msg,
+                    owner_token=owner_token,
+                    retry_delay_sec=retry_delay_sec,
+                    is_terminal=is_terminal,
+                )
+            except RepositoryConflictError as rce:
+                logger.warning("Could not fail job %s: %s", job_id, rce)
+
             for gid in active_grouped_ids:
                 try:
-                    self.repo.fail_job(gid, f"Parent batch job {job_id} failed: {exc}", owner_token=owner_token)
+                    self.repo.fail_job(
+                        gid,
+                        f"Parent batch job {job_id} failed: {err_msg}",
+                        owner_token=owner_token,
+                        is_terminal=is_terminal,
+                        retry_delay_sec=retry_delay_sec,
+                    )
                 except (sqlite3.Error, RepositoryConflictError, RuntimeError) as fail_err:
                     logger.debug("Failed to mark child job %s as failed: %s", gid, fail_err)
+
+            execution_duration_ms = int((time.perf_counter() - t_start) * 1000)
             self.repo.record_audit_event(
                 event_id=f"audit-{uuid.uuid4().hex[:8]}",
                 interview_id=interview_id,
                 event_type=f"JOB_FAILED_{job_type}",
-                payload={"job_id": job_id, "error": str(exc)},
+                payload={
+                    "job_id": job_id,
+                    "attempt": job.get("attempts", 1),
+                    "queue_wait_ms": queue_wait_ms,
+                    "execution_duration_ms": execution_duration_ms,
+                    "error": str(exc),
+                    "is_terminal": is_terminal,
+                    "retry_delay_sec": retry_delay_sec,
+                },
             )
-            if isinstance(exc, (STTRateLimitError, LLMRateLimitError)):
-                retry_wait = min(getattr(exc, "retry_after", 5.0) or 5.0, 30.0)
-                logger.info("Pacing worker loop due to rate limit: sleeping %.1fs", retry_wait)
-                await asyncio.sleep(retry_wait)
             return False
         finally:
             if heartbeat_task:
@@ -301,7 +441,13 @@ class PipelineWorker:
             next_sequence=out.next_sequence,
             next_sample_offset=out.next_sample_offset,
             turns=out.turns,
+            expected_sequence=cursor_seq,
+            expected_sample_offset=cursor_off,
         )
+        return {
+            "assembled_turns_count": len(out.turns),
+            "next_sequence": out.next_sequence,
+        }
 
     async def _handle_transcribe_turn(
         self,
@@ -309,7 +455,7 @@ class PipelineWorker:
         payload: dict[str, Any],
         owner_token: str | None = None,
         job_id: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """
         Executes STT transcription for a coherent speech turn.
         Reconstructs PCM from audio chunks, calls STT adapter, filters hallucinations,
@@ -328,9 +474,11 @@ class PipelineWorker:
         language = payload.get("language", "ru")
         segment_id = payload.get("segment_id", f"seg-{uuid.uuid4().hex[:8]}")
 
-        if not self.repo.get_interview(interview_id):
+        inv = self.repo.get_interview(interview_id)
+        if not inv:
             logger.warning("Interview %s was deleted before transcribing turn %s.", interview_id, job_id)
-            return
+            return None
+        target_revision_id = payload.get("transcript_revision_id") or inv.get("active_transcript_revision_id") or "trans-rev-1"
 
         pcm_bytes = self.repo.get_turn_audio_pcm(
             interview_id=interview_id,
@@ -344,17 +492,18 @@ class PipelineWorker:
 
         if not pcm_bytes:
             logger.debug("Turn %s has empty audio, skipping STT.", job_id)
-            return
+            return {"audio_duration_ms": 0, "call_duration_ms": 0, "is_empty": True}
 
         wav_bytes = pcm_s16le_to_wav_bytes(pcm_bytes, sample_rate, channels)
         filename = f"turn_{track_id}_{start_ms}_{end_ms}.wav"
 
-        res = await self.stt_adapter.transcribe_audio(
-            wav_bytes,
-            filename=filename,
-            content_type="audio/wav",
-            language=language,
-        )
+        async with self._provider_semaphore:
+            res = await self.stt_adapter.transcribe_audio(
+                wav_bytes,
+                filename=filename,
+                content_type="audio/wav",
+                language=language,
+            )
 
         cleaned_text = res.text.strip()
         WHISPER_HALLUCINATIONS = {
@@ -367,32 +516,49 @@ class PipelineWorker:
             "до скорых встреч",
             "редактор субтитров",
         }
+        audio_duration_ms = max(0, end_ms - start_ms)
+        call_duration_ms = int(getattr(res, "latency_seconds", 0) * 1000)
+        provider_id = getattr(getattr(self, "provider", None), "id", "system")
+        upstream_model_id = getattr(res, "model_id", "default")
+
         if (
             not cleaned_text
             or cleaned_text in (".", "...", ",", "!", "?", "—", "-")
             or cleaned_text.lower() in WHISPER_HALLUCINATIONS
         ):
             logger.debug("Transcribed turn %s produced empty/hallucination text, skipping segment.", filename)
-            return
-
-        if not self.repo.get_interview(interview_id):
-            logger.warning("Interview %s was deleted before saving transcript segment.", interview_id)
-            return
+            return {
+                "audio_duration_ms": audio_duration_ms,
+                "call_duration_ms": call_duration_ms,
+                "provider_id": provider_id,
+                "upstream_model_id": upstream_model_id,
+                "is_skipped": True,
+            }
 
         speaker_role = payload.get("speaker_role")
         if not speaker_role:
             speaker_role = "unknown" if str(track_id).lower() == "shared" else str(track_id).lower()
 
-        self.repo.add_transcript_segment(
+        self.repo.save_turn_transcript_segment(
             segment_id=segment_id,
             interview_id=interview_id,
             track_id=track_id,
             start_time_ms=start_ms,
             end_time_ms=end_ms,
             text=cleaned_text,
+            target_revision_id=target_revision_id,
             is_final=True,
             speaker_role=speaker_role,
+            owner_token=owner_token,
+            job_id=job_id,
         )
+        return {
+            "audio_duration_ms": audio_duration_ms,
+            "call_duration_ms": call_duration_ms,
+            "provider_id": provider_id,
+            "upstream_model_id": upstream_model_id,
+            "segment_id": segment_id,
+        }
 
     async def _handle_legacy_direct_transcribe(
         self,
@@ -415,12 +581,13 @@ class PipelineWorker:
             wav_bytes = audio_bytes
 
         filename = f"chunk_{track_id}_{start_ms}_{end_ms}.wav"
-        res = await self.stt_adapter.transcribe_audio(
-            wav_bytes,
-            filename=filename,
-            content_type="audio/wav",
-            language=language,
-        )
+        async with self._provider_semaphore:
+            res = await self.stt_adapter.transcribe_audio(
+                wav_bytes,
+                filename=filename,
+                content_type="audio/wav",
+                language=language,
+            )
 
         cleaned_text = res.text.strip()
         WHISPER_HALLUCINATIONS = {
@@ -589,7 +756,16 @@ class PipelineWorker:
                 owner_token=owner_token,
                 job_id=job_id,
             )
-            return
+            return {
+                "question_id": question_id,
+                "call_duration_ms": 0,
+                "provider_id": prov_id,
+                "upstream_model_id": mod_id,
+                "scores_count": len(empty_scores),
+                "is_rejected": False,
+                "is_stale": is_stale,
+                "is_unanswered": True,
+            }
 
 
         # 3. Build candidate speech text with explicit individual segment IDs
@@ -643,46 +819,50 @@ Respond strictly with a JSON object conforming to:
         ]
 
         # 4. Execute request through resilient LLM adapter
-        if isinstance(self.llm_adapter, ResilientLLMAdapter):
-            llm_res, actual_model_id = await self.llm_adapter.execute_request(
-                messages=messages,
-                json_schema={
-                    "type": "object",
-                    "properties": {
-                        "scores": {"type": "array"},
-                        "critical_errors": {"type": "array"},
+        t_eval0 = time.perf_counter()
+        async with self._provider_semaphore:
+            if isinstance(self.llm_adapter, ResilientLLMAdapter):
+                llm_res, actual_model_id = await self.llm_adapter.execute_request(
+                    messages=messages,
+                    json_schema={
+                        "type": "object",
+                        "properties": {
+                            "scores": {"type": "array"},
+                            "critical_errors": {"type": "array"},
+                        },
+                        "required": ["scores", "critical_errors"],
                     },
-                    "required": ["scores", "critical_errors"],
-                },
-                schema_name="assessment_schema",
-            )
-            fallback_metadata = self.llm_adapter.last_fallback_event
-            if fallback_metadata:
-                self.repo.record_audit_event(
-                    event_id=f"audit-{uuid.uuid4().hex[:8]}",
-                    interview_id=interview_id,
-                    event_type="MODEL_FALLBACK_TRIGGERED",
-                    payload=fallback_metadata,
+                    schema_name="assessment_schema",
                 )
-        else:
-            raw_res = await self.llm_adapter.execute_request(
-                messages=messages,
-                json_schema={
-                    "type": "object",
-                    "properties": {
-                        "scores": {"type": "array"},
-                        "critical_errors": {"type": "array"},
-                    },
-                    "required": ["scores", "critical_errors"],
-                },
-                schema_name="assessment_schema",
-            )
-            fallback_metadata = None
-            if isinstance(raw_res, tuple):
-                llm_res, actual_model_id = raw_res
+                fallback_metadata = self.llm_adapter.last_fallback_event
+                if fallback_metadata:
+                    self.repo.record_audit_event(
+                        event_id=f"audit-{uuid.uuid4().hex[:8]}",
+                        interview_id=interview_id,
+                        event_type="MODEL_FALLBACK_TRIGGERED",
+                        payload=fallback_metadata,
+                    )
             else:
-                llm_res = raw_res
-                actual_model_id = getattr(getattr(self.llm_adapter, "model", None), "upstream_model_id", "mock-model")
+                raw_res = await self.llm_adapter.execute_request(
+                    messages=messages,
+                    json_schema={
+                        "type": "object",
+                        "properties": {
+                            "scores": {"type": "array"},
+                            "critical_errors": {"type": "array"},
+                        },
+                        "required": ["scores", "critical_errors"],
+                    },
+                    schema_name="assessment_schema",
+                )
+                fallback_metadata = None
+                if isinstance(raw_res, tuple):
+                    llm_res, actual_model_id = raw_res
+                else:
+                    llm_res = raw_res
+                    actual_model_id = getattr(getattr(self.llm_adapter, "model", None), "upstream_model_id", "mock-model")
+
+        call_duration_ms = int((time.perf_counter() - t_eval0) * 1000)
 
         parsed_json = llm_res.get("data", llm_res) if isinstance(llm_res, dict) else {}
         scores = parsed_json.get("scores", [])
@@ -787,6 +967,15 @@ Respond strictly with a JSON object conforming to:
             owner_token=owner_token,
             job_id=job_id,
         )
+        return {
+            "question_id": question_id,
+            "call_duration_ms": call_duration_ms,
+            "provider_id": prov_id,
+            "upstream_model_id": mod_id,
+            "scores_count": len(scores),
+            "is_rejected": is_rejected,
+            "is_stale": is_stale,
+        }
 
     async def _handle_batch_retranscribe(
         self,
@@ -880,11 +1069,12 @@ Respond strictly with a JSON object conforming to:
                         continue
 
                     wav_bytes = pcm_s16le_to_wav_bytes(pcm_bytes, turn.sample_rate, turn.channels)
-                    res = await self.stt_adapter.transcribe_audio(
-                        wav_bytes,
-                        filename=f"batch_{track_id}_{turn.first_sequence}_{turn.last_sequence}.wav",
-                        content_type="audio/wav",
-                    )
+                    async with self._provider_semaphore:
+                        res = await self.stt_adapter.transcribe_audio(
+                            wav_bytes,
+                            filename=f"batch_{track_id}_{turn.first_sequence}_{turn.last_sequence}.wav",
+                            content_type="audio/wav",
+                        )
                     text_val = res.text.strip()
                     whisper_hallucinations = {
                         "продолжение следует...",
@@ -1102,13 +1292,14 @@ Respond strictly with a JSON object conforming to:
         summary_gen = ExecutiveSummaryGenerator(
             llm_adapter=self.llm_adapter if isinstance(self.llm_adapter, ResilientLLMAdapter) else None
         )
-        summary_res = await summary_gen.generate_summary(
-            candidate_name=candidate_name,
-            role=role,
-            decisions=list(decisions_map.values()),
-            audio_health_summary=payload.get("audio_health", {}),
-            limitations=limitations,
-        )
+        async with self._provider_semaphore:
+            summary_res = await summary_gen.generate_summary(
+                candidate_name=candidate_name,
+                role=role,
+                decisions=list(decisions_map.values()),
+                audio_health_summary=payload.get("audio_health", {}),
+                limitations=limitations,
+            )
 
         # Programmatically validate quotes against actual candidate segments of active revision
         all_segs = self.repo.get_transcript_segments(interview_id, revision_id=active_trans_rev)
@@ -1141,17 +1332,311 @@ Respond strictly with a JSON object conforming to:
             job_id=job_id,
         )
 
-    async def run_loop(self, poll_interval_sec: float = 1.0) -> None:
+    async def _handle_generate_followups(
+        self,
+        interview_id: str,
+        payload: dict[str, Any],
+        owner_token: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        request_id = payload.get("request_id")
+        if not request_id:
+            logger.warning("Missing request_id in GENERATE_FOLLOWUPS payload: %s", payload)
+            return
+
+        with self.repo.db.transaction() as conn:
+            req_row = conn.execute(
+                "SELECT * FROM followup_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+        if not req_row:
+            logger.warning("Followup request %s not found for job %s", request_id, job_id)
+            return
+
+        # 1. Lifecycle check
+        interview = self.repo.get_interview(interview_id)
+        if not interview:
+            logger.warning("Interview %s deleted. Aborting followups for job %s", interview_id, job_id)
+            return
+        inv_status = str(interview.get("status", "")).lower()
+        if inv_status in ("processing", "review", "finalized", "deleted"):
+            logger.info("Interview %s in status %s. Superseding followups job %s", interview_id, inv_status, job_id)
+            with self.repo.db.transaction() as conn:
+                conn.execute("UPDATE followup_requests SET outcome = 'superseded' WHERE id = ?", (request_id,))
+            return
+
+        # 2. Revision check
+        active_rubric = interview.get("active_rubric_revision_id") or "rub-rev-1"
+        active_trans = interview.get("active_transcript_revision_id") or "trans-rev-1"
+        if req_row["rubric_revision_id"] != active_rubric or req_row["transcript_revision_id"] != active_trans:
+            logger.info("Revisions changed for interview %s. Superseding followups request %s", interview_id, request_id)
+            with self.repo.db.transaction() as conn:
+                conn.execute("UPDATE followup_requests SET outcome = 'superseded' WHERE id = ?", (request_id,))
+            return
+
+        # 3. Check segment text & roles
+        context_data = json.loads(req_row["context_json"])
+        cand_segs = context_data.get("candidate_segments", [])
+        with self.repo.db.transaction() as conn:
+            for c_seg in cand_segs:
+                seg_row = conn.execute(
+                    "SELECT text, speaker_role, track_id FROM transcript_segments WHERE interview_id = ? AND revision_id = ? AND id = ?",
+                    (interview_id, active_trans, c_seg["id"]),
+                ).fetchone()
+                if not seg_row or seg_row["text"].strip() != c_seg["text"].strip():
+                    conn.execute("UPDATE followup_requests SET outcome = 'superseded' WHERE id = ?", (request_id,))
+                    return
+                role = (seg_row["speaker_role"] or "unknown").lower()
+                track = str(seg_row["track_id"]).lower()
+                is_cand = (role != "interviewer") if track == "candidate" else (role == "candidate")
+                if not is_cand:
+                    conn.execute("UPDATE followup_requests SET outcome = 'superseded' WHERE id = ?", (request_id,))
+                    return
+
+        # 4. Reconstruct FollowUpContext from context_data
+        q_data = context_data["question"]
+        question = PlannedQuestion(
+            id=q_data["id"],
+            title=q_data["title"],
+            prompt=q_data["prompt"],
+            criteria=[
+                RubricCriterion(id=c["id"], title=c["title"], description=c["description"])
+                for c in q_data["criteria"]
+            ],
+        )
+
+        candidate_segments = [
+            TranscriptSegment(
+                id=s["id"],
+                track_id=TrackType.CANDIDATE,
+                start_time_ms=0,
+                end_time_ms=0,
+                text=s["text"],
+                is_final=True,
+                speaker_role="candidate",
+            )
+            for s in cand_segs
+        ]
+
+        interviewer_segments = [
+            TranscriptSegment(
+                id=s["id"],
+                track_id=TrackType.INTERVIEWER,
+                start_time_ms=0,
+                end_time_ms=0,
+                text=s["text"],
+                is_final=True,
+                speaker_role="interviewer",
+            )
+            for s in context_data.get("interviewer_segments", [])
+        ]
+
+        fu_context = FollowUpContext(
+            interview_id=interview_id,
+            question_id=req_row["question_id"],
+            mode=FollowUpMode(req_row["mode"]),
+            rubric_revision_id=req_row["rubric_revision_id"],
+            transcript_revision_id=req_row["transcript_revision_id"],
+            question=question,
+            role_title=context_data.get("role_title", ""),
+            candidate_segments=candidate_segments,
+            interviewer_segments=interviewer_segments,
+            decisions_history=context_data.get("decisions_history", []),
+            candidate_fingerprint=req_row["candidate_fingerprint"],
+            context_hash=req_row["context_hash"],
+        )
+
+        # 5. Format prompt and schema
+        messages = format_followup_prompt(fu_context)
+        json_schema = FollowUpLLMResponse.model_json_schema()
+
+        # 6. Call LLM with timeout and isolated adapter
+        t0 = time.perf_counter()
+        try:
+            async with self._provider_semaphore:
+                response_envelope = await asyncio.wait_for(
+                    self.followup_llm_adapter.execute_request(
+                        messages=messages,
+                        json_schema=json_schema,
+                        schema_name="followup_suggestions",
+                        max_retries=1,
+                    ),
+                    timeout=20.0,
+                )
+        except LLMAuthenticationError as auth_err:
+            logger.error("Auth error in follow-up generation for %s: %s", request_id, auth_err)
+            with self.repo.db.transaction() as conn:
+                conn.execute(
+                    "UPDATE followup_requests SET outcome = 'failed', error_code = 'auth_error' WHERE id = ?",
+                    (request_id,),
+                )
+            auth_err.is_terminal = True
+            raise
+        except (LLMRateLimitError, LLMTransientError, asyncio.TimeoutError) as retryable_err:
+            retry_sec = getattr(retryable_err, "retry_after", None) or 10.0
+            logger.warning("Retryable error in follow-up generation for %s: %s", request_id, retryable_err)
+            retryable_err.retry_delay_sec = int(retry_sec)
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected error in follow-up generation for %s: %s", request_id, exc)
+            raise
+
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+
+        # Unpack envelope and extract exact upstream model & usage
+        if isinstance(response_envelope, dict):
+            res_dict = response_envelope.get("data") or {}
+            upstream_model = response_envelope.get("model") or getattr(
+                self.followup_llm_adapter.model, "upstream_model_id", None
+            )
+            usage = response_envelope.get("usage") or {}
+            usage_tokens = usage.get("total_tokens")
+        else:
+            res_dict = response_envelope
+            upstream_model = getattr(self.followup_llm_adapter.model, "upstream_model_id", None)
+            usage_tokens = None
+
+        logger.info(
+            "Follow-up generated for request %s (job %s) with upstream model %s in %d ms",
+            request_id,
+            job_id,
+            upstream_model,
+            latency_ms,
+        )
+
+        # 7. Validate response
+        validated_resp, errors = validate_followup_response(res_dict, fu_context)
+        if errors and not validated_resp.suggestions and any("schema" in e.lower() for e in errors):
+            with self.repo.db.transaction() as conn:
+                conn.execute(
+                    "UPDATE followup_requests SET outcome = 'failed', error_code = 'validation_error' WHERE id = ?",
+                    (request_id,),
+                )
+            val_err = ValueError(f"Followup validation failure: {errors}")
+            val_err.is_terminal = True
+            raise val_err
+
+        # 8. Pre-commit check: lifecycle and revisions
+        interview = self.repo.get_interview(interview_id)
+        if not interview:
+            return
+        inv_status = str(interview.get("status", "")).lower()
+        if inv_status in ("processing", "review", "finalized", "deleted"):
+            with self.repo.db.transaction() as conn:
+                conn.execute("UPDATE followup_requests SET outcome = 'superseded' WHERE id = ?", (request_id,))
+            return
+        if (
+            interview.get("active_rubric_revision_id") != req_row["rubric_revision_id"]
+            or interview.get("active_transcript_revision_id") != req_row["transcript_revision_id"]
+        ):
+            with self.repo.db.transaction() as conn:
+                conn.execute("UPDATE followup_requests SET outcome = 'superseded' WHERE id = ?", (request_id,))
+            return
+
+        # 9. Save suggestions
+        sug_payload = [s.model_dump() for s in validated_resp.suggestions]
+        outcome = "ready" if sug_payload else "no_suggestions"
+        if owner_token and job_id:
+            self.repo.save_followup_suggestions(
+                job_id=job_id,
+                request_id=request_id,
+                owner_token=owner_token,
+                suggestions=sug_payload,
+                outcome=outcome,
+                model_profile_id=getattr(self.followup_llm_adapter.model, "id", "google/gemini-3.8-flash"),
+                provider_id=getattr(self.followup_llm_adapter.provider, "id", "plusvibe"),
+                usage_tokens=usage_tokens,
+                latency_ms=latency_ms,
+            )
+        return {
+            "question_id": req_row["question_id"],
+            "call_duration_ms": latency_ms,
+            "provider_id": getattr(self.followup_llm_adapter.provider, "id", "plusvibe"),
+            "upstream_model": upstream_model,
+            "usage_tokens": usage_tokens,
+            "suggestions_count": len(sug_payload),
+        }
+
+    async def run_loop(self, poll_interval_sec: float = 0.25) -> None:
+        """
+        Runs dedicated consumers matching Stage 4 specifications:
+        1. Assembly: TRANSCRIBE_AUDIO (concurrency 1)
+        2. Live STT: TRANSCRIBE_TURN (concurrency 2)
+        3. Assessment: EVALUATE_QUESTION (concurrency 1)
+        4. Follow-ups: GENERATE_FOLLOWUPS (concurrency 1)
+        5. Background: BATCH_RETRANSCRIBE, GENERATE_SUMMARY, etc. (concurrency 1)
+        """
         self._running = True
-        while self._running:
-            did_work = await self.process_one_job()
-            if not did_work:
-                await asyncio.sleep(poll_interval_sec)
-            else:
-                await asyncio.sleep(0.3)
+        self._stop_event.clear()
+
+        async def _consumer_loop(
+            consumer_name: str,
+            include_types: list[str] | None = None,
+            exclude_types: list[str] | None = None,
+        ) -> None:
+            while self._running:
+                try:
+                    did_work = await self.process_one_job(
+                        include_types=include_types,
+                        exclude_types=exclude_types,
+                    )
+                    if not did_work:
+                        # Queue is empty for these types: interruptible wait
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(self._stop_event.wait(), timeout=poll_interval_sec)
+                    else:
+                        # Cooperative yield without artificial 300ms sleep
+                        await asyncio.sleep(0)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.exception("Error in %s consumer loop: %s", consumer_name, e)
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(self._stop_event.wait(), timeout=poll_interval_sec)
+
+        # Concurrency: 1 Assembly + 2 Live STT + 1 Assessment + 1 Followups + 1 Background = 6 workers
+        consumers = [
+            asyncio.create_task(_consumer_loop("assembly", include_types=["TRANSCRIBE_AUDIO"])),
+            asyncio.create_task(_consumer_loop("live_stt_1", include_types=["TRANSCRIBE_TURN"])),
+            asyncio.create_task(_consumer_loop("live_stt_2", include_types=["TRANSCRIBE_TURN"])),
+            asyncio.create_task(_consumer_loop("assessment", include_types=["EVALUATE_QUESTION"])),
+            asyncio.create_task(_consumer_loop("followups", include_types=["GENERATE_FOLLOWUPS"])),
+            asyncio.create_task(
+                _consumer_loop(
+                    "background",
+                    exclude_types=[
+                        "TRANSCRIBE_AUDIO",
+                        "TRANSCRIBE_TURN",
+                        "EVALUATE_QUESTION",
+                        "GENERATE_FOLLOWUPS",
+                    ],
+                )
+            ),
+        ]
+
+        try:
+            await asyncio.gather(*consumers)
+        except asyncio.CancelledError:
+            self._running = False
+            self._stop_event.set()
+            for c in consumers:
+                c.cancel()
+            await asyncio.gather(*consumers, return_exceptions=True)
+        finally:
+            self._running = False
+            self._stop_event.set()
+            if self._owns_http_client:
+                await self.close()
 
     def stop(self) -> None:
+        """Signals all consumers to stop."""
         self._running = False
+        self._stop_event.set()
+
+    async def close(self) -> None:
+        """Stops worker and closes owned HTTP client resources."""
+        self.stop()
+        if self._owns_http_client and self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
 
 
 if __name__ == "__main__":

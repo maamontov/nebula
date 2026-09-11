@@ -6,12 +6,14 @@ import {
   HumanAssessment,
   SpeakerRole,
   ReportRevisionSummary,
+  FollowUpSuggestion,
 } from '../types';
 import {
   reviewAssessment,
   getInterview,
   exportInterview,
   enqueueJob,
+  getInterviewJobsStatus,
   getSummary,
   confirmSummary,
   finalizeInterviewReport,
@@ -50,6 +52,7 @@ import {
   FileSpreadsheet,
   ThumbsUp,
   Briefcase,
+  Compass,
 } from 'lucide-react';
 
 interface DecisionOption {
@@ -189,6 +192,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [reportRevisions, setReportRevisions] = useState<ReportRevisionSummary[]>([]);
   const [isLoadingRevisions, setIsLoadingRevisions] = useState(false);
   const [exportingRevNumber, setExportingRevNumber] = useState<number | null>(null);
+  const [askedFollowups, setAskedFollowups] = useState<FollowUpSuggestion[]>([]);
 
   // Exclusions map: question_id -> { isExcluded: boolean; reason: string }
   const [excludedQuestions, setExcludedQuestions] = useState<Record<string, { isExcluded: boolean; reason: string }>>({});
@@ -203,6 +207,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [isConfirmingAll, setIsConfirmingAll] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isEvaluatingAll, setIsEvaluatingAll] = useState(false);
+  const [evalProgressText, setEvalProgressText] = useState<string | null>(null);
+  const [trackedEvalJobIds, setTrackedEvalJobIds] = useState<string[]>([]);
   const [exportError, setExportError] = useState<string | null>(null);
   const [evalWarning, setEvalWarning] = useState<string | null>(null);
 
@@ -247,6 +253,12 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         if (data.interview.finalized_checksum) {
           setFinalizedChecksum(data.interview.finalized_checksum);
         }
+      }
+
+      if (data.asked_followups) {
+        setAskedFollowups(data.asked_followups);
+      } else if ((data.interview as any)?.canonical_snapshot?.followup_questions) {
+        setAskedFollowups((data.interview as any).canonical_snapshot.followup_questions);
       }
 
       // Baseline proposals from AI
@@ -343,6 +355,97 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  // Restore active EVALUATE_QUESTION jobs on mount
+  useEffect(() => {
+    let isSubscribed = true;
+    getInterviewJobsStatus(interviewId, { limit: 100 })
+      .then((res) => {
+        if (!isSubscribed || !res.active_jobs) return;
+        const activeEvalJobs = res.active_jobs.filter(
+          (j) => j.type === 'EVALUATE_QUESTION' && (j.status === 'PENDING' || j.status === 'PROCESSING')
+        );
+        if (activeEvalJobs.length > 0) {
+          const jobIds = activeEvalJobs.map((j) => j.id);
+          setTrackedEvalJobIds(jobIds);
+          setIsEvaluatingAll(true);
+          setEvalProgressText(`Возобновлено отслеживание оценки (${activeEvalJobs.length} задач в очереди/работе)...`);
+        }
+      })
+      .catch((err) => {
+        console.warn('Could not restore review eval jobs:', err);
+      });
+
+    return () => {
+      isSubscribed = false;
+    };
+  }, [interviewId]);
+
+  // Track evaluation jobs to terminal state with partial progress updates
+  useEffect(() => {
+    if (trackedEvalJobIds.length === 0) return;
+
+    let isSubscribed = true;
+    const poll = setInterval(async () => {
+      try {
+        const res = await getInterviewJobsStatus(interviewId, { jobIds: trackedEvalJobIds });
+        if (!isSubscribed) return;
+
+        const jobs = res.active_jobs || [];
+        const pendingOrProcessing = jobs.filter((j) => j.status === 'PENDING' || j.status === 'PROCESSING');
+        const completed = jobs.filter((j) => j.status === 'COMPLETED');
+        const failed = jobs.filter((j) => j.status === 'FAILED');
+
+        const total = trackedEvalJobIds.length;
+        setEvalProgressText(
+          `Оценка: завершено ${completed.length}/${total}` +
+            (failed.length > 0 ? ` (ошибок: ${failed.length})` : '') +
+            ` [в процессе: ${pendingOrProcessing.length}]`
+        );
+
+        // Incrementally sync proposals so reviewer sees partial results
+        const data = await getInterview(interviewId);
+        if (isSubscribed && data.assessment_proposals && data.assessment_proposals.length > 0) {
+          setProposals(data.assessment_proposals);
+          const scores: Record<string, number> = {};
+          const critScores: Record<string, Record<string, number>> = {};
+          data.assessment_proposals.forEach((p) => {
+            const sc = p.reviewed_scores?.[0]?.score ?? p.scores?.[0]?.score;
+            if (sc !== undefined) scores[p.question_id] = sc;
+            if (p.scores && p.scores.length > 0) {
+              critScores[p.question_id] = {};
+              p.scores.forEach((c) => {
+                if (c.score !== undefined && c.score !== null) {
+                  critScores[p.question_id][c.criterion_id] = c.score;
+                }
+              });
+            }
+          });
+          setQuestionScores((prev) => ({ ...prev, ...scores }));
+          setCriterionScores((prev) => ({ ...prev, ...critScores }));
+        }
+
+        if (pendingOrProcessing.length === 0 && jobs.length > 0) {
+          // All tracked jobs reached terminal state
+          clearInterval(poll);
+          setTrackedEvalJobIds([]);
+          setIsEvaluatingAll(false);
+          if (failed.length > 0) {
+            setEvalWarning(`Автооценка завершена с ошибками для ${failed.length} вопросов. Проверьте детали.`);
+          } else {
+            setEvalProgressText(null);
+          }
+        }
+      } catch (e) {
+        console.warn('Review eval poll error:', e);
+      }
+    }, 1200);
+
+    return () => {
+      isSubscribed = false;
+      clearInterval(poll);
+    };
+  }, [trackedEvalJobIds, interviewId]);
 
   // Deterministic 100-point score computation over assessed questions
   const calculateFinalScore = (): number | null => {
@@ -797,66 +900,59 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   };
 
   const handleAutoEvaluateAll = async () => {
-    if (isFinalized) return;
+    if (isFinalized || isEvaluatingAll) return;
     setEvalWarning(null);
-    const candidateSegments = segments.filter(
-      (s) => s.speaker_role === 'candidate' || (s.speaker_role !== 'interviewer' && s.track_id === 'candidate')
-    );
+    setEvalProgressText(null);
+
+    const candidateSegments = segments.filter((s) => {
+      if (s.speaker_role === 'candidate') return true;
+      if (s.speaker_role === 'interviewer') return false;
+      return s.track_id === 'candidate';
+    });
     if (candidateSegments.length === 0) {
       setEvalWarning('В стенограмме нет распознанной речи кандидата для запуска автооценки.');
       return;
     }
 
     setIsEvaluatingAll(true);
-    try {
-      for (const q of plan.questions) {
-        await enqueueJob(interviewId, 'EVALUATE_QUESTION', {
-          question_id: q.id,
-          rubric_description: q.criteria.map((c) => c.title).join(', '),
-        });
-      }
+    setEvalProgressText('Постановка вопросов в очередь...');
 
-      let attempts = 0;
-      const poll = setInterval(async () => {
-        attempts++;
-        try {
-          const data = await getInterview(interviewId);
-          if (
-            (data.assessment_proposals && data.assessment_proposals.length >= plan.questions.length) ||
-            attempts >= 30
-          ) {
-            clearInterval(poll);
-            if (data.assessment_proposals && data.assessment_proposals.length > 0) {
-              setProposals(data.assessment_proposals);
-              const scores: Record<string, number> = {};
-              const critScores: Record<string, Record<string, number>> = {};
-              data.assessment_proposals.forEach((p) => {
-                const sc = p.reviewed_scores?.[0]?.score ?? p.scores?.[0]?.score;
-                if (sc !== undefined) scores[p.question_id] = sc;
-                if (p.scores && p.scores.length > 0) {
-                  critScores[p.question_id] = {};
-                  p.scores.forEach((c) => {
-                    if (c.score !== undefined && c.score !== null) {
-                      critScores[p.question_id][c.criterion_id] = c.score;
-                    }
-                  });
-                }
-              });
-              setQuestionScores((prev) => ({ ...prev, ...scores }));
-              setCriterionScores((prev) => ({ ...prev, ...critScores }));
-            }
-            setIsEvaluatingAll(false);
-          }
-        } catch {
-          if (attempts >= 30) {
-            clearInterval(poll);
-            setIsEvaluatingAll(false);
+    try {
+      const jobIds: string[] = [];
+      const concurrencyLimit = 3;
+      const queue = [...plan.questions];
+
+      const runWorker = async () => {
+        while (queue.length > 0) {
+          const q = queue.shift();
+          if (!q) break;
+          try {
+            const res = await enqueueJob(interviewId, 'EVALUATE_QUESTION', {
+              question_id: q.id,
+              rubric_description: q.criteria.map((c) => c.title).join(', '),
+            });
+            jobIds.push(res.job_id);
+          } catch (err) {
+            console.error(`Failed to enqueue evaluation for question ${q.id}:`, err);
           }
         }
-      }, 1000);
-    } catch (e) {
+      };
+
+      const workers = Array.from({ length: Math.min(concurrencyLimit, queue.length) }, () => runWorker());
+      await Promise.all(workers);
+
+      if (jobIds.length === 0) {
+        setIsEvaluatingAll(false);
+        setEvalWarning('Не удалось отправить вопросы на оценку.');
+        return;
+      }
+
+      setTrackedEvalJobIds(jobIds);
+      setEvalProgressText(`Отправлено ${jobIds.length} вопросов. Ожидание выполнения...`);
+    } catch (e: any) {
       console.error('Failed to auto evaluate:', e);
       setIsEvaluatingAll(false);
+      setEvalWarning(e.message || 'Ошибка автооценки');
     }
   };
 
@@ -1285,6 +1381,13 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             )}
           </div>
 
+          {evalProgressText && (
+            <div className="p-3 bg-indigo-950/40 border border-indigo-800 text-indigo-200 text-xs rounded-lg flex items-center space-x-2">
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400 flex-shrink-0" />
+              <span>{evalProgressText}</span>
+            </div>
+          )}
+
           {evalWarning && (
             <div className="p-3 bg-amber-950/40 border border-amber-800 text-amber-200 text-xs rounded-lg">
               {evalWarning}
@@ -1564,6 +1667,80 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                         })}
                       </div>
                     )}
+
+                    {/* Asked Follow-up Questions for this Question */}
+                    {(() => {
+                      const qFollowups = askedFollowups.filter((f) => f.question_id === q.id);
+                      if (qFollowups.length === 0) return null;
+                      const hasGuide = qFollowups.some((f) => f.kind === 'guide');
+
+                      return (
+                        <div className="space-y-2 pt-2 border-t border-slate-800">
+                          {hasGuide && (
+                            <div className="p-2.5 bg-amber-950/40 border border-amber-700/60 rounded-lg flex items-center space-x-2 text-xs text-amber-200">
+                              <Compass className="w-4 h-4 text-amber-400 shrink-0" />
+                              <span>
+                                <strong>Использован наводящий вопрос</strong> — учтите оказанную кандидату помощь при итоговой оценке.
+                              </span>
+                            </div>
+                          )}
+
+                          <div className="flex items-center justify-between">
+                            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                              Заданные уточняющие и наводящие вопросы ({qFollowups.length}):
+                            </span>
+                          </div>
+
+                          <div className="space-y-1.5">
+                            {qFollowups.map((f) => (
+                              <div
+                                key={f.id}
+                                className={`p-2.5 rounded-lg border text-xs space-y-1 ${
+                                  f.kind === 'guide'
+                                    ? 'bg-amber-950/20 border-amber-800/50'
+                                    : 'bg-slate-950/70 border-slate-800'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between">
+                                  <span
+                                    className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                                      f.kind === 'guide'
+                                        ? 'bg-amber-950/80 text-amber-300 border border-amber-700/60'
+                                        : f.kind === 'deepen'
+                                        ? 'bg-purple-950/80 text-purple-300 border border-purple-700/60'
+                                        : 'bg-indigo-950/80 text-indigo-300 border border-indigo-700/60'
+                                    }`}
+                                  >
+                                    {f.kind === 'guide'
+                                      ? 'Наводящий вопрос'
+                                      : f.kind === 'deepen'
+                                      ? 'Углубление'
+                                      : 'Уточнение'}
+                                  </span>
+                                  <span className="text-[10px] text-slate-500 font-mono">
+                                    {new Date(f.updated_at || f.created_at).toLocaleTimeString([], {
+                                      hour: '2-digit',
+                                      minute: '2-digit',
+                                    })}
+                                  </span>
+                                </div>
+                                <p className="text-slate-200 font-medium leading-relaxed">
+                                  {f.asked_text || f.suggested_text}
+                                </p>
+                                {f.asked_text && f.asked_text !== f.suggested_text && (
+                                  <p className="text-[10px] text-slate-400 italic">
+                                    Исходная подсказка: «{f.suggested_text}»
+                                  </p>
+                                )}
+                                {f.rationale && (
+                                  <p className="text-[11px] text-slate-400">{f.rationale}</p>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
 
                     {/* Reviewer Note Input */}
                     {!isFinalized && (

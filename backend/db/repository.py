@@ -8,12 +8,15 @@ import contextlib
 import copy
 import hashlib
 import json
+import logging
 import shutil
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("nebula.repository")
 
 from backend.core.scoring import calculate_interview_score
 from backend.core.state_machine import InvalidStateTransitionError
@@ -440,6 +443,133 @@ class Repository:
                     now,
                 ),
             )
+
+    def save_turn_transcript_segment(
+        self,
+        segment_id: str,
+        interview_id: str,
+        track_id: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        text: str,
+        target_revision_id: str,
+        speaker_role: str | None = None,
+        is_final: bool = True,
+        owner_token: str | None = None,
+        job_id: str | None = None,
+        parent_segment_id: str | None = None,
+    ) -> bool:
+        """
+        Atomically validates job lease/owner, interview lifecycle, target revision,
+        and saves transcript segment without overwriting manual human edits or stale revisions.
+        Returns True if segment was inserted/preserved.
+        """
+        if speaker_role is None:
+            speaker_role = track_id if track_id in ("candidate", "interviewer") else "unknown"
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            inv = conn.execute(
+                "SELECT id, status, active_transcript_revision_id FROM interviews WHERE id = ?",
+                (interview_id,),
+            ).fetchone()
+            if not inv or inv["status"] == "deleted":
+                raise ValueError(f"Cannot save segment: interview {interview_id} does not exist or is deleted")
+            if inv["status"] == "finalized":
+                raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+            if job_id is not None:
+                j_row = conn.execute(
+                    "SELECT id, status, locked_by, locked_until FROM jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if not j_row:
+                    raise RepositoryConflictError(f"Cannot save segment: job {job_id} not found")
+                if j_row["status"] != "PROCESSING":
+                    raise RepositoryConflictError(
+                        f"Cannot save segment: job {job_id} is no longer PROCESSING (status: {j_row['status']})"
+                    )
+                if owner_token is not None and j_row["locked_by"] and j_row["locked_by"] != owner_token:
+                    raise RepositoryConflictError(f"Cannot save segment: job {job_id} owner token mismatch")
+                if j_row["locked_until"] and j_row["locked_until"] < now:
+                    raise RepositoryConflictError(f"Cannot save segment: job {job_id} lease expired")
+
+            active_rev = inv["active_transcript_revision_id"] or "trans-rev-1"
+
+            # Always record the segment into the target revision for complete audit / historical record
+            conn.execute(
+                """
+                INSERT INTO transcript_segments (
+                    id, interview_id, track_id, start_time_ms, end_time_ms, text, is_final, revision_id,
+                    speaker_role, parent_segment_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(interview_id, revision_id, id) DO UPDATE SET
+                    track_id = excluded.track_id,
+                    start_time_ms = excluded.start_time_ms,
+                    end_time_ms = excluded.end_time_ms,
+                    text = excluded.text,
+                    is_final = excluded.is_final,
+                    speaker_role = CASE
+                        WHEN transcript_segments.speaker_role IN ('candidate', 'interviewer') AND excluded.speaker_role = 'unknown'
+                        THEN transcript_segments.speaker_role
+                        ELSE excluded.speaker_role
+                    END,
+                    parent_segment_id = excluded.parent_segment_id
+                """,
+                (
+                    segment_id,
+                    interview_id,
+                    track_id,
+                    start_time_ms,
+                    end_time_ms,
+                    text,
+                    1 if is_final else 0,
+                    target_revision_id,
+                    speaker_role,
+                    parent_segment_id,
+                    now,
+                ),
+            )
+
+            # If the target revision is still active, we're done
+            if target_revision_id == active_rev:
+                return True
+
+            # If target revision is stale (user created a new revision during live capture):
+            # Check if active revision already has segments covering this time window on this track.
+            # We must NOT overwrite manual edits or retranscriptions in active_rev!
+            overlapping = conn.execute(
+                """
+                SELECT id, speaker_role, text FROM transcript_segments
+                WHERE interview_id = ? AND revision_id = ? AND track_id = ?
+                  AND ((start_time_ms <= ? AND end_time_ms > ?) OR (start_time_ms < ? AND end_time_ms >= ?))
+                """,
+                (interview_id, active_rev, track_id, start_time_ms, start_time_ms, end_time_ms, end_time_ms),
+            ).fetchall()
+
+            if not overlapping:
+                # Safe to forward live segment into active revision without losing new speech
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO transcript_segments (
+                        id, interview_id, track_id, start_time_ms, end_time_ms, text, is_final, revision_id,
+                        speaker_role, parent_segment_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        segment_id,
+                        interview_id,
+                        track_id,
+                        start_time_ms,
+                        end_time_ms,
+                        text,
+                        1 if is_final else 0,
+                        active_rev,
+                        speaker_role,
+                        parent_segment_id,
+                        now,
+                    ),
+                )
+            return True
 
     def update_segment_speaker_role(
         self,
@@ -1770,6 +1900,31 @@ class Repository:
                     "reviewer_notes": ha.get("reviewer_notes"),
                 }
 
+            fu_rows = conn.execute(
+                """
+                SELECT id, question_id, kind, question_text, purpose, asked_text,
+                       rubric_revision_id, transcript_revision_id, decided_at
+                FROM followup_suggestions
+                WHERE interview_id = ? AND status = 'asked'
+                ORDER BY decided_at ASC, created_at ASC
+                """,
+                (interview_id,),
+            ).fetchall()
+            asked_followups = [
+                {
+                    "id": r["id"],
+                    "question_id": r["question_id"],
+                    "kind": r["kind"],
+                    "question_text": r["question_text"],
+                    "purpose": r["purpose"],
+                    "asked_text": r["asked_text"] or r["question_text"],
+                    "rubric_revision_id": r["rubric_revision_id"],
+                    "transcript_revision_id": r["transcript_revision_id"],
+                    "decided_at": r["decided_at"],
+                }
+                for r in fu_rows
+            ]
+
             snapshot_dict = {
                 "interview_id": interview_id,
                 "revision_number": rev_num,
@@ -1810,6 +1965,7 @@ class Repository:
                     "confirmed_at": now,
                 },
                 "audio_limitations": audio_limitations or [],
+                "followup_questions": asked_followups,
             }
             canonical_json = json.dumps(snapshot_dict, sort_keys=True, ensure_ascii=False)
             sha256_checksum = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
@@ -1961,7 +2117,12 @@ class Repository:
                 (job_id, job_type, interview_id, json.dumps(payload, ensure_ascii=False), max_attempts, now, now),
             )
 
-    def claim_next_job(self, lock_duration_sec: int = 60) -> dict[str, Any] | None:
+    def claim_next_job(
+        self,
+        lock_duration_sec: int = 60,
+        include_types: list[str] | tuple[str, ...] | None = None,
+        exclude_types: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any] | None:
         """Atomically leases next available pending or expired job with owner token."""
         now = utc_now_iso()
         owner_token = f"worker-{uuid.uuid4().hex}"
@@ -1982,19 +2143,32 @@ class Repository:
 
             # 2. Find eligible job: PENDING (whose retry backoff locked_until has passed)
             # or expired PROCESSING (where attempts < max_attempts)
-            row = conn.execute(
-                """
+            where_clauses = [
+                "(((j.status = 'PENDING' AND (j.locked_until IS NULL OR j.locked_until <= ?)) "
+                "OR (j.status = 'PROCESSING' AND j.locked_until < ? AND j.attempts < j.max_attempts)))"
+            ]
+            params: list[Any] = [now, now]
+
+            if include_types:
+                placeholders = ",".join("?" for _ in include_types)
+                where_clauses.append(f"j.type IN ({placeholders})")
+                params.extend(include_types)
+            elif exclude_types:
+                placeholders = ",".join("?" for _ in exclude_types)
+                where_clauses.append(f"j.type NOT IN ({placeholders})")
+                params.extend(exclude_types)
+
+            where_sql = " AND ".join(where_clauses)
+            query = f"""
                 SELECT j.* FROM jobs j
                 LEFT JOIN interviews i ON j.interview_id = i.id
-                WHERE (j.status = 'PENDING' AND (j.locked_until IS NULL OR j.locked_until <= ?))
-                   OR (j.status = 'PROCESSING' AND j.locked_until < ? AND j.attempts < j.max_attempts)
+                WHERE {where_sql}
                 ORDER BY
                     CASE WHEN i.status = 'recording' THEN 0 ELSE 1 END ASC,
                     j.created_at ASC
                 LIMIT 1
-                """,
-                (now, now),
-            ).fetchone()
+            """
+            row = conn.execute(query, params).fetchone()
             if not row:
                 return None
 
@@ -2009,13 +2183,14 @@ class Repository:
                     attempts = attempts + 1,
                     locked_until = ?,
                     locked_by = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    started_at = ?
                 WHERE id = ? AND (
                     (status = 'PENDING' AND (locked_until IS NULL OR locked_until <= ?))
                     OR (status = 'PROCESSING' AND locked_until < ? AND attempts < max_attempts)
                 )
                 """,
-                (lock_until_str, owner_token, now, job["id"], now, now),
+                (lock_until_str, owner_token, now, now, job["id"], now, now),
             )
             if cursor.rowcount == 0:
                 # Concurrent race condition: another worker claimed it in between
@@ -2024,6 +2199,7 @@ class Repository:
             job["payload"] = json.loads(job["payload_json"])
             job["attempts"] += 1
             job["locked_by"] = owner_token
+            job["started_at"] = now
             return job
 
     def claim_adjacent_transcribe_jobs(
@@ -2084,15 +2260,17 @@ class Repository:
                         attempts = attempts + 1,
                         locked_until = ?,
                         locked_by = ?,
-                        updated_at = ?
+                        updated_at = ?,
+                        started_at = ?
                     WHERE id = ? AND status = 'PENDING'
                     """,
-                    (lock_until_str, owner_token, now, j["id"]),
+                    (lock_until_str, owner_token, now, now, j["id"]),
                 )
                 if cursor.rowcount > 0:
                     j["payload"] = p
                     j["attempts"] += 1
                     j["locked_by"] = owner_token
+                    j["started_at"] = now
                     results.append(j)
                     current_end_ms = chunk_end
         return results
@@ -2145,17 +2323,17 @@ class Repository:
                 cursor = conn.execute(
                     """
                     UPDATE jobs
-                    SET status = 'COMPLETED', updated_at = ?, locked_until = NULL, locked_by = NULL
+                    SET status = 'COMPLETED', updated_at = ?, completed_at = ?, locked_until = NULL, locked_by = NULL
                     WHERE id = ? AND status = 'PROCESSING' AND (locked_by = ? OR locked_by IS NULL)
                     """,
-                    (now, job_id, owner_token),
+                    (now, now, job_id, owner_token),
                 )
                 if cursor.rowcount == 0:
                     raise RepositoryConflictError(f"Cannot complete job {job_id}: lease expired or owner token mismatch")
             else:
                 cursor = conn.execute(
-                    "UPDATE jobs SET status = 'COMPLETED', updated_at = ?, locked_until = NULL, locked_by = NULL WHERE id = ?",
-                    (now, job_id),
+                    "UPDATE jobs SET status = 'COMPLETED', updated_at = ?, completed_at = ?, locked_until = NULL, locked_by = NULL WHERE id = ?",
+                    (now, now, job_id),
                 )
                 if cursor.rowcount == 0:
                     raise RepositoryConflictError(f"Cannot complete job {job_id}: job not found")
@@ -2166,18 +2344,30 @@ class Repository:
         error_message: str,
         owner_token: str | None = None,
         retry_delay_sec: int = 0,
+        is_terminal: bool = False,
     ) -> None:
         """Marks job as FAILED or PENDING retry with durable delay, verifying owner token if supplied."""
         now = utc_now_iso()
         with self.db.transaction() as conn:
             row = conn.execute("SELECT attempts, max_attempts, status, locked_by FROM jobs WHERE id = ?", (job_id,)).fetchone()
-            if row and owner_token is not None and row["locked_by"] and row["locked_by"] != owner_token:
-                raise RepositoryConflictError(f"Cannot fail job {job_id}: owner token mismatch")
-            if row and row["attempts"] >= row["max_attempts"]:
+            if not row:
+                raise RepositoryConflictError(f"Cannot fail job {job_id}: job not found")
+
+            if owner_token is not None:
+                if row["status"] != "PROCESSING" or row["locked_by"] != owner_token:
+                    raise RepositoryConflictError(
+                        f"Cannot fail job {job_id}: status is {row['status']} or owner token mismatch"
+                    )
+            elif row["status"] in ("COMPLETED", "FAILED"):
+                raise RepositoryConflictError(f"Cannot fail job {job_id}: job is already terminal ({row['status']})")
+
+            if is_terminal or (row["attempts"] >= row["max_attempts"]):
                 status = "FAILED"
                 retry_until_str = None
+                completed_at_str = now
             else:
                 status = "PENDING"  # Re-enqueue for retry with backoff delay
+                completed_at_str = None
                 if retry_delay_sec > 0:
                     retry_until_dt = datetime.fromtimestamp(datetime.now(UTC).timestamp() + retry_delay_sec, tz=UTC)
                     retry_until_str = retry_until_dt.isoformat()
@@ -2186,28 +2376,177 @@ class Repository:
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, error_message = ?, locked_until = ?, locked_by = NULL, updated_at = ?
+                SET status = ?, error_message = ?, locked_until = ?, locked_by = NULL, updated_at = ?, completed_at = ?
                 WHERE id = ?
                 """,
-                (status, error_message, retry_until_str, now, job_id),
+                (status, error_message, retry_until_str, now, completed_at_str, job_id),
             )
 
-    def get_interview_jobs_status(self, interview_id: str) -> dict[str, Any]:
-        """Returns job counts and status summary for an interview."""
+    def find_active_evaluate_job(
+        self,
+        interview_id: str,
+        question_id: str,
+        candidate_fingerprint: str | None = None,
+        rubric_revision_id: str | None = None,
+        transcript_revision_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Finds an active (PENDING or PROCESSING) EVALUATE_QUESTION job matching the given
+        interview, question, revisions, and candidate speech fingerprint."""
         with self.db.transaction() as conn:
             rows = conn.execute(
-                "SELECT status, COUNT(*) as cnt FROM jobs WHERE interview_id = ? GROUP BY status",
+                """
+                SELECT id, type, status, attempts, max_attempts, payload_json, error_message,
+                       locked_until, created_at, started_at
+                FROM jobs
+                WHERE interview_id = ? AND type = 'EVALUATE_QUESTION' AND status IN ('PENDING', 'PROCESSING')
+                ORDER BY created_at DESC
+                """,
                 (interview_id,),
             ).fetchall()
-            status_counts = {r["status"]: r["cnt"] for r in rows}
+
+            for r in rows:
+                p: dict[str, Any] = {}
+                if r["payload_json"]:
+                    with contextlib.suppress(Exception):
+                        p = json.loads(r["payload_json"])
+
+                if p.get("question_id") != question_id:
+                    continue
+                if rubric_revision_id is not None and p.get("rubric_revision_id") != rubric_revision_id:
+                    continue
+                if transcript_revision_id is not None and p.get("transcript_revision_id") != transcript_revision_id:
+                    continue
+                if p.get("candidate_fingerprint") == candidate_fingerprint:
+                    j = dict(r)
+                    j["payload"] = p
+                    return j
+        return None
+
+    def get_interview_jobs_status(
+        self,
+        interview_id: str,
+        job_ids: list[str] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Returns job counts, telemetry metrics and active/requested job details for an interview."""
+        now_dt = datetime.now(UTC)
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT type, status, COUNT(*) as cnt FROM jobs WHERE interview_id = ? GROUP BY type, status",
+                (interview_id,),
+            ).fetchall()
+            status_counts: dict[str, int] = {}
+            counts_by_type: dict[str, dict[str, int]] = {}
+            for r in rows:
+                j_type = r["type"]
+                j_stat = r["status"]
+                cnt = r["cnt"]
+                status_counts[j_stat] = status_counts.get(j_stat, 0) + cnt
+                if j_type not in counts_by_type:
+                    counts_by_type[j_type] = {}
+                counts_by_type[j_type][j_stat] = cnt
+
             pending_or_processing = (
                 status_counts.get("PENDING", 0) + status_counts.get("PROCESSING", 0)
             )
+
+            # Calculate oldest pending job age
+            oldest_row = conn.execute(
+                "SELECT created_at FROM jobs WHERE interview_id = ? AND status = 'PENDING' ORDER BY created_at ASC LIMIT 1",
+                (interview_id,),
+            ).fetchone()
+            oldest_pending_age_sec: float | None = None
+            if oldest_row and oldest_row["created_at"]:
+                with contextlib.suppress(Exception):
+                    c_dt = datetime.fromisoformat(oldest_row["created_at"])
+                    oldest_pending_age_sec = max(0.0, round((now_dt - c_dt).total_seconds(), 2))
+
+            # Fetch active or requested jobs
+            if job_ids is not None:
+                if not job_ids:
+                    job_rows = []
+                else:
+                    placeholders = ",".join("?" for _ in job_ids)
+                    job_rows = conn.execute(
+                        f"""
+                        SELECT id, type, status, attempts, max_attempts, payload_json, error_message,
+                               locked_until, created_at, started_at, completed_at
+                        FROM jobs
+                        WHERE interview_id = ? AND id IN ({placeholders})
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                        """,
+                        (interview_id, *job_ids, limit),
+                    ).fetchall()
+            else:
+                job_rows = conn.execute(
+                    """
+                    SELECT id, type, status, attempts, max_attempts, payload_json, error_message,
+                           locked_until, created_at, started_at, completed_at
+                    FROM jobs
+                    WHERE interview_id = ? AND status IN ('PENDING', 'PROCESSING')
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (interview_id, limit),
+                ).fetchall()
+
+            active_jobs: list[dict[str, Any]] = []
+            for r in job_rows:
+                payload = {}
+                if r["payload_json"]:
+                    with contextlib.suppress(Exception):
+                        payload = json.loads(r["payload_json"])
+
+                q_id = payload.get("question_id")
+                rubric_rev = payload.get("rubric_revision_id")
+                transcript_rev = payload.get("transcript_revision_id")
+
+                created_at_str = r["created_at"]
+                started_at_str = r["started_at"]
+                completed_at_str = r["completed_at"]
+
+                queue_wait_sec: float | None = None
+                if created_at_str:
+                    with contextlib.suppress(Exception):
+                        c_dt = datetime.fromisoformat(created_at_str)
+                        ref_dt = datetime.fromisoformat(started_at_str) if started_at_str else now_dt
+                        queue_wait_sec = max(0.0, round((ref_dt - c_dt).total_seconds(), 2))
+
+                elapsed_sec: float | None = None
+                if started_at_str:
+                    with contextlib.suppress(Exception):
+                        s_dt = datetime.fromisoformat(started_at_str)
+                        end_dt = datetime.fromisoformat(completed_at_str) if completed_at_str else now_dt
+                        elapsed_sec = max(0.0, round((end_dt - s_dt).total_seconds(), 2))
+
+                active_jobs.append({
+                    "id": r["id"],
+                    "job_id": r["id"],
+                    "type": r["type"],
+                    "status": r["status"],
+                    "attempts": r["attempts"],
+                    "max_attempts": r["max_attempts"],
+                    "created_at": created_at_str,
+                    "started_at": started_at_str,
+                    "completed_at": completed_at_str,
+                    "locked_until": r["locked_until"],
+                    "error_message": r["error_message"],
+                    "question_id": q_id,
+                    "rubric_revision_id": rubric_rev,
+                    "transcript_revision_id": transcript_rev,
+                    "queue_wait_sec": queue_wait_sec,
+                    "elapsed_sec": elapsed_sec,
+                })
+
             return {
                 "interview_id": interview_id,
                 "counts": status_counts,
+                "counts_by_type": counts_by_type,
                 "pending_or_processing": pending_or_processing,
                 "is_pipeline_idle": pending_or_processing == 0,
+                "oldest_pending_age_sec": oldest_pending_age_sec,
+                "active_jobs": active_jobs,
             }
 
     # -------------------------------------------------------------
@@ -2575,9 +2914,12 @@ class Repository:
         next_sample_offset: int,
         turns: list[AssembledTurn],
         base_time: datetime | None = None,
+        expected_sequence: int | None = None,
+        expected_sample_offset: int | None = None,
     ) -> list[str]:
         """
-        Atomically commits updated assembly cursor and enqueues idempotent TRANSCRIBE_TURN jobs.
+        Atomically commits updated assembly cursor and enqueues idempotent TRANSCRIBE_TURN jobs
+        using CAS on expected cursor and strictly preventing cursor regression.
         """
         now = utc_now_iso()
         created_job_ids: list[str] = []
@@ -2589,7 +2931,43 @@ class Repository:
             if inv["status"] in ("finalized", "deleted"):
                 return []
 
-            # 1. Update or insert cursor state
+            # 1. CAS & anti-regression check
+            curr_row = conn.execute(
+                """
+                SELECT next_sequence, next_sample_offset FROM transcript_assembly_state
+                WHERE interview_id = ? AND track_id = ? AND capture_epoch = ?
+                """,
+                (interview_id, track_id, capture_epoch),
+            ).fetchone()
+
+            if curr_row is not None:
+                curr_seq = curr_row["next_sequence"]
+                curr_off = curr_row["next_sample_offset"]
+
+                # If caller specified expected cursor, enforce strict CAS match
+                if (
+                    expected_sequence is not None
+                    and expected_sample_offset is not None
+                    and (curr_seq != expected_sequence or curr_off != expected_sample_offset)
+                ):
+                    logger.warning(
+                        "CAS mismatch in commit_turn_assembly_results for %s track %s epoch %d: "
+                        "expected (%d, %d), found (%d, %d). Rejecting concurrent commit.",
+                        interview_id, track_id, capture_epoch,
+                        expected_sequence, expected_sample_offset, curr_seq, curr_off,
+                    )
+                    return []
+
+                # Prevent cursor from moving backwards in all cases
+                if (next_sequence < curr_seq) or (next_sequence == curr_seq and next_sample_offset < curr_off):
+                    logger.warning(
+                        "Cursor regression rejected for %s track %s epoch %d: "
+                        "current (%d, %d), attempted (%d, %d)",
+                        interview_id, track_id, capture_epoch, curr_seq, curr_off, next_sequence, next_sample_offset,
+                    )
+                    return []
+
+            # 2. Update or insert cursor state
             conn.execute(
                 """
                 INSERT INTO transcript_assembly_state (
@@ -2604,7 +2982,7 @@ class Repository:
                 (interview_id, track_id, capture_epoch, next_sequence, next_sample_offset, now),
             )
 
-            # 2. Insert TRANSCRIBE_TURN jobs idempotently sorted chronologically
+            # 3. Insert TRANSCRIBE_TURN jobs idempotently sorted chronologically
             turns_sorted = sorted(turns, key=lambda t: (t.start_ms, t.first_sequence))
             now_dt = base_time or datetime.now(UTC)
             for idx, turn in enumerate(turns_sorted):
@@ -2785,6 +3163,8 @@ class Repository:
                     next_sample_offset=out.next_sample_offset,
                     turns=out.turns,
                     base_time=base_time + timedelta(milliseconds=track_idx * 100),
+                    expected_sequence=cursor_seq,
+                    expected_sample_offset=cursor_off,
                 )
                 created_jobs.extend(new_jobs)
 
@@ -2978,5 +3358,617 @@ class Repository:
             template_id=target_template_id,
             questions=target_questions,
         )
+
+    # -------------------------------------------------------------
+    # Adaptive Follow-up and Guiding Questions
+    # -------------------------------------------------------------
+
+    def create_followup_request_and_job(
+        self,
+        interview_id: str,
+        question_id: str,
+        mode: str,
+        trigger: str,
+        candidate_fingerprint: str | None,
+        context_hash: str,
+        context_json: str,
+        rubric_revision_id: str,
+        transcript_revision_id: str,
+        cooldown_sec: int = 30,
+    ) -> tuple[dict[str, Any] | None, bool, str | None, float | None]:
+        """
+        Atomically creates followup_requests record and enqueues GENERATE_FOLLOWUPS job.
+        Returns: (request_dict, is_new, wait_reason, cooldown_remaining_sec)
+        """
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            inv_row = conn.execute("SELECT status FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+            if not inv_row:
+                raise KeyError(f"Interview {interview_id} not found")
+
+            inv_status = str(inv_row["status"]).lower()
+            if inv_status in ("processing", "review", "finalized", "deleted"):
+                raise RepositoryConflictError(f"Cannot generate followups in interview status '{inv_status}'")
+
+            if trigger == "auto" and inv_status != "recording":
+                return None, False, "not_recording", None
+
+            if trigger == "manual" and inv_status not in ("recording", "paused"):
+                raise RepositoryConflictError(f"Cannot generate followups in interview status '{inv_status}'")
+
+            # Check if identical request exists
+            existing_req = conn.execute(
+                """
+                SELECT * FROM followup_requests
+                WHERE interview_id = ? AND question_id = ? AND mode = ? AND context_hash = ?
+                """,
+                (interview_id, question_id, mode, context_hash),
+            ).fetchone()
+            if existing_req:
+                req_dict = dict(existing_req)
+                return req_dict, False, None, None
+
+            # Check if an active follow-up job is already in flight for this interview
+            in_flight = conn.execute(
+                """
+                SELECT j.id, fr.id as req_id, fr.question_id, fr.mode
+                FROM jobs j
+                JOIN followup_requests fr ON j.id = fr.job_id
+                WHERE j.interview_id = ? AND j.type = 'GENERATE_FOLLOWUPS'
+                  AND j.status IN ('PENDING', 'PROCESSING')
+                LIMIT 1
+                """,
+                (interview_id,),
+            ).fetchone()
+            if in_flight:
+                active_req = conn.execute(
+                    "SELECT * FROM followup_requests WHERE id = ?", (in_flight["req_id"],)
+                ).fetchone()
+                return dict(active_req) if active_req else None, False, "generating", None
+
+            # Check auto cooldown
+            if trigger == "auto":
+                last_auto = conn.execute(
+                    """
+                    SELECT created_at FROM followup_requests
+                    WHERE interview_id = ? AND trigger = 'auto'
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (interview_id,),
+                ).fetchone()
+                if last_auto:
+                    try:
+                        last_dt = datetime.fromisoformat(last_auto["created_at"])
+                        cur_dt = datetime.now(UTC)
+                        elapsed = (cur_dt - last_dt).total_seconds()
+                        if elapsed < cooldown_sec:
+                            return None, False, "cooldown_active", round(cooldown_sec - elapsed, 1)
+                    except Exception as e:
+                        logger.debug("Failed to calculate cooldown diff: %s", e)
+
+            # Insert new request and job (jobs first to satisfy FOREIGN KEY constraint)
+            request_id = f"freq-{uuid.uuid4().hex[:12]}"
+            job_id = f"job-fu-{uuid.uuid4().hex[:12]}"
+
+            job_payload = {
+                "request_id": request_id,
+                "interview_id": interview_id,
+                "question_id": question_id,
+                "mode": mode,
+                "context_hash": context_hash,
+            }
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    id, type, interview_id, payload_json, status, attempts, max_attempts, created_at, updated_at
+                ) VALUES (?, 'GENERATE_FOLLOWUPS', ?, ?, 'PENDING', 0, 2, ?, ?)
+                """,
+                (job_id, interview_id, json.dumps(job_payload, ensure_ascii=False), now, now),
+            )
+
+            conn.execute(
+                """
+                INSERT INTO followup_requests (
+                    id, interview_id, question_id, rubric_revision_id, transcript_revision_id,
+                    mode, trigger, candidate_fingerprint, context_hash, context_json,
+                    job_id, outcome, prompt_version, schema_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'v1', 'v1', ?)
+                """,
+                (
+                    request_id,
+                    interview_id,
+                    question_id,
+                    rubric_revision_id,
+                    transcript_revision_id,
+                    mode,
+                    trigger,
+                    candidate_fingerprint,
+                    context_hash,
+                    context_json,
+                    job_id,
+                    now,
+                ),
+            )
+
+            new_req = conn.execute(
+                "SELECT * FROM followup_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+            return dict(new_req), True, None, None
+
+    def get_followup_state(
+        self,
+        interview_id: str,
+        question_id: str,
+        mode: str = "probe",
+    ) -> dict[str, Any]:
+        """
+        Reads follow-up state for a question: latest request, suggestions, staleness, and history.
+        """
+        with self.db.transaction() as conn:
+            inv = conn.execute(
+                "SELECT status, active_rubric_revision_id, active_transcript_revision_id FROM interviews WHERE id = ?",
+                (interview_id,),
+            ).fetchone()
+            if not inv:
+                raise KeyError(f"Interview {interview_id} not found")
+
+            active_rubric = inv["active_rubric_revision_id"] or "rub-rev-1"
+            active_trans = inv["active_transcript_revision_id"] or "trans-rev-1"
+            inv_status = str(inv["status"]).lower()
+
+            # Latest request for this question and mode
+            req_row = conn.execute(
+                """
+                SELECT * FROM followup_requests
+                WHERE interview_id = ? AND question_id = ? AND mode = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (interview_id, question_id, mode),
+            ).fetchone()
+
+            latest_req: dict[str, Any] | None = dict(req_row) if req_row else None
+            suggestions: list[dict[str, Any]] = []
+            has_new_answer = False
+
+            if latest_req:
+                # Add job info
+                if latest_req.get("job_id"):
+                    job_row = conn.execute(
+                        "SELECT status, attempts, max_attempts, error_message FROM jobs WHERE id = ?",
+                        (latest_req["job_id"],),
+                    ).fetchone()
+                    if job_row:
+                        latest_req["job"] = dict(job_row)
+
+                # Fetch suggestions
+                sug_rows = conn.execute(
+                    """
+                    SELECT * FROM followup_suggestions
+                    WHERE request_id = ?
+                    ORDER BY ordinal ASC
+                    """,
+                    (latest_req["id"],),
+                ).fetchall()
+
+                # Check staleness
+                is_stale = False
+                stale_reason = None
+                if latest_req["rubric_revision_id"] != active_rubric:
+                    is_stale = True
+                    stale_reason = "План интервью был обновлён"
+                elif latest_req["transcript_revision_id"] != active_trans:
+                    is_stale = True
+                    stale_reason = "Стенограмма перетранскрибирована"
+
+                for sr in sug_rows:
+                    s_dict = dict(sr)
+                    s_dict["criterion_ids"] = json.loads(s_dict.get("criterion_ids_json") or "[]")
+                    s_dict["source_refs"] = json.loads(s_dict.get("source_refs_json") or "[]")
+
+                    # Check segment content integrity for staleness if revisions matched
+                    item_stale = is_stale
+                    item_stale_reason = stale_reason
+                    if not item_stale:
+                        for ref in s_dict["source_refs"]:
+                            seg_id = ref.get("segment_id")
+                            seg_row = conn.execute(
+                                """
+                                SELECT text, speaker_role, track_id FROM transcript_segments
+                                WHERE interview_id = ? AND revision_id = ? AND id = ?
+                                """,
+                                (interview_id, active_trans, seg_id),
+                            ).fetchone()
+                            if not seg_row:
+                                item_stale = True
+                                item_stale_reason = "Исходная реплика удалена"
+                                break
+                            # Check role
+                            role = (seg_row["speaker_role"] or "unknown").lower()
+                            track = str(seg_row["track_id"]).lower()
+                            is_cand = (role != "interviewer") if track == "candidate" else (role == "candidate")
+                            if not is_cand:
+                                item_stale = True
+                                item_stale_reason = "Роль спикера была изменена"
+                                break
+
+                    s_dict["is_stale"] = item_stale
+                    s_dict["stale_reason"] = item_stale_reason
+
+                    # Check if there are new candidate segments after the snapshot
+                    s_dict["has_new_answer"] = False
+                    suggestions.append(s_dict)
+
+                # Check has_new_answer globally for this question
+                new_segs = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM transcript_segments
+                    WHERE interview_id = ? AND revision_id = ? AND is_final = 1 AND created_at > ?
+                    """,
+                    (interview_id, active_trans, latest_req["created_at"]),
+                ).fetchone()[0]
+                if new_segs > 0:
+                    has_new_answer = True
+                    for s in suggestions:
+                        s["has_new_answer"] = True
+
+            # Fetch history of asked/dismissed suggestions across all requests for this question
+            history_rows = conn.execute(
+                """
+                SELECT * FROM followup_suggestions
+                WHERE interview_id = ? AND question_id = ? AND status IN ('asked', 'dismissed')
+                ORDER BY decided_at ASC, created_at ASC
+                """,
+                (interview_id, question_id),
+            ).fetchall()
+            history: list[dict[str, Any]] = []
+            for hr in history_rows:
+                h_dict = dict(hr)
+                h_dict["criterion_ids"] = json.loads(h_dict.get("criterion_ids_json") or "[]")
+                h_dict["source_refs"] = json.loads(h_dict.get("source_refs_json") or "[]")
+                history.append(h_dict)
+
+            # Check cooldown
+            cooldown_remaining: float | None = None
+            last_auto = conn.execute(
+                """
+                SELECT created_at FROM followup_requests
+                WHERE interview_id = ? AND trigger = 'auto'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (interview_id,),
+            ).fetchone()
+            if last_auto:
+                try:
+                    last_dt = datetime.fromisoformat(last_auto["created_at"])
+                    elapsed = (datetime.now(UTC) - last_dt).total_seconds()
+                    if elapsed < 30:
+                        cooldown_remaining = round(30 - elapsed, 1)
+                except Exception:
+                    pass
+
+            # Check in-flight job
+            is_generating = False
+            in_flight = conn.execute(
+                """
+                SELECT id FROM jobs
+                WHERE interview_id = ? AND type = 'GENERATE_FOLLOWUPS'
+                  AND status IN ('PENDING', 'PROCESSING')
+                LIMIT 1
+                """,
+                (interview_id,),
+            ).fetchone()
+            if in_flight:
+                is_generating = True
+
+            can_generate = (
+                inv_status in ("recording", "paused")
+                and not is_generating
+            )
+
+            wait_reason = None
+            if is_generating:
+                wait_reason = "generating"
+            elif cooldown_remaining is not None and cooldown_remaining > 0:
+                wait_reason = "cooldown_active"
+
+            return {
+                "interview_id": interview_id,
+                "question_id": question_id,
+                "mode": mode,
+                "active_rubric_revision_id": active_rubric,
+                "active_transcript_revision_id": active_trans,
+                "candidate_fingerprint": latest_req.get("candidate_fingerprint") if latest_req else None,
+                "context_hash": latest_req.get("context_hash") if latest_req else None,
+                "can_generate": can_generate,
+                "wait_reason": wait_reason,
+                "cooldown_remaining_sec": cooldown_remaining,
+                "latest_request": latest_req,
+                "suggestions": suggestions,
+                "has_new_answer": has_new_answer,
+                "history": history,
+            }
+
+    def save_followup_suggestions(
+        self,
+        job_id: str,
+        request_id: str,
+        owner_token: str,
+        suggestions: list[dict[str, Any]],
+        outcome: str,
+        model_profile_id: str | None = None,
+        provider_id: str | None = None,
+        usage_tokens: int | None = None,
+        latency_ms: int | None = None,
+    ) -> None:
+        """
+        Atomically saves validated suggestions and updates request outcome, guarded by owner_token.
+        """
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            job_row = conn.execute(
+                "SELECT locked_by, interview_id FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if not job_row or job_row["locked_by"] != owner_token:
+                raise RepositoryConflictError(f"Job {job_id} lease expired or owner token mismatch")
+
+            req_row = conn.execute(
+                "SELECT * FROM followup_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+            if not req_row:
+                raise KeyError(f"Followup request {request_id} not found")
+
+            interview_id = req_row["interview_id"]
+            question_id = req_row["question_id"]
+            rubric_rev = req_row["rubric_revision_id"]
+            trans_rev = req_row["transcript_revision_id"]
+
+            # Save suggestions with stable IDs
+            for idx, sug in enumerate(suggestions):
+                sug_id = f"{request_id}-{idx}"
+                existing_sug = conn.execute(
+                    "SELECT status, asked_text, decided_at, decision_version FROM followup_suggestions WHERE id = ?",
+                    (sug_id,),
+                ).fetchone()
+
+                crit_json = json.dumps(sug.get("criterion_ids") or [], ensure_ascii=False)
+                source_json = json.dumps(
+                    [
+                        ref.model_dump() if hasattr(ref, "model_dump") else ref
+                        for ref in (sug.get("source_refs") or [])
+                    ],
+                    ensure_ascii=False,
+                )
+
+                if existing_sug:
+                    # Preserve human decisions
+                    conn.execute(
+                        """
+                        UPDATE followup_suggestions
+                        SET kind = ?, question_text = ?, purpose = ?, criterion_ids_json = ?, source_refs_json = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            sug["kind"],
+                            sug["question_text"].strip(),
+                            sug["purpose"].strip(),
+                            crit_json,
+                            source_json,
+                            sug_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO followup_suggestions (
+                            id, request_id, interview_id, question_id, rubric_revision_id, transcript_revision_id,
+                            kind, question_text, purpose, criterion_ids_json, source_refs_json,
+                            status, ordinal, decision_version, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', ?, 1, ?)
+                        """,
+                        (
+                            sug_id,
+                            request_id,
+                            interview_id,
+                            question_id,
+                            rubric_rev,
+                            trans_rev,
+                            sug["kind"],
+                            sug["question_text"].strip(),
+                            sug["purpose"].strip(),
+                            crit_json,
+                            source_json,
+                            idx,
+                            now,
+                        ),
+                    )
+
+            conn.execute(
+                """
+                UPDATE followup_requests
+                SET outcome = ?, model_profile_id = ?, provider_id = ?, usage_tokens = ?, latency_ms = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (outcome, model_profile_id, provider_id, usage_tokens, latency_ms, now, request_id),
+            )
+
+    def update_suggestion_decision(
+        self,
+        interview_id: str,
+        suggestion_id: str,
+        status: str,
+        asked_text: str | None,
+        expected_decision_version: int,
+        expected_rubric_revision_id: str | None = None,
+        expected_transcript_revision_id: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Updates interviewer decision ('suggested' | 'asked' | 'dismissed') on a card with OCC.
+        """
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            inv = conn.execute(
+                "SELECT status, active_rubric_revision_id, active_transcript_revision_id FROM interviews WHERE id = ?",
+                (interview_id,),
+            ).fetchone()
+            if not inv:
+                raise KeyError(f"Interview {interview_id} not found")
+
+            if str(inv["status"]).lower() == "finalized":
+                raise RepositoryConflictError("Interview is finalized and immutable")
+
+            sug_row = conn.execute(
+                "SELECT * FROM followup_suggestions WHERE id = ? AND interview_id = ?",
+                (suggestion_id, interview_id),
+            ).fetchone()
+            if not sug_row:
+                raise KeyError(f"Suggestion {suggestion_id} not found")
+
+            # Check expected revisions if provided
+            if expected_rubric_revision_id and inv["active_rubric_revision_id"] != expected_rubric_revision_id:
+                raise RepositoryConflictError("Active rubric revision does not match expected revision")
+            if expected_transcript_revision_id and inv["active_transcript_revision_id"] != expected_transcript_revision_id:
+                raise RepositoryConflictError("Active transcript revision does not match expected revision")
+
+            # Check OCC version
+            current_version = sug_row["decision_version"]
+            current_status = sug_row["status"]
+            current_asked_text = sug_row["asked_text"] or ""
+            target_asked_text = (asked_text or "").strip()
+
+            if current_version != expected_decision_version:
+                # Check idempotency
+                if current_status == status and current_asked_text == target_asked_text:
+                    res = dict(sug_row)
+                    res["criterion_ids"] = json.loads(res.get("criterion_ids_json") or "[]")
+                    res["source_refs"] = json.loads(res.get("source_refs_json") or "[]")
+                    return res
+                raise RepositoryConflictError(
+                    f"Decision version mismatch for suggestion {suggestion_id}: expected {expected_decision_version}, got {current_version}"
+                )
+
+            # Do not permit marking stale suggestion as asked
+            if status == "asked" and (
+                sug_row["rubric_revision_id"] != inv["active_rubric_revision_id"]
+                or sug_row["transcript_revision_id"] != inv["active_transcript_revision_id"]
+            ):
+                raise RepositoryConflictError("Cannot mark stale suggestion as asked")
+
+            new_version = current_version + 1
+            final_asked = target_asked_text if target_asked_text else None
+            decided_at = now if status in ("asked", "dismissed") else None
+
+            conn.execute(
+                """
+                UPDATE followup_suggestions
+                SET status = ?, asked_text = ?, decided_at = ?, decision_version = ?
+                WHERE id = ? AND decision_version = ?
+                """,
+                (status, final_asked, decided_at, new_version, suggestion_id, current_version),
+            )
+
+            # Record audit event
+            event_id = f"audit-{uuid.uuid4().hex[:8]}"
+            conn.execute(
+                """
+                INSERT INTO audit_events (id, interview_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'FOLLOWUP_DECISION_UPDATED', ?, ?)
+                """,
+                (
+                    event_id,
+                    interview_id,
+                    json.dumps(
+                        {
+                            "suggestion_id": suggestion_id,
+                            "question_id": sug_row["question_id"],
+                            "status": status,
+                            "asked_text": final_asked,
+                            "decision_version": new_version,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+
+            updated = conn.execute(
+                "SELECT * FROM followup_suggestions WHERE id = ?", (suggestion_id,)
+            ).fetchone()
+            res = dict(updated)
+            res["criterion_ids"] = json.loads(res.get("criterion_ids_json") or "[]")
+            res["source_refs"] = json.loads(res.get("source_refs_json") or "[]")
+            return res
+
+    def retry_followup_request(
+        self,
+        interview_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """
+        Retries a failed follow-up request, resetting attempts and job status to PENDING.
+        """
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            req_row = conn.execute(
+                "SELECT * FROM followup_requests WHERE id = ? AND interview_id = ?",
+                (request_id, interview_id),
+            ).fetchone()
+            if not req_row:
+                raise KeyError(f"Followup request {request_id} not found")
+
+            inv = conn.execute(
+                "SELECT status FROM interviews WHERE id = ?", (interview_id,)
+            ).fetchone()
+            if not inv:
+                raise KeyError(f"Interview {interview_id} not found")
+            if str(inv["status"]).lower() not in ("recording", "paused"):
+                raise RepositoryConflictError(f"Cannot retry followups in interview status '{inv['status']}'")
+
+            job_id = req_row["job_id"]
+            if not job_id:
+                raise RepositoryConflictError(f"No job associated with request {request_id}")
+
+            job_row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not job_row:
+                raise KeyError(f"Job {job_id} not found")
+
+            if job_row["status"] == "COMPLETED" and req_row["outcome"] in ("ready", "no_suggestions"):
+                raise RepositoryConflictError("Cannot retry successfully completed request")
+
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'PENDING', attempts = 0, locked_until = NULL, locked_by = NULL, error_message = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, job_id),
+            )
+            conn.execute(
+                """
+                UPDATE followup_requests
+                SET outcome = NULL, error_code = NULL, completed_at = NULL
+                WHERE id = ?
+                """,
+                (request_id,),
+            )
+
+            updated_req = conn.execute(
+                "SELECT * FROM followup_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+            return dict(updated_req)
+
+    def get_asked_followup_history(self, interview_id: str) -> list[dict[str, Any]]:
+        """Returns all follow-up questions marked as asked for canonical snapshot and report."""
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, request_id, question_id, rubric_revision_id, transcript_revision_id,
+                       kind, question_text, purpose, asked_text, decided_at, created_at
+                FROM followup_suggestions
+                WHERE interview_id = ? AND status = 'asked'
+                ORDER BY decided_at ASC, created_at ASC
+                """,
+                (interview_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
 

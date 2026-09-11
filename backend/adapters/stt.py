@@ -122,16 +122,11 @@ class OpenAICompatibleSTTAdapter:
 
                     if resp.status_code == 429:
                         retry_h = resp.headers.get("Retry-After")
-                        retry_sec = float(retry_h) if retry_h and retry_h.isdigit() else backoff
-                        if retry_sec > 15.0 or attempt >= max_retries:
-                            raise STTRateLimitError(
-                                f"STT Rate limit exceeded (retry_after={retry_sec}s): {resp.text}",
-                                retry_after=retry_sec,
-                            )
-                        logger.warning("STT Rate limit hit, sleeping for %.2fs", retry_sec)
-                        await asyncio.sleep(retry_sec)
-                        backoff *= 2.0
-                        continue
+                        retry_sec = float(retry_h) if retry_h and retry_h.isdigit() else 10.0
+                        raise STTRateLimitError(
+                            f"STT Rate limit exceeded (retry_after={retry_sec}s): {resp.text}",
+                            retry_after=retry_sec,
+                        )
 
                     if resp.status_code == 502 and "media_submit_failed" in resp.text:
                         logger.info(

@@ -30,7 +30,7 @@ def test_migration_009_applied_and_idempotent(tmp_path):
 
     conn = db.get_connection()
     try:
-        assert get_current_migration_version(conn) == 9
+        assert get_current_migration_version(conn) >= 9
         # Check transcript_assembly_state table exists
         cols = [
             r["name"]
@@ -46,7 +46,7 @@ def test_migration_009_applied_and_idempotent(tmp_path):
 
     # Re-run for idempotency
     ver2 = run_migrations(db)
-    assert ver2 == 9
+    assert ver2 >= 9
 
 
 def test_turn_assembly_cursor_and_commit(tmp_path):

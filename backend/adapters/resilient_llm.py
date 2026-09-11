@@ -11,7 +11,9 @@ Adheres to docs/implementation-plan.md Section 4 and Section 8:
 import logging
 from typing import Any
 
-from backend.adapters.llm import OpenAICompatibleAdapter
+import httpx
+
+from backend.adapters.llm import LLMAuthenticationError, OpenAICompatibleAdapter
 from backend.core.profiles import (
     get_plusvibe_deepseek_model,
     get_plusvibe_gemini_model,
@@ -23,15 +25,25 @@ logger = logging.getLogger("nebula.resilient_llm")
 
 
 class ResilientLLMAdapter:
-    def __init__(self, force_primary_fail: bool = False):
+    def __init__(
+        self,
+        force_primary_fail: bool = False,
+        http_client: httpx.AsyncClient | None = None,
+    ):
         self.provider = get_plusvibe_provider()
         self.primary_model = get_plusvibe_gemini_model()
         self.fallback_model_1 = get_plusvibe_qwen_model()
         self.fallback_model_2 = get_plusvibe_deepseek_model()
 
-        self.primary_adapter = OpenAICompatibleAdapter(self.provider, self.primary_model)
-        self.fallback_adapter_1 = OpenAICompatibleAdapter(self.provider, self.fallback_model_1)
-        self.fallback_adapter_2 = OpenAICompatibleAdapter(self.provider, self.fallback_model_2)
+        self.primary_adapter = OpenAICompatibleAdapter(
+            self.provider, self.primary_model, http_client=http_client
+        )
+        self.fallback_adapter_1 = OpenAICompatibleAdapter(
+            self.provider, self.fallback_model_1, http_client=http_client
+        )
+        self.fallback_adapter_2 = OpenAICompatibleAdapter(
+            self.provider, self.fallback_model_2, http_client=http_client
+        )
 
         self.force_primary_fail = force_primary_fail
         self.last_fallback_event: dict[str, Any] | None = None
@@ -44,8 +56,11 @@ class ResilientLLMAdapter:
     ) -> tuple[dict[str, Any], str]:
         """
         Executes request with automatic fallback.
+        Resets last_fallback_event on each call and fails fast without fallback on LLMAuthenticationError.
         Returns: (response_data_dict, actual_model_id_used)
         """
+        self.last_fallback_event = None
+
         # Try Primary
         if not self.force_primary_fail:
             try:
@@ -55,6 +70,9 @@ class ResilientLLMAdapter:
                     schema_name=schema_name,
                 )
                 return res, self.primary_model.upstream_model_id
+            except LLMAuthenticationError:
+                # Shared auth failure cannot be resolved by fallback on same provider
+                raise
             except Exception as e:
                 logger.warning(
                     "Primary model %s failed: %s. Initiating fallback...",
@@ -86,6 +104,8 @@ class ResilientLLMAdapter:
                 schema_name=schema_name,
             )
             return res, self.fallback_model_1.upstream_model_id
+        except LLMAuthenticationError:
+            raise
         except Exception as e:
             logger.warning(
                 "Fallback 1 model %s failed: %s. Initiating Fallback 2...",
