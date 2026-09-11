@@ -11,12 +11,18 @@ import json
 import shutil
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from backend.core.scoring import calculate_interview_score
 from backend.core.state_machine import InvalidStateTransitionError
+from backend.core.turn_assembler import (
+    AssembledTurn,
+    AudioChunkRef,
+    TurnAssembler,
+    TurnAssemblyCursor,
+)
 from backend.db.database import Database
 from contracts.domain import (
     HumanCriterionScore,
@@ -2485,6 +2491,9 @@ class Repository:
             stt_payload = {
                 "audio_hex": payload_bytes.hex(),
                 "track_id": track_id,
+                "capture_epoch": capture_epoch,
+                "epoch": capture_epoch,
+                "sequence": sequence,
                 "start_ms": start_time_ms,
                 "end_ms": end_time_ms,
                 "sample_rate": sample_rate,
@@ -2517,6 +2526,269 @@ class Repository:
                     (interview_id,),
                 ).fetchall()
             return [dict(r) for r in rows]
+
+    # -------------------------------------------------------------
+    # Speech Turn Assembly & Cursor
+    # -------------------------------------------------------------
+    def get_turn_assembly_cursor(
+        self, interview_id: str, track_id: str, capture_epoch: int
+    ) -> tuple[int, int]:
+        """Returns (next_sequence, next_sample_offset) for the given track and epoch."""
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT next_sequence, next_sample_offset
+                FROM transcript_assembly_state
+                WHERE interview_id = ? AND track_id = ? AND capture_epoch = ?
+                """,
+                (interview_id, track_id, capture_epoch),
+            ).fetchone()
+            if row:
+                return (row["next_sequence"], row["next_sample_offset"])
+            return (0, 0)
+
+    def get_audio_chunks_for_assembly(
+        self,
+        interview_id: str,
+        track_id: str,
+        capture_epoch: int,
+        from_sequence: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Returns ordered audio chunks for speech turn assembly starting from sequence."""
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM audio_chunks
+                WHERE interview_id = ? AND track_id = ? AND capture_epoch = ? AND sequence >= ?
+                ORDER BY sequence ASC
+                """,
+                (interview_id, track_id, capture_epoch, from_sequence),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def commit_turn_assembly_results(
+        self,
+        interview_id: str,
+        track_id: str,
+        capture_epoch: int,
+        next_sequence: int,
+        next_sample_offset: int,
+        turns: list[AssembledTurn],
+        base_time: datetime | None = None,
+    ) -> list[str]:
+        """
+        Atomically commits updated assembly cursor and enqueues idempotent TRANSCRIBE_TURN jobs.
+        """
+        now = utc_now_iso()
+        created_job_ids: list[str] = []
+
+        with self.db.transaction() as conn:
+            inv = conn.execute("SELECT id, status FROM interviews WHERE id = ?", (interview_id,)).fetchone()
+            if not inv:
+                raise RepositoryNotFoundError(f"Interview {interview_id} not found")
+            if inv["status"] in ("finalized", "deleted"):
+                return []
+
+            # 1. Update or insert cursor state
+            conn.execute(
+                """
+                INSERT INTO transcript_assembly_state (
+                    interview_id, track_id, capture_epoch, next_sequence, next_sample_offset, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(interview_id, track_id, capture_epoch)
+                DO UPDATE SET
+                    next_sequence = excluded.next_sequence,
+                    next_sample_offset = excluded.next_sample_offset,
+                    updated_at = excluded.updated_at
+                """,
+                (interview_id, track_id, capture_epoch, next_sequence, next_sample_offset, now),
+            )
+
+            # 2. Insert TRANSCRIBE_TURN jobs idempotently sorted chronologically
+            turns_sorted = sorted(turns, key=lambda t: (t.start_ms, t.first_sequence))
+            now_dt = base_time or datetime.now(UTC)
+            for idx, turn in enumerate(turns_sorted):
+                turn_now = (now_dt + timedelta(microseconds=idx * 1000)).isoformat()
+                job_id = (
+                    f"stt-turn-{interview_id}-{track_id}-{capture_epoch}-"
+                    f"{turn.first_sequence}-{turn.first_sample_offset}-"
+                    f"{turn.last_sequence}-{turn.last_sample_offset}"
+                )
+                segment_id = (
+                    f"seg-{interview_id}-{track_id}-{capture_epoch}-"
+                    f"{turn.first_sequence}-{turn.first_sample_offset}-"
+                    f"{turn.last_sequence}-{turn.last_sample_offset}"
+                )
+                payload = {
+                    "track_id": track_id,
+                    "capture_epoch": capture_epoch,
+                    "first_sequence": turn.first_sequence,
+                    "first_sample_offset": turn.first_sample_offset,
+                    "last_sequence": turn.last_sequence,
+                    "last_sample_offset": turn.last_sample_offset,
+                    "start_ms": turn.start_ms,
+                    "end_ms": turn.end_ms,
+                    "sample_rate": turn.sample_rate,
+                    "channels": turn.channels,
+                    "language": turn.language,
+                    "segment_id": segment_id,
+                }
+                cursor_res = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO jobs (
+                        id, type, interview_id, payload_json, status, created_at, updated_at
+                    ) VALUES (?, 'TRANSCRIBE_TURN', ?, ?, 'PENDING', ?, ?)
+                    """,
+                    (job_id, interview_id, json.dumps(payload, ensure_ascii=False), turn_now, turn_now),
+                )
+                if cursor_res.rowcount > 0:
+                    created_job_ids.append(job_id)
+
+        return created_job_ids
+
+    def get_turn_audio_pcm(
+        self,
+        interview_id: str,
+        track_id: str,
+        capture_epoch: int,
+        first_sequence: int,
+        first_sample_offset: int,
+        last_sequence: int,
+        last_sample_offset: int,
+    ) -> bytes:
+        """
+        Reconstructs the exact PCM bytes for an assembled turn from stored audio chunks.
+        Verifies all sequences, checksums, formats, and offsets.
+        """
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM audio_chunks
+                WHERE interview_id = ? AND track_id = ? AND capture_epoch = ?
+                  AND sequence BETWEEN ? AND ?
+                ORDER BY sequence ASC
+                """,
+                (interview_id, track_id, capture_epoch, first_sequence, last_sequence),
+            ).fetchall()
+
+        chunks = [dict(r) for r in rows]
+        expected_seqs = list(range(first_sequence, last_sequence + 1))
+        actual_seqs = [c["sequence"] for c in chunks]
+        if actual_seqs != expected_seqs:
+            missing = set(expected_seqs) - set(actual_seqs)
+            raise ValueError(
+                f"Missing audio chunk sequences for turn in interview {interview_id} "
+                f"(track {track_id}, epoch {capture_epoch}): missing {sorted(missing)}"
+            )
+
+        pcm_parts: list[bytes] = []
+        for c in chunks:
+            fp = Path(c["file_path"])
+            if not fp.exists():
+                raise FileNotFoundError(f"Audio chunk file not found at {fp}")
+            raw = fp.read_bytes()
+
+            # Verify checksum
+            computed_sha = hashlib.sha256(raw).hexdigest()
+            if computed_sha != c["checksum_sha256"]:
+                raise ValueError(
+                    f"Checksum mismatch for chunk seq {c['sequence']}: "
+                    f"expected {c['checksum_sha256']}, got {computed_sha}"
+                )
+
+            # Strip RIFF header if present
+            raw_pcm = raw[44:] if raw.startswith(b"RIFF") and len(raw) >= 44 else raw
+
+            seq = c["sequence"]
+            start_samp = first_sample_offset if seq == first_sequence else 0
+            end_samp = last_sample_offset if seq == last_sequence else (len(raw_pcm) // 2)
+
+            start_byte = start_samp * 2
+            end_byte = end_samp * 2
+            pcm_parts.append(raw_pcm[start_byte:end_byte])
+
+        return b"".join(pcm_parts)
+
+    def flush_turn_assembly(
+        self,
+        interview_id: str,
+        track_id: str | None = None,
+        capture_epoch: int | None = None,
+    ) -> list[str]:
+        """
+        Forces turn assembler to flush any open speech tail for the given interview, track, and epoch.
+        Returns newly enqueued TRANSCRIBE_TURN job IDs.
+        """
+        assembler = TurnAssembler()
+        created_jobs: list[str] = []
+
+        with self.db.transaction() as conn:
+            query = """
+                SELECT track_id, capture_epoch, MIN(start_time_ms) as min_start
+                FROM audio_chunks
+                WHERE interview_id = ?
+            """
+            params: list[Any] = [interview_id]
+            if track_id:
+                query += " AND track_id = ?"
+                params.append(track_id)
+            if capture_epoch is not None:
+                query += " AND capture_epoch = ?"
+                params.append(capture_epoch)
+            query += " GROUP BY track_id, capture_epoch ORDER BY min_start ASC"
+            rows = conn.execute(query, params).fetchall()
+
+        base_time = datetime.now(UTC)
+        for track_idx, r in enumerate(rows):
+            t_id = r["track_id"]
+            ep = r["capture_epoch"]
+            cursor_seq, cursor_off = self.get_turn_assembly_cursor(interview_id, t_id, ep)
+            chunk_records = self.get_audio_chunks_for_assembly(interview_id, t_id, ep, from_sequence=cursor_seq)
+            if not chunk_records:
+                continue
+
+            chunk_refs: list[AudioChunkRef] = []
+            for cr in chunk_records:
+                fp_str = cr.get("file_path")
+                if fp_str and Path(fp_str).exists():
+                    raw = Path(fp_str).read_bytes()
+                    pcm = raw[44:] if raw.startswith(b"RIFF") and len(raw) >= 44 else raw
+                    chunk_refs.append(
+                        AudioChunkRef(
+                            sequence=cr["sequence"],
+                            start_time_ms=cr["start_time_ms"],
+                            end_time_ms=cr["end_time_ms"],
+                            sample_rate=cr.get("sample_rate", 16000),
+                            channels=cr.get("channels", 1),
+                            format=cr.get("format", "pcm_s16le"),
+                            pcm_bytes=pcm,
+                        )
+                    )
+
+            if not chunk_refs:
+                continue
+
+            out = assembler.assemble(
+                chunks=chunk_refs,
+                cursor=TurnAssemblyCursor(cursor_seq, cursor_off),
+                is_flush=True,
+                track_id=t_id,
+                capture_epoch=ep,
+            )
+
+            if out.turns or out.next_sequence != cursor_seq or out.next_sample_offset != cursor_off:
+                new_jobs = self.commit_turn_assembly_results(
+                    interview_id=interview_id,
+                    track_id=t_id,
+                    capture_epoch=ep,
+                    next_sequence=out.next_sequence,
+                    next_sample_offset=out.next_sample_offset,
+                    turns=out.turns,
+                    base_time=base_time + timedelta(milliseconds=track_idx * 100),
+                )
+                created_jobs.extend(new_jobs)
+
+        return created_jobs
 
     # -------------------------------------------------------------
     # Job Templates

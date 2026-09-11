@@ -16,6 +16,8 @@ export const App: React.FC = () => {
   const [interviewId, setInterviewId] = useState<string>('');
   const [plan, setPlan] = useState<InterviewPlan | null>(null);
   const [interviewStatus, setInterviewStatus] = useState<InterviewStatus>('draft');
+  const [currentCandidateName, setCurrentCandidateName] = useState<string>('');
+  const [currentRole, setCurrentRole] = useState<string>('');
 
   // Persistent active recording state
   const [activeRecordingSession, setActiveRecordingSession] = useState<{
@@ -46,12 +48,16 @@ export const App: React.FC = () => {
               const restoredStatus = sessionInfo.is_paused ? 'paused' : data.interview.status;
               setInterviewStatus(restoredStatus);
               const mode = data.interview.capture_mode as CaptureMode | undefined;
+              const candName = data.interview.candidate_name || data.plan?.candidate_name || '';
+              const candRole = data.interview.role || data.plan?.role || '';
+              setCurrentCandidateName(candName);
+              setCurrentRole(candRole);
               if (data.plan) {
                 setPlan(data.plan);
                 setActiveRecordingSession({
                   interviewId: activeSessionId,
-                  candidateName: data.plan.title,
-                  role: data.plan.role,
+                  candidateName: candName || 'Кандидат',
+                  role: candRole || 'Должность не указана',
                   plan: data.plan,
                   captureMode: mode,
                   isPaused: sessionInfo.is_paused,
@@ -118,6 +124,8 @@ export const App: React.FC = () => {
     setSetupExistingInterviewId(null);
     setInterviewId('');
     setPlan(null);
+    setCurrentCandidateName('');
+    setCurrentRole('');
     setInterviewStatus('draft');
     setScreen('setup');
   };
@@ -126,6 +134,8 @@ export const App: React.FC = () => {
     if (activeRecordingSession && activeRecordingSession.interviewId === id) {
       setInterviewId(id);
       setPlan(activeRecordingSession.plan);
+      setCurrentCandidateName(activeRecordingSession.candidateName);
+      setCurrentRole(activeRecordingSession.role);
       setScreen('live');
       return;
     }
@@ -146,6 +156,11 @@ export const App: React.FC = () => {
       const actualStatus = data.interview?.status || status;
       setInterviewStatus(actualStatus);
 
+      const candName = data.interview?.candidate_name || data.plan?.candidate_name || '';
+      const candRole = data.interview?.role || data.plan?.role || '';
+      setCurrentCandidateName(candName);
+      setCurrentRole(candRole);
+
       if (actualStatus === 'draft' || actualStatus === 'ready') {
         setSetupExistingInterviewId(id);
         setScreen('setup');
@@ -154,8 +169,8 @@ export const App: React.FC = () => {
         if (data.plan) {
           setActiveRecordingSession({
             interviewId: id,
-            candidateName: data.plan.title,
-            role: data.plan.role,
+            candidateName: candName || 'Кандидат',
+            role: candRole || 'Должность не указана',
             plan: data.plan,
             captureMode: mode,
             isPaused: actualStatus === 'paused',
@@ -172,14 +187,24 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleInterviewStarted = (id: string, newPlan: InterviewPlan, captureMode?: CaptureMode) => {
+  const handleInterviewStarted = (
+    id: string,
+    newPlan: InterviewPlan,
+    captureMode?: CaptureMode,
+    startedCandidateName?: string,
+    startedRole?: string
+  ) => {
     setInterviewId(id);
     setPlan(newPlan);
     setInterviewStatus('recording');
+    const resolvedCandName = startedCandidateName || newPlan.candidate_name || currentCandidateName || 'Кандидат';
+    const resolvedRole = startedRole || newPlan.role || currentRole || 'Должность не указана';
+    setCurrentCandidateName(resolvedCandName);
+    setCurrentRole(resolvedRole);
     setActiveRecordingSession({
       interviewId: id,
-      candidateName: newPlan.title,
-      role: newPlan.role,
+      candidateName: resolvedCandName,
+      role: resolvedRole,
       plan: newPlan,
       captureMode,
       isPaused: false,
@@ -205,12 +230,12 @@ export const App: React.FC = () => {
         status={getStatus()}
         candidateName={
           screen === 'live' || screen === 'review' || screen === 'setup'
-            ? plan?.title || 'Новое интервью'
+            ? currentCandidateName || plan?.candidate_name || (screen === 'setup' ? 'Подготовка интервью' : 'Кандидат')
             : undefined
         }
         role={
           screen === 'live' || screen === 'review' || screen === 'setup'
-            ? plan?.role || 'Подготовка'
+            ? currentRole || plan?.role || (screen === 'setup' ? 'Выбор должности' : 'Позиция не указана')
             : undefined
         }
         isCapturing={Boolean(activeRecordingSession)}
@@ -248,6 +273,8 @@ export const App: React.FC = () => {
             <LiveSessionScreen
               interviewId={activeRecordingSession.interviewId}
               plan={activeRecordingSession.plan}
+              candidateName={activeRecordingSession.candidateName}
+              role={activeRecordingSession.role}
               onFinishSession={handleFinishSession}
             />
           </div>
@@ -259,6 +286,8 @@ export const App: React.FC = () => {
             <LiveSessionScreen
               interviewId={interviewId}
               plan={plan}
+              candidateName={currentCandidateName}
+              role={currentRole}
               onFinishSession={handleFinishSession}
             />
           </div>
@@ -269,6 +298,8 @@ export const App: React.FC = () => {
           <ReviewScreen
             interviewId={interviewId}
             plan={plan}
+            candidateName={currentCandidateName}
+            role={currentRole}
             onNewInterview={handleNewInterview}
             onBackToHome={handleBackToHome}
           />

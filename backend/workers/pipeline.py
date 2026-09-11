@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import os
 import sqlite3
 import struct
 import uuid
@@ -32,6 +34,11 @@ from backend.core.profiles import (
 )
 from backend.core.revisions import TranscriptDiffEngine
 from backend.core.summary_generator import ExecutiveSummaryGenerator
+from backend.core.turn_assembler import (
+    AudioChunkRef,
+    TurnAssembler,
+    TurnAssemblyCursor,
+)
 from backend.db.repository import Repository, RepositoryConflictError
 from contracts.audio import TrackType
 from contracts.domain import (
@@ -116,11 +123,13 @@ class PipelineWorker:
 
         try:
             if job_type == "TRANSCRIBE_AUDIO":
-                grouped_ids = await self._handle_transcribe(
-                    interview_id, payload, owner_token=owner_token, active_grouped_ids=active_grouped_ids
+                await self._handle_transcribe_audio(
+                    interview_id, payload, owner_token=owner_token, job_id=job_id
                 )
-                for gid in grouped_ids:
-                    self.repo.complete_job(gid, owner_token=owner_token)
+            elif job_type == "TRANSCRIBE_TURN":
+                await self._handle_transcribe_turn(
+                    interview_id, payload, owner_token=owner_token, job_id=job_id
+                )
             elif job_type == "EVALUATE_QUESTION":
                 await self._handle_evaluate(interview_id, payload, owner_token=owner_token, job_id=job_id)
             elif job_type == "BATCH_RETRANSCRIBE":
@@ -176,78 +185,170 @@ class PipelineWorker:
         owner_token: str | None = None,
         active_grouped_ids: list[str] | None = None,
     ) -> list[str]:
-        audio_bytes = bytes.fromhex(payload["audio_hex"])
-        track_id = payload.get("track_id", "candidate")
-        start_ms = payload.get("start_ms", 0)
-        end_ms = payload.get("end_ms", 0)
-        sample_rate = payload.get("sample_rate", 16000)
-        channels = payload.get("channels", 1)
-        format_val = payload.get("format", "pcm_s16le")
-        language = payload.get("language", "ru")
-        epoch = payload.get("epoch")
+        """Legacy alias forwarding to _handle_transcribe_audio."""
+        await self._handle_transcribe_audio(interview_id, payload, owner_token=owner_token)
+        return []
 
-        is_real_stt = (
-            isinstance(self.stt_adapter, OpenAICompatibleSTTAdapter)
-            and self.stt_adapter._external_client is None
+    async def _handle_transcribe_audio(
+        self,
+        interview_id: str,
+        payload: dict[str, Any],
+        owner_token: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        """
+        Chunk ingestion event handler. Runs TurnAssembler on continuous audio chunks from cursor
+        and atomically commits updated cursor and enqueues TRANSCRIBE_TURN jobs.
+        """
+        track_id = payload.get("track_id", "candidate")
+        capture_epoch = payload.get("capture_epoch")
+        if capture_epoch is None:
+            capture_epoch = payload.get("epoch")
+        sequence = payload.get("sequence")
+
+        # Fallback resolution of sequence and epoch from audio_chunks if missing
+        if capture_epoch is None or sequence is None:
+            start_ms = payload.get("start_ms")
+            end_ms = payload.get("end_ms")
+            with self.repo.db.transaction() as conn:
+                matches = conn.execute(
+                    """
+                    SELECT sequence, capture_epoch, track_id FROM audio_chunks
+                    WHERE interview_id = ? AND track_id = ? AND start_time_ms = ? AND end_time_ms = ?
+                    """,
+                    (interview_id, track_id, start_ms, end_ms),
+                ).fetchall()
+                if len(matches) == 1:
+                    sequence = matches[0]["sequence"]
+                    capture_epoch = matches[0]["capture_epoch"]
+                    track_id = matches[0]["track_id"]
+
+        # Legacy fallback if still cannot identify chunk sequence in repository
+        if capture_epoch is None or sequence is None:
+            if "audio_hex" in payload:
+                logger.info("Executing legacy direct STT fallback for job %s (missing epoch/sequence)", job_id)
+                await self._handle_legacy_direct_transcribe(interview_id, payload)
+                return
+            raise ValueError(f"Cannot identify audio chunk sequence/epoch for TRANSCRIBE_AUDIO job {job_id}")
+
+        inv = self.repo.get_interview(interview_id)
+        if not inv or inv["status"] in ("finalized", "deleted"):
+            return
+
+        cursor_seq, cursor_off = self.repo.get_turn_assembly_cursor(interview_id, track_id, capture_epoch)
+        chunk_records = self.repo.get_audio_chunks_for_assembly(
+            interview_id=interview_id,
+            track_id=track_id,
+            capture_epoch=capture_epoch,
+            from_sequence=cursor_seq,
+        )
+        if not chunk_records:
+            return
+
+        chunk_refs: list[AudioChunkRef] = []
+        for cr in chunk_records:
+            fp_str = cr.get("file_path")
+            pcm_bytes = None
+            if fp_str and Path(fp_str).exists():
+                raw = Path(fp_str).read_bytes()
+                pcm_bytes = raw[44:] if raw.startswith(b"RIFF") and len(raw) >= 44 else raw
+            elif cr["sequence"] == sequence and "audio_hex" in payload:
+                pcm_bytes = bytes.fromhex(payload["audio_hex"])
+
+            if pcm_bytes is not None:
+                chunk_refs.append(
+                    AudioChunkRef(
+                        sequence=cr["sequence"],
+                        start_time_ms=cr["start_time_ms"],
+                        end_time_ms=cr["end_time_ms"],
+                        sample_rate=cr.get("sample_rate", 16000),
+                        channels=cr.get("channels", 1),
+                        format=cr.get("format", "pcm_s16le"),
+                        pcm_bytes=pcm_bytes,
+                    )
+                )
+
+        if not chunk_refs:
+            return
+
+        is_flush = bool(payload.get("is_flush", False))
+        if not is_flush:
+            spool_dir = Path(os.getenv("NEBULA_SPOOL_DIR", "data/spool")).resolve()
+            manifest_path = spool_dir / interview_id / track_id / "manifest.json"
+            if manifest_path.exists():
+                try:
+                    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    total_expected = manifest_data.get("total_chunks", 0)
+                    if total_expected > 0 and chunk_records[-1]["sequence"] + 1 >= total_expected:
+                        is_flush = True
+                except Exception:
+                    pass
+
+        assembler = TurnAssembler()
+        out = assembler.assemble(
+            chunks=chunk_refs,
+            cursor=TurnAssemblyCursor(cursor_seq, cursor_off),
+            is_flush=is_flush,
+            track_id=track_id,
+            capture_epoch=capture_epoch,
+            language=payload.get("language", "ru"),
         )
 
-        # 1. Skip single silence chunks for real remote STT to prevent 502 upstream errors and unnecessary API calls
-        if is_real_stt and (format_val == "pcm_s16le" or not audio_bytes.startswith(b"RIFF")) and is_pcm_silence(audio_bytes):
-            logger.debug("Skipping silence chunk for interview %s (track %s, %d-%d ms)", interview_id, track_id, start_ms, end_ms)
-            return []
+        self.repo.commit_turn_assembly_results(
+            interview_id=interview_id,
+            track_id=track_id,
+            capture_epoch=capture_epoch,
+            next_sequence=out.next_sequence,
+            next_sample_offset=out.next_sample_offset,
+            turns=out.turns,
+        )
 
-        # 2. Dynamic batch grouping: combine waiting consecutive chunks into a coherent 3-4s phrase
-        grouped_job_ids: list[str] = []
-        if is_real_stt and format_val == "pcm_s16le":
-            adjacent = self.repo.claim_adjacent_transcribe_jobs(
-                interview_id=interview_id,
-                track_id=track_id,
-                last_end_ms=end_ms,
-                epoch=epoch,
-                max_additional=3,
-                owner_token=owner_token,
-            )
-            for idx, adj_job in enumerate(adjacent):
-                if active_grouped_ids is not None:
-                    active_grouped_ids.append(adj_job["id"])
-                adj_payload = adj_job.get("payload", {})
-                adj_hex = adj_payload.get("audio_hex", "")
-                if not adj_hex:
-                    # Release unused remaining adjacent jobs
-                    for unhandled in adjacent[idx:]:
-                        with self.repo.db.transaction() as conn:
-                            conn.execute(
-                                "UPDATE jobs SET status = 'PENDING', locked_until = NULL, locked_by = NULL WHERE id = ? AND locked_by = ?",
-                                (unhandled["id"], owner_token),
-                            )
-                        if active_grouped_ids and unhandled["id"] in active_grouped_ids:
-                            active_grouped_ids.remove(unhandled["id"])
-                    break
-                adj_bytes = bytes.fromhex(adj_hex)
-                # If an adjacent chunk is silence, complete it and stop grouping at natural speech pause
-                if is_pcm_silence(adj_bytes):
-                    grouped_job_ids.append(adj_job["id"])
-                    # Release any remaining adjacent jobs that were claimed but not grouped
-                    for unhandled in adjacent[idx + 1:]:
-                        with self.repo.db.transaction() as conn:
-                            conn.execute(
-                                "UPDATE jobs SET status = 'PENDING', locked_until = NULL, locked_by = NULL WHERE id = ? AND locked_by = ?",
-                                (unhandled["id"], owner_token),
-                            )
-                        if active_grouped_ids and unhandled["id"] in active_grouped_ids:
-                            active_grouped_ids.remove(unhandled["id"])
-                    break
-                audio_bytes += adj_bytes
-                end_ms = adj_payload.get("end_ms", end_ms)
-                grouped_job_ids.append(adj_job["id"])
+    async def _handle_transcribe_turn(
+        self,
+        interview_id: str,
+        payload: dict[str, Any],
+        owner_token: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        """
+        Executes STT transcription for a coherent speech turn.
+        Reconstructs PCM from audio chunks, calls STT adapter, filters hallucinations,
+        and saves the transcript segment idempotently.
+        """
+        track_id = payload["track_id"]
+        capture_epoch = payload["capture_epoch"]
+        first_seq = payload["first_sequence"]
+        first_off = payload["first_sample_offset"]
+        last_seq = payload["last_sequence"]
+        last_off = payload["last_sample_offset"]
+        start_ms = payload["start_ms"]
+        end_ms = payload["end_ms"]
+        sample_rate = payload.get("sample_rate", 16000)
+        channels = payload.get("channels", 1)
+        language = payload.get("language", "ru")
+        segment_id = payload.get("segment_id", f"seg-{uuid.uuid4().hex[:8]}")
 
-        # If audio payload is raw PCM, wrap it into a compliant WAV container before STT
-        if format_val == "pcm_s16le" or not audio_bytes.startswith(b"RIFF"):
-            wav_bytes = pcm_s16le_to_wav_bytes(audio_bytes, sample_rate, channels)
-        else:
-            wav_bytes = audio_bytes
+        if not self.repo.get_interview(interview_id):
+            logger.warning("Interview %s was deleted before transcribing turn %s.", interview_id, job_id)
+            return
 
-        filename = f"chunk_{track_id}_{start_ms}_{end_ms}.wav"
+        pcm_bytes = self.repo.get_turn_audio_pcm(
+            interview_id=interview_id,
+            track_id=track_id,
+            capture_epoch=capture_epoch,
+            first_sequence=first_seq,
+            first_sample_offset=first_off,
+            last_sequence=last_seq,
+            last_sample_offset=last_off,
+        )
+
+        if not pcm_bytes:
+            logger.debug("Turn %s has empty audio, skipping STT.", job_id)
+            return
+
+        wav_bytes = pcm_s16le_to_wav_bytes(pcm_bytes, sample_rate, channels)
+        filename = f"turn_{track_id}_{start_ms}_{end_ms}.wav"
+
         res = await self.stt_adapter.transcribe_audio(
             wav_bytes,
             filename=filename,
@@ -256,7 +357,6 @@ class PipelineWorker:
         )
 
         cleaned_text = res.text.strip()
-        # Filter out empty text, punctuation, and known Whisper silence hallucinations
         WHISPER_HALLUCINATIONS = {
             "продолжение следует...",
             "продолжение следует",
@@ -272,12 +372,76 @@ class PipelineWorker:
             or cleaned_text in (".", "...", ",", "!", "?", "—", "-")
             or cleaned_text.lower() in WHISPER_HALLUCINATIONS
         ):
-            logger.debug("Transcribed chunk %s produced empty/hallucination text, skipping segment.", filename)
-            return grouped_job_ids
+            logger.debug("Transcribed turn %s produced empty/hallucination text, skipping segment.", filename)
+            return
 
         if not self.repo.get_interview(interview_id):
             logger.warning("Interview %s was deleted before saving transcript segment.", interview_id)
-            return grouped_job_ids
+            return
+
+        speaker_role = payload.get("speaker_role")
+        if not speaker_role:
+            speaker_role = "unknown" if str(track_id).lower() == "shared" else str(track_id).lower()
+
+        self.repo.add_transcript_segment(
+            segment_id=segment_id,
+            interview_id=interview_id,
+            track_id=track_id,
+            start_time_ms=start_ms,
+            end_time_ms=end_ms,
+            text=cleaned_text,
+            is_final=True,
+            speaker_role=speaker_role,
+        )
+
+    async def _handle_legacy_direct_transcribe(
+        self,
+        interview_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Legacy direct transcription fallback for pending jobs without sequence/epoch."""
+        audio_bytes = bytes.fromhex(payload["audio_hex"])
+        track_id = payload.get("track_id", "candidate")
+        start_ms = payload.get("start_ms", 0)
+        end_ms = payload.get("end_ms", 0)
+        sample_rate = payload.get("sample_rate", 16000)
+        channels = payload.get("channels", 1)
+        format_val = payload.get("format", "pcm_s16le")
+        language = payload.get("language", "ru")
+
+        if format_val == "pcm_s16le" or not audio_bytes.startswith(b"RIFF"):
+            wav_bytes = pcm_s16le_to_wav_bytes(audio_bytes, sample_rate, channels)
+        else:
+            wav_bytes = audio_bytes
+
+        filename = f"chunk_{track_id}_{start_ms}_{end_ms}.wav"
+        res = await self.stt_adapter.transcribe_audio(
+            wav_bytes,
+            filename=filename,
+            content_type="audio/wav",
+            language=language,
+        )
+
+        cleaned_text = res.text.strip()
+        WHISPER_HALLUCINATIONS = {
+            "продолжение следует...",
+            "продолжение следует",
+            "субтитры сделал",
+            "спасибо за просмотр",
+            "спасибо за просмотр!",
+            "до скорых встреч!",
+            "до скорых встреч",
+            "редактор субтитров",
+        }
+        if (
+            not cleaned_text
+            or cleaned_text in (".", "...", ",", "!", "?", "—", "-")
+            or cleaned_text.lower() in WHISPER_HALLUCINATIONS
+        ):
+            return
+
+        if not self.repo.get_interview(interview_id):
+            return
 
         segment_id = payload.get("segment_id", f"seg-{uuid.uuid4().hex[:8]}")
         speaker_role = payload.get("speaker_role")
@@ -294,7 +458,6 @@ class PipelineWorker:
             is_final=True,
             speaker_role=speaker_role,
         )
-        return grouped_job_ids
 
 
     async def _handle_evaluate(
@@ -664,31 +827,85 @@ Respond strictly with a JSON object conforming to:
         )
         if not new_segments:
             chunks = self.repo.get_audio_chunks(interview_id)
-            new_segments = []
+            chunks_by_group: dict[tuple[str, int], list[dict[str, Any]]] = {}
             for c in chunks:
-                fp_str = c.get("file_path")
-                if fp_str and Path(fp_str).exists():
-                    raw_bytes = Path(fp_str).read_bytes()
-                    sr = c.get("sample_rate", 16000)
-                    ch = c.get("channels", 1)
-                    fmt = c.get("format", "pcm_s16le")
-                    if fmt == "pcm_s16le" or not raw_bytes.startswith(b"RIFF"):
-                        wav_bytes = pcm_s16le_to_wav_bytes(raw_bytes, sr, ch)
-                    else:
-                        wav_bytes = raw_bytes
+                key = (c["track_id"], c.get("capture_epoch", 1))
+                chunks_by_group.setdefault(key, []).append(c)
 
+            new_segments = []
+            assembler = TurnAssembler()
+
+            for (track_id, epoch), group_chunks in chunks_by_group.items():
+                group_chunks.sort(key=lambda c: c["sequence"])
+                chunk_refs: list[AudioChunkRef] = []
+                for c in group_chunks:
+                    fp_str = c.get("file_path")
+                    if fp_str and Path(fp_str).exists():
+                        raw_bytes = Path(fp_str).read_bytes()
+                        pcm = raw_bytes[44:] if raw_bytes.startswith(b"RIFF") and len(raw_bytes) >= 44 else raw_bytes
+                        chunk_refs.append(
+                            AudioChunkRef(
+                                sequence=c["sequence"],
+                                start_time_ms=c["start_time_ms"],
+                                end_time_ms=c["end_time_ms"],
+                                sample_rate=c.get("sample_rate", 16000),
+                                channels=c.get("channels", 1),
+                                format=c.get("format", "pcm_s16le"),
+                                pcm_bytes=pcm,
+                            )
+                        )
+
+                if not chunk_refs:
+                    continue
+
+                assembly_out = assembler.assemble(
+                    chunks=chunk_refs,
+                    cursor=TurnAssemblyCursor(group_chunks[0]["sequence"], 0),
+                    is_flush=True,
+                    track_id=track_id,
+                    capture_epoch=epoch,
+                )
+
+                for turn in assembly_out.turns:
+                    pcm_bytes = self.repo.get_turn_audio_pcm(
+                        interview_id=interview_id,
+                        track_id=track_id,
+                        capture_epoch=epoch,
+                        first_sequence=turn.first_sequence,
+                        first_sample_offset=turn.first_sample_offset,
+                        last_sequence=turn.last_sequence,
+                        last_sample_offset=turn.last_sample_offset,
+                    )
+                    if not pcm_bytes:
+                        continue
+
+                    wav_bytes = pcm_s16le_to_wav_bytes(pcm_bytes, turn.sample_rate, turn.channels)
                     res = await self.stt_adapter.transcribe_audio(
                         wav_bytes,
-                        filename=f"batch_{c['track_id']}_{c['sequence']}.wav",
+                        filename=f"batch_{track_id}_{turn.first_sequence}_{turn.last_sequence}.wav",
                         content_type="audio/wav",
                     )
                     text_val = res.text.strip()
-                    if text_val:
+                    whisper_hallucinations = {
+                        "продолжение следует...",
+                        "продолжение следует",
+                        "субтитры сделал",
+                        "спасибо за просмотр",
+                        "спасибо за просмотр!",
+                        "до скорых встреч!",
+                        "до скорых встреч",
+                        "редактор субтитров",
+                    }
+                    if (
+                        text_val
+                        and text_val not in (".", "...", ",", "!", "?", "—", "-")
+                        and text_val.lower() not in whisper_hallucinations
+                    ):
                         new_segments.append({
-                            "id": f"seg-b-{c['track_id']}-{c['sequence']}",
-                            "track_id": c["track_id"],
-                            "start_time_ms": c["start_time_ms"],
-                            "end_time_ms": c["end_time_ms"],
+                            "id": f"seg-b-{track_id}-{epoch}-{turn.first_sequence}-{turn.first_sample_offset}-{turn.last_sequence}-{turn.last_sample_offset}",
+                            "track_id": track_id,
+                            "start_time_ms": turn.start_ms,
+                            "end_time_ms": turn.end_ms,
                             "text": text_val,
                         })
 

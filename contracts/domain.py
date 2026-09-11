@@ -87,6 +87,7 @@ class InterviewPlan(BaseModel):
     id: str = Field(default="plan-default")
     title: str = Field(..., min_length=2)
     role: str = Field(default="")
+    candidate_name: str | None = Field(default=None, description="Candidate name associated with this plan")
     questions: list[PlannedQuestion] = Field(..., min_length=1)
 
 

@@ -42,7 +42,7 @@ def run_migrations(db: Database) -> int:
     finally:
         conn.close()
 
-    TARGET_VERSION = 8
+    TARGET_VERSION = 9
     if current_version < TARGET_VERSION and db.db_path != ":memory:" and Path(db.db_path).exists():
         # Make verified pre-migration backup if not in-memory
         backup_dir = Path(os.getenv("NEBULA_BACKUP_DIR", "data/backups")).resolve()
@@ -531,6 +531,34 @@ def run_migrations(db: Database) -> int:
         if not db.verify_integrity():
             raise RuntimeError("Database integrity check failed after running migration 008!")
         current_version = 8
+
+    if current_version < 9:
+        with db.transaction() as tx_conn:
+            tx_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transcript_assembly_state (
+                    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+                    track_id TEXT NOT NULL,
+                    capture_epoch INTEGER NOT NULL,
+                    next_sequence INTEGER NOT NULL DEFAULT 0,
+                    next_sample_offset INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (interview_id, track_id, capture_epoch)
+                )
+                """
+            )
+            tx_conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transcript_assembly ON transcript_assembly_state(interview_id, track_id, capture_epoch);"
+            )
+            now_iso = datetime.now(UTC).isoformat()
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (9, '009_transcript_turn_assembly', ?)",
+                (now_iso,),
+            )
+
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 009!")
+        current_version = 9
 
     logger.info("Successfully ensured database schema up to version %d", current_version)
     return current_version

@@ -458,9 +458,12 @@ async def create_interview_endpoint(
                 "id": f"plan-{payload.id}",
                 "title": tpl["title"],
                 "role": tpl["role"],
+                "candidate_name": payload.candidate_name,
                 "questions": tpl["questions"],
             }
     if plan_to_save:
+        if isinstance(plan_to_save, dict) and not plan_to_save.get("candidate_name"):
+            plan_to_save["candidate_name"] = payload.candidate_name
         repo.save_plan(f"plan-{payload.id}", payload.id, plan_to_save, version=1)
     repo.record_audit_event(
         event_id=f"audit-{uuid.uuid4().hex[:8]}",
@@ -509,10 +512,13 @@ async def update_interview_endpoint(
     if payload.plan is not None:
         latest_plan = repo.get_latest_plan(interview_id)
         next_ver = (latest_plan["version"] + 1) if latest_plan else 1
+        plan_dict = dict(payload.plan) if isinstance(payload.plan, dict) else payload.plan
+        if isinstance(plan_dict, dict) and not plan_dict.get("candidate_name"):
+            plan_dict["candidate_name"] = payload.candidate_name or inv.get("candidate_name")
         repo.save_plan(
             plan_id=f"plan-{interview_id}-v{next_ver}",
             interview_id=interview_id,
-            payload=payload.plan,
+            payload=plan_dict,
             version=next_ver,
         )
 
@@ -758,11 +764,6 @@ def check_interview_readiness(
             (interview_id,),
         ).fetchall()
 
-    stt_jobs = [r for r in job_rows if r["type"] == "TRANSCRIBE_AUDIO"]
-    pending_jobs = [r for r in stt_jobs if r["status"] in ("PENDING", "PROCESSING")]
-    failed_jobs = [r for r in stt_jobs if r["status"] == "FAILED"]
-    completed_jobs = [r for r in stt_jobs if r["status"] == "COMPLETED"]
-
     missing_chunks: dict[str, list[int]] = {}
     total_expected_chunks = 0
 
@@ -774,6 +775,23 @@ def check_interview_readiness(
         diff = sorted(list(expected - ingested))
         if diff:
             missing_chunks[track] = diff
+
+    # If manifests exist and no chunks missing, ensure open assembly tails are flushed
+    if manifests_found and not missing_chunks:
+        with contextlib.suppress(Exception):
+            repo.flush_turn_assembly(interview_id)
+        with repo.db.transaction() as conn:
+            job_rows = conn.execute(
+                "SELECT id, type, status FROM jobs WHERE interview_id = ?",
+                (interview_id,),
+            ).fetchall()
+
+    stt_relevant = [r for r in job_rows if r["type"] in ("TRANSCRIBE_AUDIO", "TRANSCRIBE_TURN")]
+    pending_jobs = [r for r in stt_relevant if r["status"] in ("PENDING", "PROCESSING")]
+    failed_jobs = [r for r in stt_relevant if r["status"] == "FAILED"]
+    completed_jobs = [r for r in stt_relevant if r["status"] == "COMPLETED"]
+
+    assembly_completed = [r for r in job_rows if r["type"] == "TRANSCRIBE_AUDIO" and r["status"] == "COMPLETED"]
 
     # If manifests exist:
     if manifests_found:
@@ -796,7 +814,7 @@ def check_interview_readiness(
                 {
                     "is_ready": False,
                     "state": "STT_FAILED",
-                    "details": f"{len(failed_jobs)} audio transcription jobs failed.",
+                    "details": f"{len(failed_jobs)} audio transcription / assembly jobs failed.",
                     "missing_chunks": {},
                     "stt_jobs": {"completed": len(completed_jobs), "pending": len(pending_jobs), "failed": len(failed_jobs)},
                     "manifests": manifests_found,
@@ -809,20 +827,20 @@ def check_interview_readiness(
                 {
                     "is_ready": False,
                     "state": "STT_IN_PROGRESS",
-                    "details": f"STT transcription in progress ({len(completed_jobs)}/{len(stt_jobs)} completed, {len(pending_jobs)} pending).",
+                    "details": f"STT transcription in progress ({len(completed_jobs)}/{len(stt_relevant)} completed, {len(pending_jobs)} pending).",
                     "missing_chunks": {},
                     "stt_jobs": {"completed": len(completed_jobs), "pending": len(pending_jobs), "failed": len(failed_jobs)},
                     "manifests": manifests_found,
                 },
             )
 
-        if total_expected_chunks > 0 and len(completed_jobs) < len(db_chunks):
+        if total_expected_chunks > 0 and len(assembly_completed) < len(db_chunks):
             return (
                 False,
                 {
                     "is_ready": False,
                     "state": "STT_IN_PROGRESS",
-                    "details": f"Awaiting STT job execution for {len(db_chunks) - len(completed_jobs)} chunks.",
+                    "details": f"Awaiting STT job execution for {len(db_chunks) - len(assembly_completed)} chunks.",
                     "missing_chunks": {},
                     "stt_jobs": {"completed": len(completed_jobs), "pending": len(pending_jobs), "failed": len(failed_jobs)},
                     "manifests": manifests_found,
@@ -1134,6 +1152,10 @@ async def stop_interview_endpoint(
             data = manifest.model_dump_json(indent=2)
             tmp_path.write_text(data, encoding="utf-8")
             os.replace(tmp_path, manifest_path)
+
+    # Flush open speech turns in the turn assembler on interview stop
+    with contextlib.suppress(Exception):
+        repo.flush_turn_assembly(interview_id)
 
     if current_status != new_status:
         repo.update_interview_status(interview_id, new_status)

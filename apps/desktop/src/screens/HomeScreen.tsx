@@ -133,6 +133,38 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
   };
 
+  const getCandidateDisplay = (item: InterviewListItem) => {
+    if (item.candidate_name && item.candidate_name.trim() && item.candidate_name !== 'Не указан' && item.candidate_name !== 'Без имени') {
+      return item.candidate_name;
+    }
+    if (item.title && (item.title.includes('—') || item.title.includes('-'))) {
+      const parts = item.title.split(/[—-]/);
+      if (parts.length >= 2) {
+        const candidatePart = parts[parts.length - 1].trim();
+        if (candidatePart && candidatePart !== 'Черновик' && candidatePart !== 'Без имени') {
+          return candidatePart;
+        }
+      }
+    }
+    return item.candidate_name || 'Не указан';
+  };
+
+  const getRoleDisplay = (item: InterviewListItem) => {
+    if (item.role && item.role.trim() && item.role !== 'Позиция не указана') {
+      return item.role;
+    }
+    if (item.title && (item.title.includes('—') || item.title.includes('-'))) {
+      const parts = item.title.split(/[—-]/);
+      if (parts.length >= 2) {
+        const rolePart = parts[0].trim();
+        if (rolePart && rolePart !== 'Интервью') {
+          return rolePart;
+        }
+      }
+    }
+    return item.role || item.title || 'Позиция не указана';
+  };
+
   const getStatusBadge = (item: InterviewListItem) => {
     if (item.is_reopened) {
       return (
@@ -418,7 +450,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                       {/* Candidate */}
                       <td className="py-4 px-6">
                         <div className="font-semibold text-slate-100 group-hover:text-indigo-300 transition">
-                          {item.candidate_name || 'Не указан'}
+                          {getCandidateDisplay(item)}
                         </div>
                         <div className="text-xs text-slate-500 font-mono mt-0.5 truncate max-w-[200px]">
                           {item.id}
@@ -427,7 +459,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
                       {/* Role */}
                       <td className="py-4 px-6">
-                        <div className="text-slate-200">{item.role || item.title}</div>
+                        <div className="text-slate-200">{getRoleDisplay(item)}</div>
                         {item.template_id && (
                           <div className="text-[11px] text-slate-500 mt-0.5">
                             Шаблон: {item.template_id}

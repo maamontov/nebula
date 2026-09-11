@@ -72,6 +72,7 @@ export interface InterviewPlan {
   id: string;
   title: string;
   role: string;
+  candidate_name?: string;
   questions: PlannedQuestion[];
 }
 

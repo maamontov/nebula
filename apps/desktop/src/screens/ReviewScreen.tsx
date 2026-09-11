@@ -49,6 +49,7 @@ import {
   ArrowLeft,
   FileSpreadsheet,
   ThumbsUp,
+  Briefcase,
 } from 'lucide-react';
 
 interface DecisionOption {
@@ -120,6 +121,8 @@ type ReviewTab = 'overview' | 'questions' | 'transcript' | 'result' | 'history';
 interface ReviewScreenProps {
   interviewId: string;
   plan: InterviewPlan;
+  candidateName?: string;
+  role?: string;
   onNewInterview: () => void;
   onBackToHome?: () => void;
 }
@@ -127,6 +130,8 @@ interface ReviewScreenProps {
 export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   interviewId,
   plan,
+  candidateName,
+  role,
   onNewInterview,
   onBackToHome,
 }) => {
@@ -897,6 +902,19 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   ).length;
   const excludedQuestionsCount = Object.values(excludedQuestions).filter((x) => x.isExcluded).length;
 
+  const effectiveCandidateName =
+    interviewMetadata?.candidate_name ||
+    candidateName ||
+    plan.candidate_name ||
+    (plan.title?.includes('—') ? plan.title.split('—')[1]?.trim() : '') ||
+    'Кандидат не указан';
+  const effectiveRole =
+    interviewMetadata?.role ||
+    role ||
+    plan.role ||
+    (plan.title?.includes('—') ? plan.title.split('—')[0]?.trim() : '') ||
+    'Должность не указана';
+
   return (
     <div className="max-w-6xl mx-auto p-6 space-y-6 overflow-y-auto h-[calc(100vh-4rem)]">
       {/* Top Header & Context */}
@@ -907,7 +925,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           </div>
           <div>
             <div className="flex items-center space-x-2">
-              <h2 className="text-lg font-bold text-slate-100">{plan.title || 'Собеседование'}</h2>
+              <h2 className="text-lg font-bold text-slate-100">{effectiveCandidateName}</h2>
               {isFinalized ? (
                 <span className="flex items-center space-x-1 px-2.5 py-0.5 text-xs font-semibold text-emerald-400 bg-emerald-950/80 border border-emerald-700 rounded-full">
                   <Lock className="w-3.5 h-3.5" />
@@ -920,12 +938,20 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 </span>
               )}
             </div>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Роль: <span className="text-slate-200 font-medium">{plan.role}</span> • Сессия: <span className="font-mono text-slate-300">{interviewId}</span>
+            <p className="text-xs text-slate-400 mt-1 flex flex-wrap items-center gap-x-2">
+              <span className="inline-flex items-center space-x-1 text-slate-200 font-medium">
+                <Briefcase className="w-3.5 h-3.5 text-slate-400" />
+                <span>{effectiveRole}</span>
+              </span>
+              <span>•</span>
+              <span className="font-mono text-slate-400">Сессия: {interviewId}</span>
               {finalizedChecksum && (
-                <span className="ml-2 font-mono text-[11px] text-emerald-400">
-                  • SHA: {finalizedChecksum.substring(0, 10)}...
-                </span>
+                <>
+                  <span>•</span>
+                  <span className="font-mono text-[11px] text-emerald-400">
+                    SHA: {finalizedChecksum.substring(0, 10)}...
+                  </span>
+                </>
               )}
             </p>
           </div>
@@ -1177,12 +1203,12 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
               <div className="p-3 bg-slate-950/70 border border-slate-800/80 rounded-lg space-y-1">
                 <span className="text-[10px] text-slate-500 uppercase font-semibold">Кандидат</span>
-                <p className="font-semibold text-slate-100 text-sm">{plan.title}</p>
+                <p className="font-semibold text-slate-100 text-sm">{effectiveCandidateName}</p>
               </div>
 
               <div className="p-3 bg-slate-950/70 border border-slate-800/80 rounded-lg space-y-1">
                 <span className="text-[10px] text-slate-500 uppercase font-semibold">Должность / Профиль</span>
-                <p className="font-semibold text-slate-100 text-sm">{plan.role}</p>
+                <p className="font-semibold text-slate-100 text-sm">{effectiveRole}</p>
               </div>
 
               <div className="p-3 bg-slate-950/70 border border-slate-800/80 rounded-lg space-y-1">

@@ -37,7 +37,13 @@ import {
 
 interface SetupScreenProps {
   existingInterviewId?: string | null;
-  onInterviewStarted: (interviewId: string, plan: InterviewPlan, captureMode?: CaptureMode) => void;
+  onInterviewStarted: (
+    interviewId: string,
+    plan: InterviewPlan,
+    captureMode?: CaptureMode,
+    candidateName?: string,
+    role?: string
+  ) => void;
   onBackToHome?: () => void;
 }
 
@@ -173,10 +179,13 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
     try {
       let invId = currentInterviewId;
       const effectiveRole = role.trim();
-      const invTitle = `${effectiveRole || 'Интервью'} — ${candidateName.trim() || 'Черновик'}`;
-      const updatedPlan = {
+      const effectiveCandidate = candidateName.trim();
+      const invTitle = `${effectiveRole || 'Интервью'} — ${effectiveCandidate || 'Черновик'}`;
+      const updatedPlan: InterviewPlan = {
         ...plan,
+        title: invTitle,
         role: effectiveRole || plan.role || 'Позиция не указана',
+        candidate_name: effectiveCandidate || undefined,
       };
 
       if (!invId) {
@@ -184,7 +193,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
         await createInterview({
           id: invId,
           title: invTitle,
-          candidate_name: candidateName.trim() || 'Без имени',
+          candidate_name: effectiveCandidate || 'Без имени',
           role: effectiveRole || 'Позиция не указана',
           plan: updatedPlan,
           capture_mode: captureMode,
@@ -193,7 +202,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
       } else {
         await updateInterviewDraft(invId, {
           title: invTitle,
-          candidate_name: candidateName.trim() || 'Без имени',
+          candidate_name: effectiveCandidate || 'Без имени',
           role: effectiveRole || 'Позиция не указана',
           plan: updatedPlan,
           template_id: selectedTemplateId || undefined,
@@ -262,10 +271,13 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
 
     let invId = currentInterviewId;
     const effectiveRole = role.trim();
-    const invTitle = `${effectiveRole} — ${candidateName.trim()}`;
-    const updatedPlan = {
+    const effectiveCandidate = candidateName.trim();
+    const invTitle = `${effectiveRole} — ${effectiveCandidate}`;
+    const updatedPlan: InterviewPlan = {
       ...plan,
+      title: invTitle,
       role: effectiveRole,
+      candidate_name: effectiveCandidate,
     };
 
     try {
@@ -274,7 +286,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
         await createInterview({
           id: invId,
           title: invTitle,
-          candidate_name: candidateName.trim(),
+          candidate_name: effectiveCandidate,
           role: effectiveRole,
           plan: updatedPlan,
           capture_mode: captureMode,
@@ -283,7 +295,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
       } else {
         await updateInterviewDraft(invId, {
           title: invTitle,
-          candidate_name: candidateName.trim(),
+          candidate_name: effectiveCandidate,
           role: effectiveRole,
           plan: updatedPlan,
           template_id: selectedTemplateId || undefined,
@@ -324,7 +336,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
         version: 'consent-v1.0-ru',
       });
 
-      onInterviewStarted(invId, plan, captureMode);
+      onInterviewStarted(invId, updatedPlan, captureMode, effectiveCandidate, effectiveRole);
     } catch (err: any) {
       const message = typeof err === 'string'
         ? err

@@ -20,12 +20,16 @@ import { Square, Pause, Play, CheckCircle, MessageSquare, Quote, Sparkles, Alert
 interface LiveSessionScreenProps {
   interviewId: string;
   plan: InterviewPlan;
+  candidateName?: string;
+  role?: string;
   onFinishSession: (interviewId: string) => void;
 }
 
 export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   interviewId,
   plan,
+  candidateName,
+  role,
   onFinishSession,
 }) => {
   const [elapsedSec, setElapsedSec] = useState(0);
@@ -293,7 +297,11 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
             <span className="w-2.5 h-2.5 rounded-full bg-rose-500 recording-pulse" />
             <span>{formatTime(elapsedSec)}</span>
           </div>
-          <span className="text-xs text-slate-400">Монотонный таймер сессии</span>
+          <div className="hidden sm:flex items-center space-x-2 pl-4 border-l border-slate-800 text-xs">
+            <span className="font-semibold text-slate-100">{candidateName || plan.candidate_name || 'Кандидат'}</span>
+            <span className="text-slate-500">•</span>
+            <span className="text-slate-400">{role || plan.role || 'Позиция не указана'}</span>
+          </div>
         </div>
 
         <div className="flex items-center space-x-3">

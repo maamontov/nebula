@@ -207,4 +207,14 @@ CREATE TABLE IF NOT EXISTS audio_chunks (
 
 CREATE INDEX IF NOT EXISTS idx_audio_chunks_interview ON audio_chunks(interview_id, track_id, sequence);
 
+CREATE TABLE IF NOT EXISTS transcript_assembly_state (
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL,
+    capture_epoch INTEGER NOT NULL,
+    next_sequence INTEGER NOT NULL DEFAULT 0,
+    next_sample_offset INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (interview_id, track_id, capture_epoch)
+);
 
+CREATE INDEX IF NOT EXISTS idx_transcript_assembly ON transcript_assembly_state(interview_id, track_id, capture_epoch);
