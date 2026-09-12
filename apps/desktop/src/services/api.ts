@@ -733,7 +733,14 @@ export async function startBatchRetranscribe(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error(`Batch retranscribe error: ${res.statusText}`);
+  if (!res.ok) {
+    let errDetail = res.statusText;
+    try {
+      const errData = await res.json();
+      if (errData?.detail) errDetail = errData.detail;
+    } catch (_) {}
+    throw new Error(`Batch retranscribe error: ${errDetail}`);
+  }
   return res.json();
 }
 

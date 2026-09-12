@@ -100,7 +100,7 @@ def test_migration_011_job_telemetry(tmp_path):
 
     # Verify column existence and preserved legacy data
     with db.transaction() as cur:
-        assert get_current_migration_version(cur) == 11
+        assert get_current_migration_version(cur) >= 11
         row = cur.execute("SELECT id, status, started_at, completed_at FROM jobs WHERE id = 'job-legacy-1'").fetchone()
         assert row is not None
         assert row["id"] == "job-legacy-1"
@@ -115,7 +115,7 @@ def test_migration_011_job_telemetry(tmp_path):
     # Verify idempotency
     run_migrations(db)
     with db.transaction() as cur:
-        assert get_current_migration_version(cur) == 11
+        assert get_current_migration_version(cur) >= 11
 
 
 def test_job_started_at_and_completed_at_lifecycle(tmp_path):

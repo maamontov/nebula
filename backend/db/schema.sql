@@ -54,11 +54,12 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
 );
 
 CREATE TABLE IF NOT EXISTS transcript_revisions (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
     interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
     revision_number INTEGER NOT NULL DEFAULT 1,
     is_batch_final INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
+    PRIMARY KEY (interview_id, id),
     UNIQUE (interview_id, revision_number)
 );
 

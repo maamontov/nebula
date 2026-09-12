@@ -10,6 +10,7 @@ adaptive noise floor, silence thresholds, pre-roll/post-roll margins, and max du
 """
 from __future__ import annotations
 
+import bisect
 import math
 import struct
 from dataclasses import dataclass, field
@@ -47,6 +48,16 @@ class AudioChunkRef:
     channels: int
     format: str
     pcm_bytes: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkSpan:
+    sequence: int
+    stream_sample_start: int
+    stream_sample_end: int
+    chunk_sample_start: int
+    start_time_ms: int
+    sample_rate: int
 
 
 @dataclass(frozen=True)
@@ -266,7 +277,8 @@ class TurnAssembler:
         frame_bytes_list: list[bytes] = []
 
         total_samples = 0
-        sample_map: list[tuple[int, int, int]] = []  # (seq, sample_offset_in_chunk, time_ms)
+        spans: list[_ChunkSpan] = []
+        span_ends: list[int] = []
         pcm_stream = bytearray()
 
         for chunk in group:
@@ -277,13 +289,22 @@ class TurnAssembler:
 
             active_bytes = chunk.pcm_bytes[start_sample * BYTES_PER_SAMPLE :]
             pcm_stream.extend(active_bytes)
+            num_samples = chunk_samples - start_sample
 
-            for s_idx in range(start_sample, chunk_samples):
-                t_ms = chunk.start_time_ms + int(s_idx * 1000 / chunk.sample_rate)
-                sample_map.append((chunk.sequence, s_idx, t_ms))
-            total_samples += (chunk_samples - start_sample)
+            spans.append(
+                _ChunkSpan(
+                    sequence=chunk.sequence,
+                    stream_sample_start=total_samples,
+                    stream_sample_end=total_samples + num_samples,
+                    chunk_sample_start=start_sample,
+                    start_time_ms=chunk.start_time_ms,
+                    sample_rate=chunk.sample_rate,
+                )
+            )
+            total_samples += num_samples
+            span_ends.append(total_samples)
 
-        if not sample_map:
+        if not spans or total_samples == 0:
             return TurnAssemblerOutput(
                 turns=[],
                 next_sequence=cursor.sequence,
@@ -291,6 +312,17 @@ class TurnAssembler:
                 has_open_tail=False,
                 open_tail_duration_ms=0,
             )
+
+        def resolve_sample(stream_sample_idx: int) -> tuple[int, int, int]:
+            """Returns (sequence, sample_offset_in_chunk, time_ms) for a sample index in pcm_stream."""
+            idx = bisect.bisect_right(span_ends, stream_sample_idx)
+            if idx >= len(spans):
+                idx = len(spans) - 1
+            span = spans[idx]
+            offset_in_span = stream_sample_idx - span.stream_sample_start
+            chunk_off = span.chunk_sample_start + offset_in_span
+            t_ms = span.start_time_ms + int(chunk_off * 1000 / span.sample_rate)
+            return span.sequence, chunk_off, t_ms
 
         # Segment pcm_stream into frames
         num_frames = len(pcm_stream) // self.bytes_per_frame
@@ -301,7 +333,7 @@ class TurnAssembler:
             frame_bytes_list.append(f_bytes)
 
             sample_start_idx = f_idx * self.samples_per_frame
-            s_seq, s_off, s_time = sample_map[sample_start_idx]
+            s_seq, s_off, s_time = resolve_sample(sample_start_idx)
 
             rms, dbfs = calculate_frame_rms_dbfs(f_bytes)
 
@@ -347,10 +379,10 @@ class TurnAssembler:
 
         def emit_turn(start_f: int, end_f: int) -> None:
             start_sample_idx = start_f * self.samples_per_frame
-            end_sample_idx = min((end_f + 1) * self.samples_per_frame, len(sample_map))
+            end_sample_idx = min((end_f + 1) * self.samples_per_frame, total_samples)
 
-            first_seq, first_off, start_ms = sample_map[start_sample_idx]
-            last_seq, last_off, _ = sample_map[end_sample_idx - 1]
+            first_seq, first_off, start_ms = resolve_sample(start_sample_idx)
+            last_seq, last_off, _ = resolve_sample(end_sample_idx - 1)
             end_sample_offset = last_off + 1
 
             # Find the chunk containing the last sample to calculate exact end_ms
@@ -429,7 +461,7 @@ class TurnAssembler:
                 has_open_tail = True
                 open_tail_duration_ms = (len(frames) - speech_start_frame) * self.frame_ms
                 start_sample_idx = speech_start_frame * self.samples_per_frame
-                next_seq, next_off, _ = sample_map[start_sample_idx]
+                next_seq, next_off, _ = resolve_sample(start_sample_idx)
                 return TurnAssemblerOutput(
                     turns=turns,
                     next_sequence=next_seq,
@@ -444,8 +476,8 @@ class TurnAssembler:
             next_off = 0
         else:
             discard_until_frame = max(last_committed_frame_end, len(frames) - pre_roll_frames)
-            discard_sample_idx = min(discard_until_frame * self.samples_per_frame, len(sample_map) - 1)
-            next_seq, next_off, _ = sample_map[discard_sample_idx]
+            discard_sample_idx = min(discard_until_frame * self.samples_per_frame, total_samples - 1)
+            next_seq, next_off, _ = resolve_sample(discard_sample_idx)
 
         return TurnAssemblerOutput(
             turns=turns,

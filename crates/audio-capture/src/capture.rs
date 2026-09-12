@@ -466,6 +466,25 @@ impl CaptureHandle {
     }
 }
 
+impl Drop for CaptureHandle {
+    fn drop(&mut self) {
+        if let Some(ctrl) = self.stream_ctrl.take() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = ctrl.send(StreamControlMsg::Stop(tx));
+            let _ = rx.recv();
+        }
+        if let Some(th) = self.stream_thread.take() {
+            let _ = th.join();
+        }
+
+        self.is_running.store(false, Ordering::SeqCst);
+
+        if let Some(th) = self.worker_thread.take() {
+            let _ = th.join();
+        }
+    }
+}
+
 /// Spawns a dedicated audio capture pipeline for a single track.
 /// Realtime callback feeds a lock-free ring buffer;
 /// Worker thread drains buffer, downsamples to 16kHz mono, and spools chunks.

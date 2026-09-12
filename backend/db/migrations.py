@@ -42,7 +42,7 @@ def run_migrations(db: Database) -> int:
     finally:
         conn.close()
 
-    TARGET_VERSION = 11
+    TARGET_VERSION = 12
     if current_version < TARGET_VERSION and db.db_path != ":memory:" and Path(db.db_path).exists():
         # Make verified pre-migration backup if not in-memory
         backup_dir = Path(os.getenv("NEBULA_BACKUP_DIR", "data/backups")).resolve()
@@ -647,6 +647,126 @@ def run_migrations(db: Database) -> int:
         if not db.verify_integrity():
             raise RuntimeError("Database integrity check failed after running migration 011!")
         current_version = 11
+
+    if current_version < 12:
+        with db.transaction() as tx_conn:
+            tx_conn.execute("PRAGMA foreign_keys = OFF;")
+            tx_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transcript_revisions_v12 (
+                    id TEXT NOT NULL,
+                    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+                    revision_number INTEGER NOT NULL DEFAULT 1,
+                    is_batch_final INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (interview_id, id),
+                    UNIQUE (interview_id, revision_number)
+                );
+                """
+            )
+            # 1. Copy existing transcript_revisions if present
+            table_exists = bool(
+                tx_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='transcript_revisions'"
+                ).fetchone()
+            )
+            if table_exists:
+                tx_conn.execute(
+                    """
+                    INSERT OR IGNORE INTO transcript_revisions_v12 (
+                        id, interview_id, revision_number, is_batch_final, created_at
+                    )
+                    SELECT id, interview_id, revision_number, is_batch_final, created_at
+                    FROM transcript_revisions;
+                    """
+                )
+
+            # 2. Recover any missing revisions referenced in transcript_segments or interviews.active_transcript_revision_id
+            now_iso = datetime.now(UTC).isoformat()
+            interviews_exists = bool(
+                tx_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='interviews'"
+                ).fetchone()
+            )
+            segments_exists = bool(
+                tx_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='transcript_segments'"
+                ).fetchone()
+            )
+            interviews_rows = []
+            has_active_rev = False
+            if interviews_exists:
+                inv_cols = [r["name"] for r in tx_conn.execute("PRAGMA table_info(interviews)").fetchall()]
+                has_active_rev = "active_transcript_revision_id" in inv_cols
+                query = (
+                    "SELECT id, active_transcript_revision_id, created_at FROM interviews"
+                    if has_active_rev
+                    else "SELECT id, created_at FROM interviews"
+                )
+                interviews_rows = tx_conn.execute(query).fetchall()
+
+            for inv in interviews_rows:
+                inv_id = inv["id"]
+                inv_created = inv["created_at"] or now_iso
+                active_rev = inv["active_transcript_revision_id"] if has_active_rev else None
+
+                v12_rows = tx_conn.execute(
+                    "SELECT id, revision_number FROM transcript_revisions_v12 WHERE interview_id = ?",
+                    (inv_id,),
+                ).fetchall()
+                existing_rev_ids = {r["id"] for r in v12_rows}
+                existing_nums = {r["revision_number"] for r in v12_rows}
+
+                seg_revs = []
+                if segments_exists:
+                    seg_revs = [
+                        row[0]
+                        for row in tx_conn.execute(
+                            "SELECT DISTINCT revision_id FROM transcript_segments WHERE interview_id = ? AND revision_id IS NOT NULL",
+                            (inv_id,),
+                        ).fetchall()
+                    ]
+                needed_revs = set(seg_revs)
+                if active_rev:
+                    needed_revs.add(active_rev)
+
+                for r_id in sorted(needed_revs):
+                    if r_id not in existing_rev_ids:
+                        rev_num = 1
+                        if r_id.startswith("trans-rev-"):
+                            import contextlib
+                            with contextlib.suppress(ValueError):
+                                rev_num = int(r_id.split("-")[-1])
+                        if rev_num in existing_nums:
+                            rev_num = (max(existing_nums) if existing_nums else 0) + 1
+
+                        tx_conn.execute(
+                            """
+                            INSERT INTO transcript_revisions_v12 (
+                                id, interview_id, revision_number, is_batch_final, created_at
+                            ) VALUES (?, ?, ?, 0, ?)
+                            """,
+                            (r_id, inv_id, rev_num, inv_created),
+                        )
+                        existing_rev_ids.add(r_id)
+                        existing_nums.add(rev_num)
+
+            if table_exists:
+                tx_conn.execute("DROP TABLE transcript_revisions;")
+            tx_conn.execute("ALTER TABLE transcript_revisions_v12 RENAME TO transcript_revisions;")
+            tx_conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transcript_revisions_interview ON transcript_revisions(interview_id, revision_number);"
+            )
+
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (12, '012_transcript_revisions_composite_pk', ?)",
+                (now_iso,),
+            )
+            tx_conn.execute("PRAGMA foreign_keys = ON;")
+
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 012!")
+        current_version = 12
 
     logger.info("Successfully ensured database schema up to version %d", current_version)
     return current_version

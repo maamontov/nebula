@@ -166,22 +166,40 @@ export type FollowUpTrigger = 'auto' | 'manual';
 
 export type FollowUpStatus = 'suggested' | 'asked' | 'dismissed';
 
+export interface EvidenceRef {
+  segment_id: string;
+  exact_quote: string;
+  track_id?: string | null;
+}
+
 export interface FollowUpSuggestion {
   id: string;
   interview_id: string;
   question_id: string;
   request_id: string;
+  rubric_revision_id?: string;
+  transcript_revision_id?: string;
   kind: FollowUpKind;
-  suggested_text: string;
-  rationale: string;
-  evidence_quote?: string | null;
-  evidence_segment_id?: string | null;
+  question_text: string;
+  purpose: string;
+  criterion_ids?: string[];
+  source_refs?: EvidenceRef[];
   status: FollowUpStatus;
   asked_text?: string | null;
+  ordinal?: number;
+  decided_at?: string | null;
   decision_version: number;
   is_stale: boolean;
+  stale_reason?: string | null;
+  has_new_answer?: boolean;
   created_at: string;
-  updated_at: string;
+  updated_at?: string;
+
+  // Backward-compatibility aliases
+  suggested_text?: string;
+  rationale?: string;
+  evidence_quote?: string | null;
+  evidence_segment_id?: string | null;
 }
 
 export interface FollowUpsStateResponse {

@@ -141,3 +141,78 @@ def test_forbidden_personal_bias_blocked(sample_transcript):
     result = validate_proposal(proposal, sample_transcript)
     assert result.is_valid is False
     assert any("forbidden attribute reference" in err for err in result.errors)
+
+
+def test_technical_terms_do_not_trigger_false_positive_bias(sample_transcript):
+    """
+    R7: Words like 'message', 'storage', 'coverage', 'акцент на репликации', 'старый сервер'
+    must not trigger forbidden personal bias.
+    """
+    valid_explanations = [
+        "Candidate clearly explains message queues and storage partitioning.",
+        "Candidate made a clear coverage assessment and leverage analysis.",
+        "Кандидат сделал акцент на масштабируемости и репликации данных.",
+        "Описан перенос нагрузки со старого сервера на новый кластер.",
+    ]
+    for exp in valid_explanations:
+        proposal = AssessmentProposal(
+            id="prop-tech",
+            interview_id="inv-1",
+            question_id="q-saga",
+            rubric_revision_id="rub-1",
+            transcript_revision_id="tx-rev-1",
+            model_profile_id="test-model",
+            scores=[
+                CriterionScoreProposal(
+                    criterion_id="crit-arch",
+                    score=4.0,
+                    explanation=exp,
+                    evidence=[
+                        EvidenceRef(
+                            segment_id="seg-2",
+                            exact_quote="паттерн Saga",
+                        )
+                    ],
+                )
+            ],
+        )
+        res = validate_proposal(proposal, sample_transcript)
+        assert res.is_valid is True, f"Explanation '{exp}' failed validation: {res.errors}"
+
+
+def test_genuine_protected_attributes_are_strictly_blocked(sample_transcript):
+    """Real age, gender, accent, nationality or appearance judgments are blocked."""
+    invalid_explanations = [
+        ("Candidate's age is an issue for this fast-paced startup role.", "возраст"),
+        ("Кандидат слишком старый для нашей молодой команды.", "возрастная дискриминация"),
+        ("Кандидат женщина, поэтому ей будет сложно руководить мужским отделом.", "пол кандидата"),
+        ("У кандидата слишком явный акцент в речи.", "акцент"),
+        ("Оценка снижена из-за национальности кандидата.", "национальность"),
+    ]
+    for exp, expected_bias in invalid_explanations:
+        proposal = AssessmentProposal(
+            id="prop-bias",
+            interview_id="inv-1",
+            question_id="q-saga",
+            rubric_revision_id="rub-1",
+            transcript_revision_id="tx-rev-1",
+            model_profile_id="test-model",
+            scores=[
+                CriterionScoreProposal(
+                    criterion_id="crit-arch",
+                    score=2.0,
+                    explanation=exp,
+                    evidence=[
+                        EvidenceRef(
+                            segment_id="seg-2",
+                            exact_quote="паттерн Saga",
+                        )
+                    ],
+                )
+            ],
+        )
+        res = validate_proposal(proposal, sample_transcript)
+        assert any(
+            "forbidden attribute reference" in err and expected_bias in err
+            for err in res.errors
+        )

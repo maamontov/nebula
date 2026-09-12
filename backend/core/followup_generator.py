@@ -12,8 +12,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.core.evidence_validator import (
-    FORBIDDEN_ATTRIBUTES_KEYWORDS,
     SUSPICIOUS_INJECTION_PATTERNS,
+    find_forbidden_attributes,
     validate_evidence_quote,
 )
 from backend.core.matcher import QuestionMatcher
@@ -459,14 +459,14 @@ def validate_followup_response(
             errors.append(f"{sug_prefix}: purpose length {len(purpose)} out of [1, 240].")
 
         # 4. Check forbidden personal attributes bias in question and purpose
-        combined_text = f"{q_text} {purpose}".lower()
-        for forbidden in FORBIDDEN_ATTRIBUTES_KEYWORDS:
-            if forbidden in combined_text:
-                errors.append(f"{sug_prefix} contains forbidden attribute keyword: '{forbidden}'.")
+        combined_text = f"{q_text} {purpose}"
+        forbidden_matches = find_forbidden_attributes(combined_text)
+        for forbidden in forbidden_matches:
+            errors.append(f"{sug_prefix} contains forbidden attribute keyword: '{forbidden}'.")
 
         # 5. Check prompt injection traces
         for pattern in SUSPICIOUS_INJECTION_PATTERNS:
-            if re.search(pattern, combined_text):
+            if re.search(pattern, combined_text, re.IGNORECASE):
                 errors.append(f"{sug_prefix} contains suspicious injection pattern: '{pattern}'.")
 
         # 6. Check criteria IDs

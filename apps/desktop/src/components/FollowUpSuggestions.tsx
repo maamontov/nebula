@@ -311,6 +311,7 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
     setErrorMessage(null);
     setStateResponse(null);
     setIsGenerating(false);
+    setActiveMode('probe');
   }, [questionId]);
 
   // Lifecycle mount / unmount cleanup
@@ -335,7 +336,7 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
       setErrorMessage(null);
       await patchFollowUpSuggestion(interviewId, suggestion.id, {
         status,
-        asked_text: customAskedText !== undefined ? customAskedText : (status === 'asked' ? suggestion.suggested_text : null),
+        asked_text: customAskedText !== undefined ? customAskedText : (status === 'asked' ? (suggestion.question_text || suggestion.suggested_text) : null),
         expected_decision_version: suggestion.decision_version,
       });
       setEditingId(null);
@@ -623,43 +624,75 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
                 ) : (
                   <div>
                     <p className="text-xs font-medium text-slate-100 leading-relaxed">
-                      {s.asked_text || s.suggested_text}
+                      {s.asked_text || s.question_text || s.suggested_text}
                     </p>
-                    {s.asked_text && s.asked_text !== s.suggested_text && (
+                    {s.asked_text && s.asked_text !== (s.question_text || s.suggested_text) && (
                       <p className="text-[10px] text-slate-400 italic mt-0.5">
-                        Исходный: «{s.suggested_text}»
+                        Исходный: «{s.question_text || s.suggested_text}»
                       </p>
                     )}
                   </div>
                 )}
 
-                {/* Rationale */}
-                {s.rationale && (
+                {/* Purpose / Rationale */}
+                {(s.purpose || s.rationale) && (
                   <p className="text-[11px] text-slate-400 leading-normal">
-                    {s.rationale}
+                    {s.purpose || s.rationale}
                   </p>
                 )}
 
-                {/* Evidence Quote with Clickable Transcript Jump */}
-                {s.evidence_quote && (
-                  <div
-                    onClick={() => {
-                      if (s.evidence_segment_id) {
-                        onLocateSegment(s.evidence_segment_id);
-                      }
-                    }}
-                    className={`group p-2 rounded border text-[11px] flex items-start space-x-1.5 transition cursor-pointer ${
-                      s.evidence_segment_id
-                        ? 'bg-slate-900/80 hover:bg-indigo-950/40 border-slate-800 hover:border-indigo-600 text-slate-300'
-                        : 'bg-slate-900/50 border-slate-800 text-slate-400'
-                    }`}
-                    title={s.evidence_segment_id ? 'Перейти к цитате в стенограмме' : undefined}
-                  >
-                    <Quote className="w-3 h-3 text-indigo-400 shrink-0 mt-0.5" />
-                    <div className="flex-1 italic leading-snug">«{s.evidence_quote}»</div>
-                    {s.evidence_segment_id && (
-                      <ExternalLink className="w-2.5 h-2.5 text-indigo-400 group-hover:text-amber-300 shrink-0 mt-0.5" />
-                    )}
+                {/* Evidence Quotes / Source Refs with Clickable Transcript Jump */}
+                {((s.source_refs && s.source_refs.length > 0) || s.evidence_quote) && (
+                  <div className="space-y-1">
+                    {s.source_refs && s.source_refs.length > 0 ? (
+                      s.source_refs.map((ref, idx) => {
+                        const segId = ref.segment_id || (ref as any).turn_id;
+                        const quoteText = ref.exact_quote || (ref as any).quote;
+                        if (!quoteText) return null;
+                        return (
+                          <div
+                            key={idx}
+                            onClick={() => {
+                              if (segId) {
+                                onLocateSegment(segId);
+                              }
+                            }}
+                            className={`group p-2 rounded border text-[11px] flex items-start space-x-1.5 transition cursor-pointer ${
+                              segId
+                                ? 'bg-slate-900/80 hover:bg-indigo-950/40 border-slate-800 hover:border-indigo-600 text-slate-300'
+                                : 'bg-slate-900/50 border-slate-800 text-slate-400'
+                            }`}
+                            title={segId ? 'Перейти к цитате в стенограмме' : undefined}
+                          >
+                            <Quote className="w-3 h-3 text-indigo-400 shrink-0 mt-0.5" />
+                            <div className="flex-1 italic leading-snug">«{quoteText}»</div>
+                            {segId && (
+                              <ExternalLink className="w-2.5 h-2.5 text-indigo-400 group-hover:text-amber-300 shrink-0 mt-0.5" />
+                            )}
+                          </div>
+                        );
+                      })
+                    ) : s.evidence_quote ? (
+                      <div
+                        onClick={() => {
+                          if (s.evidence_segment_id) {
+                            onLocateSegment(s.evidence_segment_id);
+                          }
+                        }}
+                        className={`group p-2 rounded border text-[11px] flex items-start space-x-1.5 transition cursor-pointer ${
+                          s.evidence_segment_id
+                            ? 'bg-slate-900/80 hover:bg-indigo-950/40 border-slate-800 hover:border-indigo-600 text-slate-300'
+                            : 'bg-slate-900/50 border-slate-800 text-slate-400'
+                        }`}
+                        title={s.evidence_segment_id ? 'Перейти к цитате в стенограмме' : undefined}
+                      >
+                        <Quote className="w-3 h-3 text-indigo-400 shrink-0 mt-0.5" />
+                        <div className="flex-1 italic leading-snug">«{s.evidence_quote}»</div>
+                        {s.evidence_segment_id && (
+                          <ExternalLink className="w-2.5 h-2.5 text-indigo-400 group-hover:text-amber-300 shrink-0 mt-0.5" />
+                        )}
+                      </div>
+                    ) : null}
                   </div>
                 )}
 
@@ -670,7 +703,7 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
                       type="button"
                       onClick={() => {
                         setEditingId(s.id);
-                        setEditingText(s.suggested_text);
+                        setEditingText(s.question_text || s.suggested_text || '');
                       }}
                       className="flex items-center space-x-1 text-[10px] text-slate-400 hover:text-indigo-300 transition"
                       title="Отредактировать формулировку перед подтверждением"

@@ -56,6 +56,7 @@ from backend.core.profiles import (
 from backend.core.revisions import TranscriptDiffEngine
 from backend.core.summary_generator import ExecutiveSummaryGenerator
 from backend.core.turn_assembler import (
+    AssembledTurn,
     AudioChunkRef,
     TurnAssembler,
     TurnAssemblyCursor,
@@ -89,13 +90,13 @@ def is_pcm_silence(audio_bytes: bytes, threshold_mean_abs: float = 12.0) -> bool
     return mean_abs < threshold_mean_abs
 
 
-DEFAULT_JOB_DEADLINES: dict[str, float] = {
+DEFAULT_JOB_DEADLINES: dict[str, float | None] = {
     "TRANSCRIBE_AUDIO": 30.0,
     "TRANSCRIBE_TURN": 30.0,
     "EVALUATE_QUESTION": 30.0,
     "GENERATE_FOLLOWUPS": 20.0,
     "GENERATE_SUMMARY": 60.0,
-    "BATCH_RETRANSCRIBE": 120.0,
+    "BATCH_RETRANSCRIBE": None,
 }
 
 
@@ -221,7 +222,10 @@ class PipelineWorker:
                     raise ValueError(f"Unknown job type: {job_type}")
 
             deadline_sec = DEFAULT_JOB_DEADLINES.get(job_type, 60.0)
-            res_meta = await asyncio.wait_for(_run_handler(), timeout=deadline_sec)
+            if deadline_sec is not None and deadline_sec > 0:
+                res_meta = await asyncio.wait_for(_run_handler(), timeout=deadline_sec)
+            else:
+                res_meta = await _run_handler()
 
             if cancel_event.is_set():
                 raise RepositoryConflictError(f"Job {job_id} lease lost during execution, aborting commit")
@@ -255,7 +259,7 @@ class PipelineWorker:
         except Exception as exc:
             logger.exception("Job %s (%s) failed", job_id, job_type)
             is_terminal = getattr(exc, "is_terminal", False)
-            if isinstance(exc, (LLMAuthenticationError, STTAuthenticationError)):
+            if isinstance(exc, (LLMAuthenticationError, STTAuthenticationError, RepositoryConflictError)):
                 is_terminal = True
 
             retry_delay_sec = 0
@@ -984,22 +988,36 @@ Respond strictly with a JSON object conforming to:
         owner_token: str | None = None,
         job_id: str | None = None,
     ) -> None:
+        inv = self.repo.get_interview(interview_id)
+        if not inv or inv.get("status") == "deleted":
+            logger.warning("Interview %s was deleted before batch retranscribe.", interview_id)
+            return
+
+        old_rev_id = payload.get("old_revision_id") or inv.get("active_transcript_revision_id") or "trans-rev-1"
+
         existing_revs = self.repo.get_transcript_revisions(interview_id)
         existing_rev_ids = {r["id"] for r in existing_revs}
         new_rev_id = payload.get("new_revision_id")
-        if not new_rev_id or new_rev_id in existing_rev_ids:
+        if not new_rev_id:
             next_num = len(existing_revs) + 1
             while f"trans-rev-{next_num}" in existing_rev_ids:
                 next_num += 1
             new_rev_id = f"trans-rev-{next_num}"
             revision_number = next_num
         else:
-            revision_number = payload.get("revision_number", len(existing_revs) + 1)
+            existing_rev = next((r for r in existing_revs if r["id"] == new_rev_id), None)
+            revision_number = (
+                existing_rev["revision_number"]
+                if existing_rev
+                else payload.get("revision_number", len(existing_revs) + 1)
+            )
 
-        old_rev_id = payload.get("old_revision_id", "trans-rev-1")
-
-        if not self.repo.get_interview(interview_id):
-            logger.warning("Interview %s was deleted before batch retranscribe.", interview_id)
+        if inv.get("active_transcript_revision_id") == new_rev_id:
+            logger.info(
+                "Batch revision %s is already published and active for interview %s. Skipping re-processing.",
+                new_rev_id,
+                interview_id,
+            )
             return
 
         self.repo.create_transcript_revision(
@@ -1008,6 +1026,37 @@ Respond strictly with a JSON object conforming to:
             revision_number=revision_number,
             is_batch_final=True,
         )
+
+        old_segs = self.repo.get_transcript_segments(interview_id, revision_id=old_rev_id)
+        if not old_segs:
+            old_segs = self.repo.get_transcript_segments(interview_id)
+
+        def resolve_speaker_role(t_id: str, seg_start: int, seg_end: int) -> str:
+            if t_id in ("candidate", "interviewer"):
+                return t_id
+            roles_overlapping = set()
+            best_overlap = 0
+            inherited_role = "unknown"
+            for old_s in old_segs:
+                old_role = old_s.get("speaker_role")
+                if old_role in ("candidate", "interviewer"):
+                    o_start = max(seg_start, old_s.get("start_time_ms", 0))
+                    o_end = min(seg_end, old_s.get("end_time_ms", 0))
+                    overlap = max(0, o_end - o_start)
+                    if overlap > 0:
+                        roles_overlapping.add(old_role)
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            inherited_role = old_role
+            if len(roles_overlapping) == 1:
+                return inherited_role
+            return "unknown"
+
+        # Checkpoint and staged segments recovery
+        checkpoint = payload.get("checkpoint") or {}
+        empty_turns: set[str] = set(checkpoint.get("empty_turns", []))
+        existing_staged = self.repo.get_transcript_segments(interview_id, revision_id=new_rev_id)
+        staged_segs_map: dict[str, dict[str, Any]] = {s["id"]: s for s in existing_staged}
 
         # Ingest new segments
         new_segments = payload.get("segments")
@@ -1022,16 +1071,33 @@ Respond strictly with a JSON object conforming to:
                 chunks_by_group.setdefault(key, []).append(c)
 
             new_segments = []
-            assembler = TurnAssembler()
 
             for (track_id, epoch), group_chunks in chunks_by_group.items():
                 group_chunks.sort(key=lambda c: c["sequence"])
-                chunk_refs: list[AudioChunkRef] = []
-                for c in group_chunks:
-                    fp_str = c.get("file_path")
-                    if fp_str and Path(fp_str).exists():
+                assembler = TurnAssembler()
+                chunk_window_size = 50
+                total_chunks = len(group_chunks)
+                chunk_idx = 0
+                cursor = TurnAssemblyCursor(group_chunks[0]["sequence"], 0)
+                turns_to_transcribe: list[AssembledTurn] = []
+
+                while chunk_idx < total_chunks:
+                    window_slice = group_chunks[chunk_idx : chunk_idx + chunk_window_size]
+                    is_last_window = (chunk_idx + chunk_window_size >= total_chunks)
+
+                    chunk_refs: list[AudioChunkRef] = []
+                    for c in window_slice:
+                        fp_str = c.get("file_path")
+                        if not fp_str or not Path(fp_str).exists():
+                            raise ValueError(
+                                f"Audio chunk file {fp_str} missing or corrupted for chunk sequence={c.get('sequence')}"
+                            )
                         raw_bytes = Path(fp_str).read_bytes()
-                        pcm = raw_bytes[44:] if raw_bytes.startswith(b"RIFF") and len(raw_bytes) >= 44 else raw_bytes
+                        pcm = (
+                            raw_bytes[44:]
+                            if raw_bytes.startswith(b"RIFF") and len(raw_bytes) >= 44
+                            else raw_bytes
+                        )
                         chunk_refs.append(
                             AudioChunkRef(
                                 sequence=c["sequence"],
@@ -1044,18 +1110,58 @@ Respond strictly with a JSON object conforming to:
                             )
                         )
 
-                if not chunk_refs:
-                    continue
+                    if not chunk_refs:
+                        chunk_idx += chunk_window_size
+                        continue
 
-                assembly_out = assembler.assemble(
-                    chunks=chunk_refs,
-                    cursor=TurnAssemblyCursor(group_chunks[0]["sequence"], 0),
-                    is_flush=True,
-                    track_id=track_id,
-                    capture_epoch=epoch,
-                )
+                    assembly_out = assembler.assemble(
+                        chunks=chunk_refs,
+                        cursor=cursor,
+                        is_flush=is_last_window,
+                        track_id=track_id,
+                        capture_epoch=epoch,
+                    )
+                    turns_to_transcribe.extend(assembly_out.turns)
+                    cursor = TurnAssemblyCursor(assembly_out.next_sequence, assembly_out.next_sample_offset)
 
-                for turn in assembly_out.turns:
+                    del chunk_refs
+
+                    next_idx = next(
+                        (i for i, c in enumerate(group_chunks) if c["sequence"] >= cursor.sequence),
+                        total_chunks,
+                    )
+                    if next_idx <= chunk_idx and not is_last_window:
+                        chunk_idx += max(1, chunk_window_size // 2)
+                    else:
+                        chunk_idx = next_idx
+
+                for turn in turns_to_transcribe:
+                    turn_seg_id = (
+                        f"seg-b-{track_id}-{epoch}-{turn.first_sequence}-"
+                        f"{turn.first_sample_offset}-{turn.last_sequence}-{turn.last_sample_offset}"
+                    )
+
+                    # Resume from staged segments if already transcribed on earlier attempt
+                    if turn_seg_id in staged_segs_map:
+                        new_segments.append(staged_segs_map[turn_seg_id])
+                        continue
+
+                    if turn_seg_id in empty_turns:
+                        continue
+
+                    # Yield event loop to allow other tasks to proceed
+                    await asyncio.sleep(0)
+
+                    # Renew lease during long processing
+                    if job_id and owner_token:
+                        lease_ok = self.repo.update_job_checkpoint(
+                            job_id, owner_token, {}, extension_sec=120
+                        )
+                        if not lease_ok:
+                            raise RepositoryConflictError(
+                                f"Job {job_id} lease lost during batch retranscribe"
+                            )
+
                     pcm_bytes = self.repo.get_turn_audio_pcm(
                         interview_id=interview_id,
                         track_id=track_id,
@@ -1066,14 +1172,18 @@ Respond strictly with a JSON object conforming to:
                         last_sample_offset=turn.last_sample_offset,
                     )
                     if not pcm_bytes:
+                        empty_turns.add(turn_seg_id)
                         continue
 
                     wav_bytes = pcm_s16le_to_wav_bytes(pcm_bytes, turn.sample_rate, turn.channels)
                     async with self._provider_semaphore:
-                        res = await self.stt_adapter.transcribe_audio(
-                            wav_bytes,
-                            filename=f"batch_{track_id}_{turn.first_sequence}_{turn.last_sequence}.wav",
-                            content_type="audio/wav",
+                        res = await asyncio.wait_for(
+                            self.stt_adapter.transcribe_audio(
+                                wav_bytes,
+                                filename=f"batch_{track_id}_{turn.first_sequence}_{turn.last_sequence}.wav",
+                                content_type="audio/wav",
+                            ),
+                            timeout=60.0,
                         )
                     text_val = res.text.strip()
                     whisper_hallucinations = {
@@ -1091,60 +1201,68 @@ Respond strictly with a JSON object conforming to:
                         and text_val not in (".", "...", ",", "!", "?", "—", "-")
                         and text_val.lower() not in whisper_hallucinations
                     ):
-                        new_segments.append({
-                            "id": f"seg-b-{track_id}-{epoch}-{turn.first_sequence}-{turn.first_sample_offset}-{turn.last_sequence}-{turn.last_sample_offset}",
+                        assigned_role = resolve_speaker_role(track_id, turn.start_ms, turn.end_ms)
+                        # Save segment immediately into staged revision
+                        self.repo.add_transcript_segment(
+                            segment_id=turn_seg_id,
+                            interview_id=interview_id,
+                            track_id=track_id,
+                            start_time_ms=turn.start_ms,
+                            end_time_ms=turn.end_ms,
+                            text=text_val,
+                            is_final=True,
+                            revision_id=new_rev_id,
+                            speaker_role=assigned_role,
+                        )
+                        seg_dict = {
+                            "id": turn_seg_id,
                             "track_id": track_id,
                             "start_time_ms": turn.start_ms,
                             "end_time_ms": turn.end_ms,
                             "text": text_val,
-                        })
-
-        old_segs = self.repo.get_transcript_segments(interview_id, revision_id=old_rev_id)
-        if not old_segs:
-            old_segs = self.repo.get_transcript_segments(interview_id)
-
-        for seg in new_segments:
-            assigned_role = seg.get("speaker_role")
-            if not assigned_role or assigned_role == "unknown":
-                t_id = seg.get("track_id", "candidate")
-                if t_id in ("candidate", "interviewer"):
-                    assigned_role = t_id
-                else:
-                    seg_start = seg.get("start_time_ms", 0)
-                    seg_end = seg.get("end_time_ms", 0)
-                    roles_overlapping = set()
-                    best_overlap = 0
-                    inherited_role = "unknown"
-                    for old_s in old_segs:
-                        old_role = old_s.get("speaker_role")
-                        if old_role in ("candidate", "interviewer"):
-                            o_start = max(seg_start, old_s.get("start_time_ms", 0))
-                            o_end = min(seg_end, old_s.get("end_time_ms", 0))
-                            overlap = max(0, o_end - o_start)
-                            if overlap > 0:
-                                roles_overlapping.add(old_role)
-                                if overlap > best_overlap:
-                                    best_overlap = overlap
-                                    inherited_role = old_role
-                    if len(roles_overlapping) > 1:
-                        assigned_role = "unknown"
-                    elif len(roles_overlapping) == 1:
-                        assigned_role = inherited_role
+                            "speaker_role": assigned_role,
+                        }
+                        staged_segs_map[turn_seg_id] = seg_dict
+                        new_segments.append(seg_dict)
+                        if job_id and owner_token:
+                            self.repo.update_job_checkpoint(
+                                job_id,
+                                owner_token,
+                                {"last_turn_id": turn_seg_id},
+                                extension_sec=120,
+                            )
                     else:
-                        assigned_role = "unknown"
+                        empty_turns.add(turn_seg_id)
+                        if job_id and owner_token:
+                            self.repo.update_job_checkpoint(
+                                job_id,
+                                owner_token,
+                                {"empty_turns": [turn_seg_id]},
+                                extension_sec=120,
+                            )
+        else:
+            # Manual import segments provided directly
+            for seg in new_segments:
+                assigned_role = seg.get("speaker_role")
+                if not assigned_role or assigned_role == "unknown":
+                    assigned_role = resolve_speaker_role(
+                        seg.get("track_id", "candidate"),
+                        seg.get("start_time_ms", 0),
+                        seg.get("end_time_ms", 0),
+                    )
+                    seg["speaker_role"] = assigned_role
 
-
-            self.repo.add_transcript_segment(
-                segment_id=seg["id"],
-                interview_id=interview_id,
-                track_id=seg.get("track_id", "candidate"),
-                start_time_ms=seg.get("start_time_ms", 0),
-                end_time_ms=seg.get("end_time_ms", 0),
-                text=seg.get("text", "").strip(),
-                is_final=True,
-                revision_id=new_rev_id,
-                speaker_role=assigned_role,
-            )
+                self.repo.add_transcript_segment(
+                    segment_id=seg["id"],
+                    interview_id=interview_id,
+                    track_id=seg.get("track_id", "candidate"),
+                    start_time_ms=seg.get("start_time_ms", 0),
+                    end_time_ms=seg.get("end_time_ms", 0),
+                    text=seg.get("text", "").strip(),
+                    is_final=True,
+                    revision_id=new_rev_id,
+                    speaker_role=assigned_role,
+                )
 
         # Run TranscriptDiffEngine
         diff_engine = TranscriptDiffEngine()
@@ -1190,18 +1308,6 @@ Respond strictly with a JSON object conforming to:
             if report.is_modified:
                 modified_questions.add(q_id)
 
-        # Mark modified proposals and human assessments as stale without deleting human overrides!
-        if modified_questions:
-            self.repo.mark_proposals_stale(
-                interview_id=interview_id,
-                question_ids=list(modified_questions),
-                stale_reason=f"Стенограмма обновлена до {new_rev_id}. Обнаружены расхождения в тексте.",
-            )
-
-        if not self.repo.get_interview(interview_id):
-            logger.warning("Interview %s deleted during retranscribe. Aborting activation.", interview_id)
-            return
-
         committed_new_segs = self.repo.get_transcript_segments(interview_id, revision_id=new_rev_id)
         if not committed_new_segs:
             logger.warning(
@@ -1210,8 +1316,33 @@ Respond strictly with a JSON object conforming to:
             )
             return
 
-        # ONLY AFTER ALL DATA AND STATUSES ARE SAVED, ACTIVATE NEW REVISION!
-        self.repo.set_active_transcript_revision(interview_id, new_rev_id)
+        try:
+            self.repo.publish_batch_transcript_revision(
+                interview_id=interview_id,
+                expected_old_revision_id=old_rev_id,
+                target_revision_id=new_rev_id,
+                owner_token=owner_token,
+                job_id=job_id,
+                modified_question_ids=list(modified_questions) if modified_questions else None,
+            )
+        except RepositoryConflictError as exc:
+            logger.warning(
+                "Batch retranscription for interview %s aborted due to conflict: %s. Active revision kept unchanged.",
+                interview_id,
+                exc,
+            )
+            self.repo.record_audit_event(
+                event_id=f"audit-{uuid.uuid4().hex[:8]}",
+                interview_id=interview_id,
+                event_type="BATCH_RETRANSCRIPTION_CONFLICT",
+                payload={
+                    "expected_old_revision_id": old_rev_id,
+                    "target_revision_id": new_rev_id,
+                    "conflict_reason": str(exc),
+                },
+            )
+            exc.is_terminal = True
+            raise
 
         self.repo.record_audit_event(
             event_id=f"audit-{uuid.uuid4().hex[:8]}",

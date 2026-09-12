@@ -361,6 +361,7 @@ def test_optimistic_concurrency_blocks_stale_revisions(client: TestClient, repo:
     # Set active revision to trans-rev-2
     repo.update_interview_status(interview_id, "processing")
     repo.update_interview_status(interview_id, "review")
+    repo.create_transcript_revision("trans-rev-2", interview_id, revision_number=2)
     repo.set_active_transcript_revision(interview_id, "trans-rev-2")
 
     # 1. Review submitted for trans-rev-1 must be blocked with 409

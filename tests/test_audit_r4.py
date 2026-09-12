@@ -31,6 +31,7 @@ async def test_r4_prompt_filters_rejected_stale_and_foreign_revisions(repo):
         role="Principal Engineer",
     )
     repo.set_active_rubric_revision(inv_id, "rub-rev-active")
+    repo.create_transcript_revision("trans-rev-active", inv_id, revision_number=2)
     repo.set_active_transcript_revision(inv_id, "trans-rev-active")
 
     # 1. Proposal for q1 that is rejected
@@ -401,6 +402,7 @@ async def test_r4_confirm_summary_after_retranscription_resolves_stale(repo):
     )
 
     # Transcript gets updated to trans-rev-2
+    repo.create_transcript_revision("trans-rev-2", inv_id, revision_number=2)
     repo.set_active_transcript_revision(inv_id, "trans-rev-2")
 
     # Human expert confirms summary on the active trans-rev-2

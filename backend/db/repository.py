@@ -102,6 +102,14 @@ class Repository:
                     now,
                 ),
             )
+            conn.execute(
+                """
+                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
+                VALUES ('trans-rev-1', ?, 1, 0, ?)
+                ON CONFLICT(interview_id, id) DO NOTHING
+                """,
+                (interview_id, now),
+            )
         return self.get_interview(interview_id)  # type: ignore[return-value]
 
     def update_interview_draft(
@@ -571,6 +579,66 @@ class Repository:
                 )
             return True
 
+    def _allocate_next_transcript_revision_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        interview_id: str,
+        base_revision_id: str | None = None,
+        now_iso: str | None = None,
+    ) -> tuple[str, int]:
+        """
+        Allocates and records the next unique transcript revision for an interview.
+        Ensures base_revision_id is recorded if provided, and generates next revision
+        without colliding on PRIMARY KEY (interview_id, id) or UNIQUE (interview_id, revision_number).
+        """
+        now = now_iso or utc_now_iso()
+        rev_rows = conn.execute(
+            "SELECT id, revision_number FROM transcript_revisions WHERE interview_id = ?",
+            (interview_id,),
+        ).fetchall()
+        existing_ids = {r["id"] for r in rev_rows}
+        existing_nums = {r["revision_number"] for r in rev_rows}
+
+        if base_revision_id and base_revision_id not in existing_ids:
+            base_num = 1
+            if base_revision_id.startswith("trans-rev-"):
+                with contextlib.suppress(ValueError):
+                    base_num = int(base_revision_id.split("-")[-1])
+            if base_num in existing_nums:
+                base_num = (max(existing_nums) if existing_nums else 0) + 1
+            conn.execute(
+                """
+                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
+                VALUES (?, ?, ?, 0, ?)
+                ON CONFLICT(interview_id, id) DO NOTHING
+                """,
+                (base_revision_id, interview_id, base_num, now),
+            )
+            existing_ids.add(base_revision_id)
+            existing_nums.add(base_num)
+
+        max_num = max(existing_nums) if existing_nums else 0
+        if base_revision_id and base_revision_id.startswith("trans-rev-"):
+            with contextlib.suppress(ValueError):
+                max_num = max(max_num, int(base_revision_id.split("-")[-1]))
+
+        next_num = max_num + 1
+        while next_num in existing_nums or f"trans-rev-{next_num}" in existing_ids:
+            next_num += 1
+        new_rev_id = f"trans-rev-{next_num}"
+
+        conn.execute(
+            """
+            INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(interview_id, id) DO UPDATE SET
+                revision_number = excluded.revision_number,
+                is_batch_final = excluded.is_batch_final
+            """,
+            (new_rev_id, interview_id, next_num, now),
+        )
+        return new_rev_id, next_num
+
     def update_segment_speaker_role(
         self,
         interview_id: str,
@@ -602,35 +670,8 @@ class Repository:
             if not row:
                 raise ValueError(f"Segment {segment_id} not found in active revision {curr_rev}")
 
-            rev_rows = conn.execute(
-                "SELECT id, revision_number FROM transcript_revisions WHERE interview_id = ?",
-                (interview_id,),
-            ).fetchall()
-            existing_ids = {r["id"] for r in rev_rows} | {curr_rev}
-            max_num = max([r["revision_number"] for r in rev_rows] + [1])
-            if curr_rev.startswith("trans-rev-"):
-                with contextlib.suppress(ValueError):
-                    max_num = max(max_num, int(curr_rev.split("-")[-1]))
-            next_num = max_num + 1
-            while f"trans-rev-{next_num}" in existing_ids:
-                next_num += 1
-            new_rev_id = f"trans-rev-{next_num}"
-
-            conn.execute(
-                """
-                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
-                VALUES (?, ?, 1, 1, ?)
-                ON CONFLICT(id) DO NOTHING
-                """,
-                (curr_rev, interview_id, now),
-            )
-            conn.execute(
-                """
-                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
-                VALUES (?, ?, ?, 1, ?)
-                ON CONFLICT(id) DO NOTHING
-                """,
-                (new_rev_id, interview_id, next_num, now),
+            new_rev_id, next_num = self._allocate_next_transcript_revision_in_tx(
+                conn, interview_id, base_revision_id=curr_rev, now_iso=now
             )
 
 
@@ -766,35 +807,8 @@ class Repository:
             if not (start_ms < split_time_ms < end_ms):
                 raise ValueError(f"Split time {split_time_ms} must be strictly between {start_ms} and {end_ms}")
 
-            rev_rows = conn.execute(
-                "SELECT id, revision_number FROM transcript_revisions WHERE interview_id = ?",
-                (interview_id,),
-            ).fetchall()
-            existing_ids = {r["id"] for r in rev_rows} | {curr_rev}
-            max_num = max([r["revision_number"] for r in rev_rows] + [1])
-            if curr_rev.startswith("trans-rev-"):
-                with contextlib.suppress(ValueError):
-                    max_num = max(max_num, int(curr_rev.split("-")[-1]))
-            next_num = max_num + 1
-            while f"trans-rev-{next_num}" in existing_ids:
-                next_num += 1
-            new_rev_id = f"trans-rev-{next_num}"
-
-            conn.execute(
-                """
-                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
-                VALUES (?, ?, 1, 1, ?)
-                ON CONFLICT(id) DO NOTHING
-                """,
-                (curr_rev, interview_id, now),
-            )
-            conn.execute(
-                """
-                INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
-                VALUES (?, ?, ?, 1, ?)
-                ON CONFLICT(id) DO NOTHING
-                """,
-                (new_rev_id, interview_id, next_num, now),
+            new_rev_id, next_num = self._allocate_next_transcript_revision_in_tx(
+                conn, interview_id, base_revision_id=curr_rev, now_iso=now
             )
 
 
@@ -985,15 +999,34 @@ class Repository:
     ) -> None:
         now = utc_now_iso()
         with self.db.transaction() as conn:
+            existing_for_num = conn.execute(
+                "SELECT id FROM transcript_revisions WHERE interview_id = ? AND revision_number = ?",
+                (interview_id, revision_number),
+            ).fetchone()
+            if existing_for_num and existing_for_num["id"] != revision_id:
+                max_num_row = conn.execute(
+                    "SELECT MAX(revision_number) FROM transcript_revisions WHERE interview_id = ?",
+                    (interview_id,),
+                ).fetchone()
+                revision_number = (max_num_row[0] or 0) + 1
+
             conn.execute(
                 """
                 INSERT INTO transcript_revisions (id, interview_id, revision_number, is_batch_final, created_at)
                 VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
+                ON CONFLICT(interview_id, id) DO UPDATE SET
                     is_batch_final = excluded.is_batch_final
                 """,
                 (revision_id, interview_id, revision_number, 1 if is_batch_final else 0, now),
             )
+
+    def get_transcript_revision(self, interview_id: str, revision_id: str) -> dict[str, Any] | None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM transcript_revisions WHERE interview_id = ? AND id = ?",
+                (interview_id, revision_id),
+            ).fetchone()
+            return dict(row) if row else None
 
     def get_transcript_revisions(self, interview_id: str) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
@@ -1010,10 +1043,131 @@ class Repository:
                 raise ValueError(f"Interview {interview_id} not found or deleted")
             if inv["status"] == "finalized":
                 raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+            # Revision must exist for this interview
+            rev = conn.execute(
+                "SELECT id FROM transcript_revisions WHERE interview_id = ? AND id = ?",
+                (interview_id, revision_id),
+            ).fetchone()
+            if not rev:
+                seg = conn.execute(
+                    "SELECT 1 FROM transcript_segments WHERE interview_id = ? AND revision_id = ? LIMIT 1",
+                    (interview_id, revision_id),
+                ).fetchone()
+                if not seg:
+                    raise ValueError(f"Transcript revision '{revision_id}' does not exist for interview {interview_id}")
+
             conn.execute(
                 "UPDATE interviews SET active_transcript_revision_id = ? WHERE id = ?",
                 (revision_id, interview_id),
             )
+
+    def publish_batch_transcript_revision(
+        self,
+        interview_id: str,
+        expected_old_revision_id: str,
+        target_revision_id: str,
+        owner_token: str | None = None,
+        job_id: str | None = None,
+        modified_question_ids: list[str] | None = None,
+        stale_reason: str | None = None,
+    ) -> None:
+        """
+        Atomically activates a batch transcript revision and invalidates dependent
+        scoring/evidence, ensuring no concurrent manual edits or race conditions
+        overwrite newer data.
+
+        Raises:
+            ValueError: if interview or target_revision does not exist, or target revision is empty.
+            RepositoryConflictError: if interview is finalized/deleted, active revision != expected_old_revision_id,
+                                     or job lease is invalid/expired.
+        """
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            inv = conn.execute(
+                "SELECT id, status, active_transcript_revision_id FROM interviews WHERE id = ?",
+                (interview_id,),
+            ).fetchone()
+            if not inv or inv["status"] == "deleted":
+                raise ValueError(
+                    f"Cannot publish transcript revision: interview {interview_id} does not exist or is deleted"
+                )
+            if inv["status"] == "finalized":
+                raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
+
+            if job_id is not None:
+                j_row = conn.execute(
+                    "SELECT id, status, locked_by, locked_until FROM jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if not j_row:
+                    raise RepositoryConflictError(f"Cannot publish transcript revision: job {job_id} not found")
+                if j_row["status"] != "PROCESSING":
+                    raise RepositoryConflictError(
+                        f"Cannot publish transcript revision: job {job_id} is no longer PROCESSING (status: {j_row['status']})"
+                    )
+                if owner_token is not None and j_row["locked_by"] and j_row["locked_by"] != owner_token:
+                    raise RepositoryConflictError(
+                        f"Cannot publish transcript revision: job {job_id} owner token mismatch"
+                    )
+                if j_row["locked_until"] and j_row["locked_until"] < now:
+                    raise RepositoryConflictError(
+                        f"Cannot publish transcript revision: job {job_id} lease expired"
+                    )
+
+            active_rev = inv["active_transcript_revision_id"] or "trans-rev-1"
+            if active_rev != expected_old_revision_id:
+                raise RepositoryConflictError(
+                    f"Transcript revision conflict: active revision is '{active_rev}', "
+                    f"but expected '{expected_old_revision_id}'. Concurrent manual edit detected."
+                )
+
+            # Target revision must exist in transcript_revisions for this interview
+            rev = conn.execute(
+                "SELECT id FROM transcript_revisions WHERE interview_id = ? AND id = ?",
+                (interview_id, target_revision_id),
+            ).fetchone()
+            if not rev:
+                raise ValueError(
+                    f"Transcript revision '{target_revision_id}' does not exist for interview {interview_id}"
+                )
+
+            # Ensure target revision has at least one segment
+            seg_count = conn.execute(
+                "SELECT COUNT(1) as cnt FROM transcript_segments WHERE interview_id = ? AND revision_id = ?",
+                (interview_id, target_revision_id),
+            ).fetchone()["cnt"]
+            if seg_count == 0:
+                raise ValueError(
+                    f"Target revision '{target_revision_id}' has 0 segments, cannot activate empty transcript"
+                )
+
+            # Atomically set active revision
+            conn.execute(
+                "UPDATE interviews SET active_transcript_revision_id = ?, updated_at = ? WHERE id = ?",
+                (target_revision_id, now, interview_id),
+            )
+
+            # Invalidate modified questions atomically if any
+            if modified_question_ids:
+                reason = (
+                    stale_reason
+                    or f"Стенограмма обновлена до {target_revision_id}. Обнаружены расхождения в тексте."
+                )
+                for q_id in modified_question_ids:
+                    conn.execute(
+                        "UPDATE assessment_proposals SET is_stale = 1, stale_reason = ? WHERE interview_id = ? AND question_id = ?",
+                        (reason, interview_id, q_id),
+                    )
+                    conn.execute(
+                        "UPDATE human_assessments SET is_stale = 1, stale_reason = ? WHERE interview_id = ? AND question_id = ?",
+                        (reason, interview_id, q_id),
+                    )
+                conn.execute(
+                    "UPDATE summary_proposals SET is_confirmed = 0, is_stale = 1, stale_reason = ? WHERE interview_id = ?",
+                    (reason, interview_id),
+                )
+
 
     def set_active_rubric_revision(self, interview_id: str, revision_id: str) -> None:
         with self.db.transaction() as conn:
@@ -2108,6 +2262,20 @@ class Repository:
             if inv["status"] == "finalized":
                 raise RepositoryConflictError(f"Interview {interview_id} is finalized and immutable")
 
+            if job_type == "BATCH_RETRANSCRIBE":
+                active_batch = conn.execute(
+                    """
+                    SELECT id FROM jobs
+                    WHERE interview_id = ? AND type = 'BATCH_RETRANSCRIBE' AND status IN ('PENDING', 'PROCESSING')
+                    LIMIT 1
+                    """,
+                    (interview_id,),
+                ).fetchone()
+                if active_batch:
+                    raise RepositoryConflictError(
+                        f"A batch retranscription job ({active_batch['id']}) is already pending/processing for interview {interview_id}"
+                    )
+
             conn.execute(
                 """
                 INSERT INTO jobs (
@@ -2288,6 +2456,44 @@ class Repository:
                 WHERE id = ? AND status = 'PROCESSING' AND locked_by = ?
                 """,
                 (lock_until_str, now, job_id, owner_token),
+            )
+            return cursor.rowcount > 0
+
+    def update_job_checkpoint(
+        self,
+        job_id: str,
+        owner_token: str,
+        checkpoint_data: dict[str, Any],
+        extension_sec: int = 60,
+    ) -> bool:
+        """Atomically updates job payload checkpoint and extends lease if owner token matches."""
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM jobs WHERE id = ? AND status = 'PROCESSING' AND locked_by = ?",
+                (job_id, owner_token),
+            ).fetchone()
+            if not row:
+                return False
+            payload = json.loads(row["payload_json"])
+            checkpoint = payload.setdefault("checkpoint", {})
+            for k, v in checkpoint_data.items():
+                if isinstance(v, list) and isinstance(checkpoint.get(k), list):
+                    existing_set = set(checkpoint[k])
+                    for item in v:
+                        if item not in existing_set:
+                            checkpoint[k].append(item)
+                else:
+                    checkpoint[k] = v
+            new_payload_json = json.dumps(payload, ensure_ascii=False)
+            lock_until_dt = datetime.fromtimestamp(datetime.now(UTC).timestamp() + extension_sec, tz=UTC)
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET payload_json = ?, locked_until = ?, updated_at = ?
+                WHERE id = ? AND status = 'PROCESSING' AND locked_by = ?
+                """,
+                (new_payload_json, lock_until_dt.isoformat(), now, job_id, owner_token),
             )
             return cursor.rowcount > 0
 

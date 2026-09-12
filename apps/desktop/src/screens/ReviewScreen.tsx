@@ -152,7 +152,13 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     segment_count: number;
     is_active: boolean;
   }>>([]);
-  const [isRetranscribing, setIsRetranscribing] = useState(false);
+  const [activeBatchJob, setActiveBatchJob] = useState<{
+    jobId: string;
+    targetRevisionId: string;
+    sourceRevisionId: string;
+    status: 'PENDING' | 'PROCESSING';
+    progressText?: string;
+  } | null>(null);
   const [retranscribeSuccess, setRetranscribeSuccess] = useState<string | null>(null);
   const [retranscribeError, setRetranscribeError] = useState<string | null>(null);
   const [diffData, setDiffData] = useState<any | null>(null);
@@ -356,7 +362,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     loadData();
   }, [loadData]);
 
-  // Restore active EVALUATE_QUESTION jobs on mount
+  // Restore active EVALUATE_QUESTION and BATCH_RETRANSCRIBE jobs on mount
   useEffect(() => {
     let isSubscribed = true;
     getInterviewJobsStatus(interviewId, { limit: 100 })
@@ -371,15 +377,31 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           setIsEvaluatingAll(true);
           setEvalProgressText(`Возобновлено отслеживание оценки (${activeEvalJobs.length} задач в очереди/работе)...`);
         }
+
+        const activeBatch = res.active_jobs.find(
+          (j) => j.type === 'BATCH_RETRANSCRIBE' && (j.status === 'PENDING' || j.status === 'PROCESSING')
+        );
+        if (activeBatch) {
+          setActiveBatchJob({
+            jobId: activeBatch.id,
+            targetRevisionId: activeBatch.transcript_revision_id || 'trans-rev-2',
+            sourceRevisionId: activeRevisionId,
+            status: activeBatch.status as 'PENDING' | 'PROCESSING',
+            progressText:
+              activeBatch.status === 'PROCESSING'
+                ? 'Выполняется распознавание аудио...'
+                : 'В очереди обработки...',
+          });
+        }
       })
       .catch((err) => {
-        console.warn('Could not restore review eval jobs:', err);
+        console.warn('Could not restore review jobs on mount:', err);
       });
 
     return () => {
       isSubscribed = false;
     };
-  }, [interviewId]);
+  }, [interviewId, activeRevisionId]);
 
   // Track evaluation jobs to terminal state with partial progress updates
   useEffect(() => {
@@ -446,6 +468,82 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       clearInterval(poll);
     };
   }, [trackedEvalJobIds, interviewId]);
+
+
+  // Track active BATCH_RETRANSCRIBE job to terminal state
+  useEffect(() => {
+    if (!activeBatchJob) return;
+
+    let isSubscribed = true;
+    let isPolling = false;
+
+    const poll = setInterval(async () => {
+      if (isPolling) return;
+      isPolling = true;
+      try {
+        const res = await getInterviewJobsStatus(interviewId, { jobIds: [activeBatchJob.jobId] });
+        if (!isSubscribed) return;
+
+        const jobs = res.active_jobs || [];
+        const job = jobs.find((j) => j.id === activeBatchJob.jobId);
+        if (!job) {
+          return;
+        }
+
+        if (job.status === 'PENDING') {
+          setActiveBatchJob((prev) =>
+            prev ? { ...prev, status: 'PENDING', progressText: 'В очереди обработки...' } : null
+          );
+        } else if (job.status === 'PROCESSING') {
+          const elapsed = job.elapsed_sec ? ` (${Math.round(job.elapsed_sec)}с)` : '';
+          setActiveBatchJob((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  status: 'PROCESSING',
+                  progressText: `Выполняется пакетная перестенограмма${elapsed}...`,
+                }
+              : null
+          );
+        } else if (job.status === 'COMPLETED') {
+          clearInterval(poll);
+          setActiveBatchJob(null);
+          setRetranscribeError(null);
+          await loadData();
+          const activatedRev = job.transcript_revision_id || activeBatchJob.targetRevisionId;
+          setRetranscribeSuccess(
+            `Пакетная перестенограмма успешно завершена! Активная ревизия переключена на: ${activatedRev}`
+          );
+        } else if (job.status === 'FAILED') {
+          clearInterval(poll);
+          setActiveBatchJob(null);
+          const errMsg = job.error_message || 'Неизвестная ошибка воркера';
+          const isConflict =
+            errMsg.toLowerCase().includes('conflict') ||
+            errMsg.includes('409') ||
+            errMsg.includes('ручной правки');
+          if (isConflict) {
+            setRetranscribeError(
+              `Конфликт ревизий: во время пакетной обработки стенограмма была изменена вручную. ` +
+                `Ваши ручные правки сохранены, пакетная ревизия не активирована. ` +
+                `Вы можете запустить новую перестенограмму на базе текущей ревизии.`
+            );
+          } else {
+            setRetranscribeError(`Ошибка пакетной перестенограммы: ${errMsg}`);
+          }
+        }
+      } catch (e) {
+        console.warn('Batch poll error:', e);
+      } finally {
+        isPolling = false;
+      }
+    }, 1500);
+
+    return () => {
+      isSubscribed = false;
+      clearInterval(poll);
+    };
+  }, [activeBatchJob, interviewId, loadData]);
 
   // Deterministic 100-point score computation over assessed questions
   const calculateFinalScore = (): number | null => {
@@ -566,8 +664,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   };
 
   const handleBatchRetranscribe = async () => {
-    if (isFinalized || isRetranscribing) return;
-    setIsRetranscribing(true);
+    if (isFinalized || activeBatchJob) return;
     setRetranscribeError(null);
     setRetranscribeSuccess(null);
     try {
@@ -585,12 +682,29 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       }
       const nextRev = `trans-rev-${nextRevNum}`;
       const res = await startBatchRetranscribe(interviewId, nextRev, activeRevisionId);
-      setRetranscribeSuccess(`Пакетная перестенограмма успешно завершена! Активная ревизия переключена на: ${res.new_revision_id}`);
-      await loadData();
+      setActiveBatchJob({
+        jobId: res.job_id,
+        targetRevisionId: res.new_revision_id || nextRev,
+        sourceRevisionId: activeRevisionId,
+        status: 'PENDING',
+        progressText: 'Запрос отправлен в очередь...',
+      });
     } catch (err: any) {
-      setRetranscribeError(err?.message || 'Ошибка запуска пакетной перестенограммы');
-    } finally {
-      setIsRetranscribing(false);
+      const msg = err?.message || 'Ошибка запуска пакетной перестенограммы';
+      if (msg.includes('already pending/processing')) {
+        const match = msg.match(/(job-[a-zA-Z0-9_-]+)/);
+        if (match) {
+          setActiveBatchJob({
+            jobId: match[1],
+            targetRevisionId: 'trans-rev-2',
+            sourceRevisionId: activeRevisionId,
+            status: 'PENDING',
+            progressText: 'Подключение к выполняющейся задаче...',
+          });
+          return;
+        }
+      }
+      setRetranscribeError(msg);
     }
   };
 
@@ -1725,15 +1839,15 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                                   </span>
                                 </div>
                                 <p className="text-slate-200 font-medium leading-relaxed">
-                                  {f.asked_text || f.suggested_text}
+                                  {f.asked_text || f.question_text || f.suggested_text}
                                 </p>
-                                {f.asked_text && f.asked_text !== f.suggested_text && (
+                                {f.asked_text && f.asked_text !== (f.question_text || f.suggested_text) && (
                                   <p className="text-[10px] text-slate-400 italic">
-                                    Исходная подсказка: «{f.suggested_text}»
+                                    Исходная подсказка: «{f.question_text || f.suggested_text}»
                                   </p>
                                 )}
-                                {f.rationale && (
-                                  <p className="text-[11px] text-slate-400">{f.rationale}</p>
+                                {(f.purpose || f.rationale) && (
+                                  <p className="text-[11px] text-slate-400">{f.purpose || f.rationale}</p>
                                 )}
                               </div>
                             ))}
@@ -1810,16 +1924,22 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 <button
                   type="button"
                   onClick={handleBatchRetranscribe}
-                  disabled={isRetranscribing}
+                  disabled={Boolean(activeBatchJob)}
                   className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-medium rounded-lg transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                   title="Запустить повторное STT-распознавание аудиосессии с фиксацией новой ревизии"
                 >
-                  {isRetranscribing ? (
+                  {activeBatchJob ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
                   ) : (
                     <RefreshCw className="w-3.5 h-3.5 text-indigo-400" />
                   )}
-                  <span>{isRetranscribing ? 'Пакетная STT...' : 'Пакетная перестенограмма'}</span>
+                  <span>
+                    {activeBatchJob
+                      ? activeBatchJob.status === 'PROCESSING'
+                        ? 'Выполняется...'
+                        : 'В очереди...'
+                      : 'Пакетная перестенограмма'}
+                  </span>
                 </button>
               )}
 
@@ -1839,6 +1959,28 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
               </button>
             </div>
           </div>
+
+          {activeBatchJob && (
+            <div className="p-3 bg-indigo-950/40 border border-indigo-800/80 text-indigo-200 text-xs rounded-lg flex items-center space-x-2.5">
+              <Loader2 className="w-4 h-4 text-indigo-400 animate-spin shrink-0" />
+              <div className="flex-1">
+                <div className="flex items-center space-x-2">
+                  <span className="font-semibold text-slate-200">
+                    {activeBatchJob.status === 'PROCESSING'
+                      ? 'Пакетная перестенограмма выполняется'
+                      : 'Пакетная перестенограмма в очереди'}
+                  </span>
+                  <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-indigo-900/60 border border-indigo-700/50 text-indigo-300">
+                    {activeBatchJob.jobId}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  {activeBatchJob.progressText || 'Фоновая обработка аудиосессии...'}{' '}
+                  (целевая ревизия: <span className="text-slate-300 font-mono">{activeBatchJob.targetRevisionId}</span>)
+                </p>
+              </div>
+            </div>
+          )}
 
           {retranscribeSuccess && (
             <div className="p-3 bg-emerald-950/60 border border-emerald-800 text-emerald-300 text-xs rounded-lg flex items-center justify-between">

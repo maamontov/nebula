@@ -22,6 +22,100 @@ FORBIDDEN_ATTRIBUTES_KEYWORDS = [
     "национальность", "раса", "внешность", "эмоциональность",
 ]
 
+# Word-bounded and context-aware bias rules to prevent false positives on technical terms
+# like 'message', 'storage', 'coverage', 'акцент на масштабируемости', 'старый сервер'.
+BIAS_RULES: list[tuple[str, re.Pattern[str], re.Pattern[str] | None]] = [
+    # Accent / Speech style
+    (
+        "акцент",
+        re.compile(r"\b(accent|акцент\w*)\b", re.IGNORECASE),
+        re.compile(r"\b(акцент\s+на|accent\s+on)\b", re.IGNORECASE),
+    ),
+    (
+        "произношение",
+        re.compile(r"\b(pronunciation|произношени\w*)\b", re.IGNORECASE),
+        None,
+    ),
+    (
+        "тембр",
+        re.compile(r"\b(timbre|тембр\w*)\b", re.IGNORECASE),
+        None,
+    ),
+    (
+        "дикция",
+        re.compile(r"\b(diction|дикци\w*)\b", re.IGNORECASE),
+        None,
+    ),
+    (
+        "скорость речи",
+        re.compile(r"\b(speech\s+rate|скорост\w+\s+речи)\b", re.IGNORECASE),
+        None,
+    ),
+    # Personal attributes
+    (
+        "возраст",
+        re.compile(r"\b(age|ages|aging|aged|возраст\w*)\b", re.IGNORECASE),
+        None,
+    ),
+    (
+        "пожилой",
+        re.compile(r"\b(elderly|пожил\w+)\b", re.IGNORECASE),
+        None,
+    ),
+    (
+        "возрастная дискриминация",
+        re.compile(
+            r"\b(молод\w+\s+(кандидат|специалист|человек|разработчик|инженер)|"
+            r"(кандидат|специалист|человек|разработчик|инженер)\s+молод\w*|"
+            r"слишком\s+молод\w*|"
+            r"стар\w+\s+(кандидат|специалист|человек|разработчик|инженер)|"
+            r"(кандидат|специалист|человек|разработчик|инженер)\s+стар\w*|"
+            r"слишком\s+стар\w*)\b",
+            re.IGNORECASE,
+        ),
+        None,
+    ),
+    (
+        "пол кандидата",
+        re.compile(r"\b(gender|пол\s+кандидата|мужчин\w*|женщин\w*)\b", re.IGNORECASE),
+        None,
+    ),
+    (
+        "национальность",
+        re.compile(r"\b(nationality|национальност\w*)\b", re.IGNORECASE),
+        None,
+    ),
+    (
+        "раса",
+        re.compile(r"\b(race|рас[аыеуой]|расов\w*)\b", re.IGNORECASE),
+        None,
+    ),
+    (
+        "внешность",
+        re.compile(r"\b(appearance|внешност\w*)\b", re.IGNORECASE),
+        None,
+    ),
+    (
+        "эмоциональность",
+        re.compile(r"\b(emotionality|эмоциональност\w*)\b", re.IGNORECASE),
+        None,
+    ),
+]
+
+
+def find_forbidden_attributes(text: str) -> list[str]:
+    """
+    Detects protected personal attributes and bias in explanation or follow-up text.
+    Uses word boundaries and context awareness to avoid false positives on technical
+    terms like 'message', 'storage', 'coverage', 'акцент на репликации', 'старый сервер'.
+    """
+    matches: list[str] = []
+    for label, pattern, exc_pattern in BIAS_RULES:
+        if pattern.search(text) and not (exc_pattern and exc_pattern.search(text)):
+            matches.append(label)
+    return matches
+
+
 SUSPICIOUS_INJECTION_PATTERNS = [
     r"ignore\s+(previous|all)\s+instructions",
     r"поставь\s+максимальный\s+балл",
@@ -87,14 +181,14 @@ def validate_proposal(
 
     for score_item in proposal.scores:
         # 1. Check explanation for forbidden personal bias
-        exp_lower = score_item.explanation.lower()
-        for forbidden in FORBIDDEN_ATTRIBUTES_KEYWORDS:
-            if forbidden in exp_lower:
-                errors.append(
-                    f"Criterion '{score_item.criterion_id}' explanation contains forbidden attribute reference: '{forbidden}'"
-                )
+        forbidden_matches = find_forbidden_attributes(score_item.explanation)
+        for forbidden in forbidden_matches:
+            errors.append(
+                f"Criterion '{score_item.criterion_id}' explanation contains forbidden attribute reference: '{forbidden}'"
+            )
 
         # 2. Check for prompt injection traces in explanation
+        exp_lower = score_item.explanation.lower()
         for pattern in SUSPICIOUS_INJECTION_PATTERNS:
             if re.search(pattern, exp_lower):
                 warnings.append(

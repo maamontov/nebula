@@ -217,20 +217,6 @@ class ReportRevision(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
-# Re-export follow-up models
-from contracts.followups import (  # noqa: E402
-    FollowUpKind,
-    FollowUpLLMResponse,
-    FollowUpLLMSuggestion,
-    FollowUpMode,
-    FollowUpsStateResponse,
-    FollowUpStatus,
-    FollowUpSuggestion,
-    FollowUpTrigger,
-    GenerateFollowUpsRequest,
-    PatchFollowUpSuggestionRequest,
-)
-
 __all__ = [
     "InterviewStatus",
     "RubricCriterion",
@@ -247,13 +233,15 @@ __all__ = [
     "HumanQuestionAssessment",
     "ReportRevision",
     "FollowUpKind",
-    "FollowUpLLMResponse",
-    "FollowUpLLMSuggestion",
     "FollowUpMode",
-    "FollowUpsStateResponse",
     "FollowUpStatus",
-    "FollowUpSuggestion",
     "FollowUpTrigger",
-    "GenerateFollowUpsRequest",
-    "PatchFollowUpSuggestionRequest",
 ]
+
+# Backward compatibility aliases for follow-up contracts
+from contracts.followups import (  # noqa: E402
+    FollowUpKind,
+    FollowUpMode,
+    FollowUpStatus,
+    FollowUpTrigger,
+)

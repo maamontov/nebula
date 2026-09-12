@@ -1848,6 +1848,14 @@ async def batch_retranscribe_endpoint(
     if InterviewStatus(inv["status"]) == InterviewStatus.FINALIZED:
         raise HTTPException(status_code=409, detail="Interview is finalized and immutable")
 
+    active_rev = inv.get("active_transcript_revision_id") or "trans-rev-1"
+    old_rev = payload.old_revision_id or active_rev
+    if payload.old_revision_id and payload.old_revision_id != active_rev:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Active transcript revision is '{active_rev}', but request specified '{payload.old_revision_id}'",
+        )
+
     job_id = f"job-batch-{uuid.uuid4().hex[:8]}"
     try:
         repo.enqueue_job(
@@ -1856,8 +1864,9 @@ async def batch_retranscribe_endpoint(
             interview_id=interview_id,
             payload={
                 "new_revision_id": payload.new_revision_id,
-                "old_revision_id": payload.old_revision_id,
+                "old_revision_id": old_rev,
                 "segments": payload.segments,
+                "provenance": payload.provenance,
             },
         )
         return {"status": "enqueued", "job_id": job_id, "new_revision_id": payload.new_revision_id}
