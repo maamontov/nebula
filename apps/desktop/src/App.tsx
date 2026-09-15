@@ -10,8 +10,13 @@ import { getActiveSession, getInterview } from './services/api';
 import { AlertCircle, X } from 'lucide-react';
 
 type Screen = 'home' | 'templates' | 'setup' | 'live' | 'review';
+type Theme = 'light' | 'dark';
 
 export const App: React.FC = () => {
+  const [theme, setTheme] = useState<Theme>(() => {
+    if (typeof window === 'undefined') return 'light';
+    return window.localStorage.getItem('nebula-theme') === 'dark' ? 'dark' : 'light';
+  });
   const [screen, setScreen] = useState<Screen>('home');
   const [interviewId, setInterviewId] = useState<string>('');
   const [plan, setPlan] = useState<InterviewPlan | null>(null);
@@ -35,6 +40,12 @@ export const App: React.FC = () => {
 
   // Warning modal for blocked actions
   const [warningModal, setWarningModal] = useState<string | null>(null);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    window.localStorage.setItem('nebula-theme', theme);
+  }, [theme]);
 
   useEffect(() => {
     getActiveSession()
@@ -225,7 +236,7 @@ export const App: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col select-none">
+    <div className="app-root min-h-screen flex flex-col select-none">
       <Header
         status={getStatus()}
         candidateName={
@@ -243,9 +254,11 @@ export const App: React.FC = () => {
         currentScreen={screen}
         onNavigate={handleNavigate}
         activeRecordingSession={activeRecordingSession}
+        theme={theme}
+        onToggleTheme={() => setTheme((current) => (current === 'light' ? 'dark' : 'light'))}
       />
 
-      <main className="flex-1 overflow-hidden relative">
+      <main className="app-main flex-1 overflow-hidden relative">
         {/* Screen: Home */}
         {screen === 'home' && (
           <HomeScreen

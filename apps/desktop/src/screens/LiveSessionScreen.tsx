@@ -405,7 +405,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   };
 
   return (
-    <div className="h-[calc(100vh-4rem)] flex flex-col bg-slate-950 overflow-hidden">
+    <div className="live-screen h-[calc(100vh-4rem)] flex flex-col bg-slate-950 overflow-hidden">
       {/* Backend connection banner */}
       {backendError && (
         <div className="px-6 py-2 bg-rose-950/80 border-b border-rose-800 text-rose-300 text-xs flex items-center justify-between">
@@ -418,7 +418,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
       )}
 
       {/* Top Session Control Bar */}
-      <div className="px-6 py-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
+      <div className="live-control-bar px-6 py-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
         <div className="flex items-center space-x-4">
           <div className="font-mono text-xl font-bold tracking-wider text-slate-100 flex items-center space-x-2">
             <span className="w-2.5 h-2.5 rounded-full bg-rose-500 recording-pulse" />
@@ -769,4 +769,3 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
     </div>
   );
 };
-

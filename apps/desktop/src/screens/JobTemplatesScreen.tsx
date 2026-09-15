@@ -353,9 +353,9 @@ export const JobTemplatesScreen: React.FC = () => {
   });
 
   return (
-    <div className="h-[calc(100vh-4rem)] flex overflow-hidden">
+    <div className="templates-screen h-[calc(100vh-4rem)] flex overflow-hidden">
       {/* Left Column: Templates List */}
-      <div className="w-80 md:w-96 border-r border-slate-800 bg-slate-900/60 flex flex-col h-full">
+      <div className="templates-sidebar w-80 md:w-96 border-r border-slate-800 bg-slate-900/60 flex flex-col h-full">
         {/* Header */}
         <div className="p-4 border-b border-slate-800 space-y-3">
           <div className="flex items-center justify-between">
@@ -492,7 +492,7 @@ export const JobTemplatesScreen: React.FC = () => {
       </div>
 
       {/* Right Column: Template & Questions Editor */}
-      <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6">
+      <div className="templates-editor flex-1 overflow-y-auto p-6 md:p-8 space-y-6">
         {/* Editor Top Bar */}
         <div className="flex items-center justify-between border-b border-slate-800 pb-4">
           <div>

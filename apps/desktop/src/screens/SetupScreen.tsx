@@ -359,9 +359,9 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
   };
 
   return (
-    <div className="max-w-5xl mx-auto p-6 md:p-8 space-y-8 overflow-y-auto h-[calc(100vh-4rem)]">
+    <div className="setup-screen max-w-5xl mx-auto p-6 md:p-8 space-y-8 overflow-y-auto h-[calc(100vh-4rem)]">
       {/* Top Header */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 glass-panel p-6 rounded-2xl shadow-xl">
+      <div className="screen-header flex flex-col md:flex-row md:items-center justify-between gap-4 glass-panel p-6 rounded-2xl shadow-xl">
         <div className="flex items-center space-x-3">
           {onBackToHome && (
             <button

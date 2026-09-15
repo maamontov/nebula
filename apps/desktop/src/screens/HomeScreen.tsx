@@ -275,9 +275,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   };
 
   return (
-    <div className="max-w-7xl mx-auto p-6 md:p-8 space-y-6 overflow-y-auto h-[calc(100vh-4rem)]">
+    <div className="home-screen max-w-7xl mx-auto p-6 md:p-8 space-y-6 overflow-y-auto h-[calc(100vh-4rem)]">
       {/* Header Banner */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 glass-panel p-6 rounded-2xl shadow-xl">
+      <div className="home-heading flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-100 flex items-center space-x-3">
             <span>Собеседования</span>
@@ -294,7 +294,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           onClick={onNewInterview}
           disabled={hasActiveRecording}
           title={hasActiveRecording ? 'Запись уже активна' : 'Создать новое интервью'}
-          className={`flex items-center space-x-2 px-5 py-2.5 rounded-xl font-medium transition shadow-lg ${
+            className={`primary-action flex items-center space-x-2 px-5 py-2.5 rounded-xl font-medium transition shadow-lg ${
             hasActiveRecording
               ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
               : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/30'
@@ -306,7 +306,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       </div>
 
       {/* Filters Toolbar */}
-      <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 flex flex-wrap items-center gap-3">
+      <div className="filter-toolbar p-3 rounded-xl bg-slate-900/60 border border-slate-800 flex flex-wrap items-center gap-3">
         {/* Search */}
         <div className="relative flex-1 min-w-[240px]">
           <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -383,7 +383,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       </div>
 
       {/* Main Table / List */}
-      <div className="glass-panel rounded-2xl overflow-hidden shadow-xl border border-slate-800/80">
+      <div className="interview-table-shell glass-panel rounded-2xl overflow-hidden shadow-xl border border-slate-800/80">
         {isLoading ? (
           <div className="p-16 text-center text-slate-400 space-y-3">
             <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto" />
@@ -427,7 +427,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead>
-                <tr className="border-b border-slate-800 bg-slate-900/80 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                <tr className="interview-table-head border-b border-slate-800 bg-slate-900/80 text-xs font-semibold text-slate-400 uppercase tracking-wider">
                   <th className="py-3.5 px-6">Кандидат</th>
                   <th className="py-3.5 px-6">Должность</th>
                   <th className="py-3.5 px-6">Дата</th>
@@ -445,7 +445,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                     <tr
                       key={item.id}
                       onClick={() => onOpenInterview(item.id, item.status)}
-                      className="hover:bg-slate-800/40 cursor-pointer transition group"
+                      className="interview-table-row hover:bg-slate-800/40 cursor-pointer transition group"
                     >
                       {/* Candidate */}
                       <td className="py-4 px-6">

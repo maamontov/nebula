@@ -1126,11 +1126,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     'Должность не указана';
 
   return (
-    <div className="max-w-6xl mx-auto p-6 space-y-6 overflow-y-auto h-[calc(100vh-4rem)]">
+    <div className="review-screen max-w-6xl mx-auto p-6 space-y-6 overflow-y-auto h-[calc(100vh-4rem)]">
       {/* Top Header & Context */}
-      <div className="glass-panel p-5 rounded-2xl flex flex-wrap items-center justify-between gap-4 shadow-xl">
+      <div className="review-header glass-panel p-5 rounded-2xl flex flex-wrap items-center justify-between gap-4 shadow-xl">
         <div className="flex items-center space-x-4">
-          <div className="w-12 h-12 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-500 flex items-center justify-center shadow-lg shadow-emerald-500/20 shrink-0">
+          <div className="review-hero-icon w-12 h-12 rounded-xl flex items-center justify-center shadow-lg shrink-0">
             <Award className="w-7 h-7 text-white" />
           </div>
           <div>
