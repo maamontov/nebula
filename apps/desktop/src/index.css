@@ -269,10 +269,15 @@ button:disabled {
   min-width: 0;
 }
 
+.topbar-context {
+  flex: 1 1 auto;
+}
+
 .topbar-actions {
   justify-content: flex-end;
   gap: 14px;
-  width: 100%;
+  width: auto;
+  flex: 0 1 auto;
 }
 
 .interview-context {
@@ -595,6 +600,80 @@ button:disabled {
 .live-control-bar {
   background: var(--surface) !important;
   border-color: var(--border) !important;
+}
+
+.live-session-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.live-session-actions {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.live-main-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(280px, 1.2fr) minmax(300px, 1.35fr);
+}
+
+.live-main-grid > * {
+  min-width: 0;
+  min-height: 0;
+}
+
+.live-transcript-header {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.live-transcript-header > :first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.live-transcript-engine {
+  flex: 0 1 44%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.live-copilot-column {
+  min-width: 0;
+}
+
+@media (max-width: 991px) {
+  .live-main-grid {
+    grid-template-columns: minmax(180px, 0.8fr) minmax(280px, 1.2fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+    overflow-y: auto;
+  }
+
+  .live-copilot-column {
+    grid-column: 1 / -1;
+    max-height: 560px;
+    overflow-y: auto;
+  }
+}
+
+@media (max-width: 720px) {
+  .live-main-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto;
+  }
+
+  .live-questions-column,
+  .live-transcript-column,
+  .live-copilot-column {
+    grid-column: 1;
+    min-height: 280px;
+    max-height: none;
+  }
+
+  .live-control-bar {
+    align-items: flex-start;
+  }
 }
 
 .templates-screen {

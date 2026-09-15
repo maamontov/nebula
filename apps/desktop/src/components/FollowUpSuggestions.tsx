@@ -380,21 +380,21 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
     switch (kind) {
       case 'clarify':
         return (
-          <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-indigo-950/80 text-indigo-300 border border-indigo-700/60 flex items-center space-x-1">
+          <span className="max-w-full min-w-0 px-2 py-0.5 text-[10px] font-bold leading-tight whitespace-normal rounded bg-indigo-950/80 text-indigo-300 border border-indigo-700/60 flex items-center space-x-1">
             <HelpCircle className="w-3 h-3" />
             <span>Уточнение</span>
           </span>
         );
       case 'deepen':
         return (
-          <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-purple-950/80 text-purple-300 border border-purple-700/60 flex items-center space-x-1">
+          <span className="max-w-full min-w-0 px-2 py-0.5 text-[10px] font-bold leading-tight whitespace-normal rounded bg-purple-950/80 text-purple-300 border border-purple-700/60 flex items-center space-x-1">
             <Sparkles className="w-3 h-3" />
             <span>Углубление</span>
           </span>
         );
       case 'guide':
         return (
-          <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-amber-950/80 text-amber-300 border border-amber-600/70 flex items-center space-x-1 shadow-sm">
+          <span className="max-w-full min-w-0 px-2 py-0.5 text-[10px] font-bold leading-tight whitespace-normal rounded bg-amber-950/80 text-amber-300 border border-amber-600/70 flex items-center space-x-1 shadow-sm">
             <Compass className="w-3 h-3 text-amber-400" />
             <span>Наводящий вопрос (подсказка)</span>
           </span>
@@ -403,24 +403,24 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
   };
 
   return (
-    <div className="p-3 bg-slate-900/90 border border-slate-800 rounded-xl space-y-3">
+    <div className="p-3 bg-slate-900/90 border border-slate-800 rounded-xl space-y-3 min-w-0">
       {/* Header with Title and Auto-toggle */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center space-x-2">
+      <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+        <div className="flex min-w-0 flex-1 items-start space-x-2">
           <HelpCircle className="w-4 h-4 text-cyan-400 shrink-0" />
           <div className="min-w-0">
             <span className="text-xs font-bold uppercase tracking-wider text-slate-200 block">
               Что спросить дальше
             </span>
             {questionTitle && (
-              <span className="text-[10px] text-slate-400 truncate block max-w-[170px]" title={questionTitle}>
+              <span className="text-[10px] text-slate-400 break-words block" title={questionTitle}>
                 {questionTitle}
               </span>
             )}
           </div>
         </div>
 
-        <label className="flex items-center space-x-1.5 cursor-pointer select-none">
+        <label className="flex shrink-0 items-center space-x-1.5 cursor-pointer select-none">
           <input
             type="checkbox"
             checked={autoEnabled}
@@ -441,7 +441,7 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
           type="button"
           onClick={() => handleGenerate('probe', 'manual')}
           disabled={disabled || isGenerating}
-          className="flex items-center justify-center space-x-1.5 px-2.5 py-1.5 bg-indigo-600/90 hover:bg-indigo-500 disabled:bg-slate-800/80 disabled:text-slate-500 text-white text-xs font-semibold rounded-lg shadow-sm transition cursor-pointer disabled:cursor-not-allowed"
+          className="min-w-0 flex items-center justify-center space-x-1.5 px-2.5 py-1.5 bg-indigo-600/90 hover:bg-indigo-500 disabled:bg-slate-800/80 disabled:text-slate-500 text-white text-xs font-semibold text-center leading-snug rounded-lg shadow-sm transition cursor-pointer disabled:cursor-not-allowed"
           title="Сгенерировать уточняющие и углубляющие вопросы по ответу кандидата"
         >
           {isGenerating && activeMode === 'probe' ? (
@@ -461,7 +461,7 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
           type="button"
           onClick={() => handleGenerate('guide', 'manual')}
           disabled={disabled || isGenerating}
-          className="flex items-center justify-center space-x-1.5 px-2.5 py-1.5 bg-amber-600/90 hover:bg-amber-500 disabled:bg-slate-800/80 disabled:text-slate-500 text-white text-xs font-semibold rounded-lg shadow-sm transition cursor-pointer disabled:cursor-not-allowed"
+          className="min-w-0 flex items-center justify-center space-x-1.5 px-2.5 py-1.5 bg-amber-600/90 hover:bg-amber-500 disabled:bg-slate-800/80 disabled:text-slate-500 text-white text-xs font-semibold text-center leading-snug rounded-lg shadow-sm transition cursor-pointer disabled:cursor-not-allowed"
           title="Предложить один наводящий вопрос, если кандидат испытывает затруднения"
         >
           {isGenerating && activeMode === 'guide' ? (
@@ -480,10 +480,10 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
 
       {/* Error / Retry Bar */}
       {errorMessage && (
-        <div className="p-2.5 bg-rose-950/40 border border-rose-800/80 rounded-lg flex items-center justify-between space-x-2 text-xs text-rose-300">
-          <div className="flex items-center space-x-1.5 min-w-0">
+        <div className="p-2.5 bg-rose-950/40 border border-rose-800/80 rounded-lg flex flex-wrap items-start justify-between gap-2 text-xs text-rose-300">
+          <div className="flex min-w-0 flex-1 items-start space-x-1.5">
             <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-            <span className="truncate" title={errorMessage}>{errorMessage}</span>
+            <span className="break-words" title={errorMessage}>{errorMessage}</span>
           </div>
           <div className="flex items-center space-x-1 shrink-0">
             <button
@@ -508,8 +508,8 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
 
       {/* Warning: Stale answer banner */}
       {stateResponse?.has_new_answer && !isGenerating && (
-        <div className="p-2 bg-indigo-950/40 border border-indigo-800/60 rounded-lg flex items-center justify-between text-xs text-indigo-300">
-          <span className="text-[11px]">Поступили новые реплики кандидата</span>
+        <div className="p-2 bg-indigo-950/40 border border-indigo-800/60 rounded-lg flex flex-wrap items-start justify-between gap-2 text-xs text-indigo-300">
+          <span className="text-[11px] break-words">Поступили новые реплики кандидата</span>
           <button
             type="button"
             onClick={() => handleGenerate(activeMode, 'manual')}
@@ -571,8 +571,8 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
                 }`}
               >
                 {/* Kind & Status Badges */}
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center space-x-1.5">
+                <div className="flex flex-wrap items-start justify-between gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                     {getKindBadge(s.kind)}
                     {s.is_stale && !isAsked && (
                       <span className="px-1.5 py-0.5 text-[9px] font-semibold text-amber-400 bg-amber-950/80 border border-amber-800/70 rounded">
@@ -698,7 +698,7 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
 
                 {/* Actions when not asked yet */}
                 {!isAsked && !isEditing && (
-                  <div className="flex items-center justify-between pt-1 border-t border-slate-800/80">
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-800/80">
                     <button
                       type="button"
                       onClick={() => {

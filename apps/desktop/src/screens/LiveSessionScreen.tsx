@@ -418,20 +418,20 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
       )}
 
       {/* Top Session Control Bar */}
-      <div className="live-control-bar px-6 py-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
-        <div className="flex items-center space-x-4">
+      <div className="live-control-bar px-6 py-3 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
+        <div className="live-session-summary flex items-center min-w-0 space-x-4">
           <div className="font-mono text-xl font-bold tracking-wider text-slate-100 flex items-center space-x-2">
             <span className="w-2.5 h-2.5 rounded-full bg-rose-500 recording-pulse" />
             <span>{formatTime(elapsedSec)}</span>
           </div>
-          <div className="hidden sm:flex items-center space-x-2 pl-4 border-l border-slate-800 text-xs">
-            <span className="font-semibold text-slate-100">{candidateName || plan.candidate_name || 'Кандидат'}</span>
+          <div className="hidden sm:flex min-w-0 items-center space-x-2 pl-4 border-l border-slate-800 text-xs">
+            <span className="max-w-[220px] truncate font-semibold text-slate-100">{candidateName || plan.candidate_name || 'Кандидат'}</span>
             <span className="text-slate-500">•</span>
-            <span className="text-slate-400">{role || plan.role || 'Позиция не указана'}</span>
+            <span className="max-w-[260px] truncate text-slate-400">{role || plan.role || 'Позиция не указана'}</span>
           </div>
         </div>
 
-        <div className="flex items-center space-x-3">
+        <div className="live-session-actions flex flex-wrap items-center gap-3">
           <button
             onClick={handleTogglePause}
             disabled={isTogglingPause || isStopping}
@@ -463,9 +463,9 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
       </div>
 
       {/* Main Grid: Left Questions, Center Live Transcripts, Right Live AI Copilot */}
-      <div className="flex-1 grid grid-cols-12 gap-0 min-h-0 overflow-hidden">
+      <div className="live-main-grid flex-1 gap-0 min-h-0 overflow-hidden">
         {/* Column 1: Questions Plan Navigator (3 cols) */}
-        <div className="col-span-3 border-r border-slate-800 bg-slate-950/70 p-4 space-y-3 overflow-y-auto">
+        <div className="live-questions-column border-r border-slate-800 bg-slate-950/70 p-4 space-y-3 overflow-y-auto">
           <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">План вопросов</h3>
           {plan.questions.map((q, idx) => {
             const hasProposal = proposals.some((p) => p.question_id === q.id);
@@ -474,13 +474,13 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
               <div
                 key={q.id}
                 onClick={() => setActiveQuestionIdx(idx)}
-                className={`p-3 rounded-lg border cursor-pointer transition ${
+                className={`p-3 rounded-lg border cursor-pointer transition min-w-0 ${
                   isActive
                     ? 'bg-indigo-950/40 border-indigo-500/80 shadow-sm'
                     : 'bg-slate-900/40 border-slate-800/80 hover:bg-slate-900'
                 }`}
               >
-                <div className="flex items-center justify-between mb-1">
+                <div className="flex items-start justify-between gap-2 mb-1">
                   <span className={`text-xs font-bold ${isActive ? 'text-indigo-400' : 'text-slate-400'}`}>
                     Вопрос #{idx + 1}
                   </span>
@@ -491,20 +491,20 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                     </span>
                   )}
                 </div>
-                <p className="text-xs text-slate-200 line-clamp-2">{q.text}</p>
+                <p className="text-xs text-slate-200 break-words leading-relaxed">{q.text || q.prompt || q.title}</p>
               </div>
             );
           })}
         </div>
 
         {/* Column 2: Live Transcripts (5 cols) */}
-        <div className="col-span-5 border-r border-slate-800 flex flex-col bg-slate-950/40 min-h-0 relative">
-          <div className="p-3 border-b border-slate-800/80 bg-slate-900/50 flex items-center justify-between shrink-0">
-            <div className="flex items-center space-x-2">
+        <div className="live-transcript-column border-r border-slate-800 flex flex-col bg-slate-950/40 min-h-0 relative">
+          <div className="live-transcript-header p-3 border-b border-slate-800/80 bg-slate-900/50 flex justify-between shrink-0">
+            <div className="flex items-start space-x-2">
               <MessageSquare className="w-4 h-4 text-slate-400" />
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-300">Живая стенограмма</span>
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-300 break-words">Живая стенограмма</span>
             </div>
-            <span className="text-[11px] text-slate-400">Whisper Large v3 Turbo (STT)</span>
+            <span className="live-transcript-engine text-[11px] text-slate-400">Whisper Large v3 Turbo (STT)</span>
           </div>
 
           <div
@@ -515,7 +515,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
             {segments.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-slate-500 space-y-2 py-16">
                 <MessageSquare className="w-8 h-8 text-slate-600 animate-pulse" />
-                <p className="text-xs">Стенограмма пуста. Ожидание речи и распознавания...</p>
+                <p className="text-xs text-center break-words">Стенограмма пуста. Ожидание речи и распознавания...</p>
               </div>
             ) : (
               segments.map((s) => {
@@ -531,7 +531,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                     isHighlighted ? 'scale-[1.01]' : ''
                   }`}
                 >
-                  <div className="flex items-center space-x-2 mb-1">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-1 min-w-0">
                     <span className={`text-[11px] font-semibold ${isCandidate ? 'text-emerald-400' : isInterviewer ? 'text-indigo-400' : 'text-cyan-400'}`}>
                       {speakerLabel}
                     </span>
@@ -581,7 +581,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                     </div>
                   </div>
                   <div
-                    className={`max-w-[85%] p-3 rounded-xl text-xs leading-relaxed transition-all ${
+                    className={`max-w-[85%] p-3 rounded-xl text-xs leading-relaxed break-words transition-all ${
                       isHighlighted
                         ? 'ring-2 ring-amber-400 bg-amber-950/40 border border-amber-500 text-amber-100 shadow-lg shadow-amber-950/50'
                         : isCandidate
@@ -611,7 +611,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
         </div>
 
         {/* Column 3: Live AI Copilot & Evidence (4 cols) */}
-        <div className="col-span-4 p-4 space-y-4 overflow-y-auto bg-slate-950/80 flex flex-col justify-between">
+        <div className="live-copilot-column p-4 space-y-4 overflow-y-auto bg-slate-950/80 flex flex-col justify-between">
           <div className="space-y-4">
             {/* Adaptive Follow-up Questions Copilot */}
             {currentQ && (
@@ -626,26 +626,26 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
               />
             )}
 
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="flex min-w-0 items-center space-x-2">
                 <Sparkles className="w-4 h-4 text-indigo-400" />
-                <span className="text-xs font-bold uppercase tracking-wider text-slate-200">Оперативная оценка</span>
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-200 break-words">Оперативная оценка</span>
               </div>
-              <span className="text-[10px] text-slate-400 bg-slate-800/80 px-2 py-0.5 rounded">Gemini 3.8 Flash</span>
+              <span className="shrink-0 text-[10px] text-slate-400 bg-slate-800/80 px-2 py-0.5 rounded">Gemini 3.8 Flash</span>
             </div>
 
             {/* Quick Action to evaluate current question */}
-            <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl space-y-2">
-              <div className="flex items-center justify-between">
+            <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl space-y-2 min-w-0">
+              <div className="flex flex-wrap items-start justify-between gap-2">
                 <span className="text-xs font-semibold text-slate-300">Оценить текущий ответ</span>
                 {evalSuccessNotice && (
-                  <span className="text-[10px] text-emerald-400">{evalSuccessNotice}</span>
+                  <span className="text-[10px] text-emerald-400 break-words">{evalSuccessNotice}</span>
                 )}
               </div>
               <button
                 onClick={handleEvaluateCurrent}
                 disabled={isEvaluating || isJobRunning}
-                className="w-full flex items-center justify-center space-x-2 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-950 disabled:text-slate-500 text-white text-xs font-semibold rounded-lg shadow-sm transition"
+                className="w-full min-w-0 flex items-center justify-center space-x-2 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-950 disabled:text-slate-500 text-white text-xs font-semibold text-center leading-snug rounded-lg shadow-sm transition"
               >
                 {isEvaluating ? (
                   <>
