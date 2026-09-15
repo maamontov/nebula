@@ -504,6 +504,27 @@ button:disabled {
   transition: background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
 }
 
+.form-control {
+  box-sizing: border-box;
+  height: 42px;
+}
+
+.form-control-action {
+  box-sizing: border-box;
+  display: inline-flex;
+  width: 42px;
+  height: 42px;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  padding: 0;
+}
+
+.filter-control {
+  box-sizing: border-box;
+  height: 42px;
+}
+
 .home-screen {
   scrollbar-gutter: stable;
 }

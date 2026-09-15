@@ -534,7 +534,7 @@ export const JobTemplatesScreen: React.FC = () => {
                   setEditingTemplate((prev) => ({ ...prev, title: e.target.value }))
                 }
                 placeholder="например, Senior Backend / Systems Engineer"
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+                className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
               />
             </div>
 
@@ -545,7 +545,7 @@ export const JobTemplatesScreen: React.FC = () => {
                 onChange={(e) =>
                   setEditingTemplate((prev) => ({ ...prev, level: e.target.value }))
                 }
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
               >
                 <option value="Junior">Junior</option>
                 <option value="Middle">Middle</option>
@@ -565,7 +565,7 @@ export const JobTemplatesScreen: React.FC = () => {
                 setEditingTemplate((prev) => ({ ...prev, role: e.target.value }))
               }
               placeholder="например, Backend Engineer, Frontend, DevOps"
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+              className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
             />
           </div>
 
@@ -852,7 +852,7 @@ export const JobTemplatesScreen: React.FC = () => {
                     prev ? { ...prev, targetTemplateId: e.target.value } : null
                   )
                 }
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
               >
                 {templates
                   .filter((t) => t.id !== editingTemplate.id)

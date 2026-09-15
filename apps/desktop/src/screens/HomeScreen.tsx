@@ -318,12 +318,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               setSearchQuery(e.target.value);
               setPage(1);
             }}
-            className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-4 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+            className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-4 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
           />
         </div>
 
         {/* Role Filter */}
-        <div className="flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
+        <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
           <Briefcase className="w-4 h-4 text-slate-400" />
           <select
             value={roleFilter}
@@ -341,7 +341,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         </div>
 
         {/* Status Filter */}
-        <div className="flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
+        <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
           <Filter className="w-4 h-4 text-slate-400" />
           <select
             value={statusFilter}
@@ -364,7 +364,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         </div>
 
         {/* Date Filter */}
-        <div className="flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
+        <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
           <Calendar className="w-4 h-4 text-slate-400" />
           <select
             value={dateFilter}

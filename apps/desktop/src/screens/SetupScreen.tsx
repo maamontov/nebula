@@ -431,7 +431,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
               value={candidateName}
               onChange={(e) => setCandidateName(e.target.value)}
               placeholder="Введите ФИО реального кандидата"
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+              className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
             />
           </div>
 
@@ -445,7 +445,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                 <select
                   value={selectedTemplateId}
                   onChange={(e) => handleTemplateChange(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                  className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
                 >
                   <option value="" disabled>Выберите шаблон должности...</option>
                   {templates.map((tpl) => (
@@ -467,7 +467,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                     }
                   }}
                   title="Применить актуальные вопросы из шаблона"
-                  className="p-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 rounded-lg transition"
+                  className="form-control-action bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 rounded-lg transition"
                 >
                   <RotateCcw className="w-4 h-4" />
                 </button>
@@ -487,7 +487,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
               setPlan((prev) => ({ ...prev, role: val }));
             }}
             placeholder="например, Backend или Data Science"
-            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+            className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
           />
         </div>
       </div>
@@ -725,13 +725,15 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
         {/* Audio Device Pickers */}
         {captureMode === 'single_source' ? (
           <div className="space-y-1.5 max-w-md">
-            <label className="text-xs font-semibold text-slate-300">Общее аудиоустройство</label>
+            <label className="text-xs font-semibold text-slate-300 flex items-center space-x-1.5">
+              <Mic className="w-3.5 h-3.5 text-slate-400" />
+              <span>Общее аудиоустройство</span>
+            </label>
             <div className="relative">
-              <Mic className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
               <select
                 value={selectedShared}
                 onChange={(e) => setSelectedShared(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-4 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3 pr-10 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
               >
                 {devices.map((d) => (
                   <option key={d.id} value={d.id} className="bg-slate-900">
@@ -744,13 +746,15 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-1.5">
-              <label className="text-xs font-semibold text-slate-300">Микрофон интервьюера</label>
+              <label className="text-xs font-semibold text-slate-300 flex items-center space-x-1.5">
+                <Mic className="w-3.5 h-3.5 text-slate-400" />
+                <span>Микрофон интервьюера</span>
+              </label>
               <div className="relative">
-                <Mic className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
                 <select
                   value={selectedMic}
                   onChange={(e) => setSelectedMic(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-4 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                  className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3 pr-10 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
                 >
                   {devices.map((d) => (
                     <option key={d.id} value={d.id} className="bg-slate-900">
@@ -762,13 +766,15 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-xs font-semibold text-slate-300">Звук кандидата (Динамики / Встреча)</label>
+              <label className="text-xs font-semibold text-slate-300 flex items-center space-x-1.5">
+                <Volume2 className="w-3.5 h-3.5 text-slate-400" />
+                <span>Звук кандидата (Динамики / Встреча)</span>
+              </label>
               <div className="relative">
-                <Volume2 className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
                 <select
                   value={selectedSpeaker}
                   onChange={(e) => setSelectedSpeaker(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-4 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                  className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3 pr-10 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
                 >
                   {devices.map((d) => (
                     <option key={d.id} value={d.id} className="bg-slate-900">
