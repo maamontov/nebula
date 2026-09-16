@@ -266,7 +266,7 @@ def get_environment_text_analysis_settings() -> TextAnalysisSettings:
     )
 
 
-def _to_model_profile(provider_id: str, m_settings: AnalysisModelSettings) -> ModelProfile:
+def to_model_profile(provider_id: str, m_settings: AnalysisModelSettings) -> ModelProfile:
     """Converts AnalysisModelSettings to domain ModelProfile with deterministic ID and reasoning payload."""
     thinking_payload = None
     supports_reasoning = False
@@ -300,6 +300,30 @@ def _to_model_profile(provider_id: str, m_settings: AnalysisModelSettings) -> Mo
     )
 
 
+def _origin(url: str) -> tuple[str, str, int]:
+    parsed = urllib.parse.urlparse(url)
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    return parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port or default_port
+
+
+def _credential_preset_for_url(
+    preset: ProviderPreset,
+    configured_url: str,
+    *,
+    transcription: bool,
+) -> ProviderPreset:
+    """Only use a legacy provider key for that preset's canonical network origin."""
+    if preset == ProviderPreset.CUSTOM:
+        return preset
+    defaults = (
+        get_preset_transcription_settings(preset)
+        if transcription
+        else get_preset_text_analysis_settings(preset)
+    )
+    canonical_url = defaults.endpoint_url if transcription else defaults.base_url
+    return preset if _origin(configured_url) == _origin(canonical_url) else ProviderPreset.CUSTOM
+
+
 def resolve_ai_settings(
     repo: Repository,
     cred_store: CredentialStore,
@@ -321,8 +345,24 @@ def resolve_ai_settings(
         text_analysis = get_environment_text_analysis_settings()
 
     # Resolve credentials
-    stt_key, stt_status = cred_store.resolve_credential("stt", revision, transcription.preset)
-    llm_key, llm_status = cred_store.resolve_credential("llm", revision, text_analysis.preset)
+    stt_key, stt_status = cred_store.resolve_credential(
+        "stt",
+        revision,
+        _credential_preset_for_url(
+            transcription.preset,
+            transcription.endpoint_url,
+            transcription=True,
+        ),
+    )
+    llm_key, llm_status = cred_store.resolve_credential(
+        "llm",
+        revision,
+        _credential_preset_for_url(
+            text_analysis.preset,
+            text_analysis.base_url,
+            transcription=False,
+        ),
+    )
 
     blocker = repo.get_ai_settings_update_blocker()
     can_update = blocker is None
@@ -377,9 +417,9 @@ def resolve_ai_settings(
         max_concurrency=text_analysis.max_concurrency,
     )
 
-    llm_primary = _to_model_profile(text_analysis.provider_id, text_analysis.primary_model)
+    llm_primary = to_model_profile(text_analysis.provider_id, text_analysis.primary_model)
     llm_fallbacks = tuple(
-        _to_model_profile(text_analysis.provider_id, fb) for fb in text_analysis.fallback_models
+        to_model_profile(text_analysis.provider_id, fb) for fb in text_analysis.fallback_models
     )
 
     runtime_config = RuntimeAiConfiguration(

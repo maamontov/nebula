@@ -7,7 +7,9 @@ import hashlib
 import json
 import math
 import os
+import urllib.parse
 import uuid
+from threading import Lock
 from typing import Any
 
 from dotenv import load_dotenv
@@ -27,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from backend.adapters.llm import OpenAICompatibleAdapter
 from backend.adapters.stt import OpenAICompatibleSTTAdapter
-from backend.core.ai_settings import resolve_ai_settings
+from backend.core.ai_settings import resolve_ai_settings, to_model_profile
 from backend.core.audio_health import AudioHealthMonitor, ChannelMetrics
 from backend.core.audio_utils import pcm_s16le_to_wav_bytes
 from backend.core.credential_store import CredentialStore
@@ -70,9 +72,11 @@ from contracts.followups import (
     GenerateFollowUpsRequest,
     PatchFollowUpSuggestionRequest,
 )
-from contracts.provider import ModelProfile, ProviderProfile, STTProfile, STTProtocol
+from contracts.provider import ProviderProfile, STTProfile, STTProtocol
 from contracts.settings import (
     AiSettingsResponse,
+    ApiKeyAction,
+    AuthMode,
     TestAiSettingsRequest,
     TestAiSettingsResponse,
     TestTarget,
@@ -84,6 +88,8 @@ app = FastAPI(
     version="0.1.0",
     description="Core API for Nebula AI Interview Copilot",
 )
+
+_ai_settings_update_lock = Lock()
 
 # Allowed origins for Tauri desktop and local development loopback
 # Разрешенные origins для десктопа Tauri и локальной разработки на loopback
@@ -2434,6 +2440,73 @@ async def get_system_models_endpoint(
 # AI Provider & Model Settings Endpoints
 # -------------------------------------------------------------
 
+
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urllib.parse.urlparse(url)
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    return parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port or default_port
+
+
+def _validate_preserved_credential_origin(
+    *,
+    label: str,
+    old_url: str,
+    new_url: str,
+    action: ApiKeyAction,
+    credential_configured: bool,
+    credential_source: str,
+) -> None:
+    if (
+        action == ApiKeyAction.PRESERVE
+        and credential_configured
+        and credential_source != "process_environment"
+        and _url_origin(old_url) != _url_origin(new_url)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{label} provider origin changed; choose replace or clear for its API key "
+                "instead of preserving the credential from the previous origin"
+            ),
+        )
+
+
+def _probe_api_key(
+    *,
+    candidate_key: str | None,
+    auth_mode: AuthMode,
+    candidate_url: str,
+    active_url: str,
+    active_key: str | None,
+) -> str | None:
+    if auth_mode == AuthMode.NONE:
+        return None
+    if candidate_key:
+        return candidate_key
+    if _url_origin(candidate_url) == _url_origin(active_url) and active_key:
+        return active_key
+    raise HTTPException(
+        status_code=422,
+        detail="An API key is required to test a Bearer-authenticated provider at a different origin",
+    )
+
+
+def _safe_probe_error(exc: Exception) -> str:
+    """Returns a useful category without exposing untrusted upstream response content."""
+    error_code = exc.__class__.__name__
+    if "Authentication" in error_code:
+        return "Authentication failed"
+    if "RateLimit" in error_code:
+        return "Provider rate limit exceeded"
+    if "ContextLength" in error_code:
+        return "Model context limit exceeded"
+    if "InvalidResponse" in error_code:
+        return "Provider returned an invalid structured response"
+    if "Transient" in error_code:
+        return "Provider is temporarily unavailable"
+    return "Probe request failed"
+
+
 @app.get("/api/v1/settings/ai", response_model=AiSettingsResponse)
 async def get_ai_settings_endpoint(
     repo: Repository = Depends(get_repository),
@@ -2456,44 +2529,80 @@ async def update_ai_settings_endpoint(
     Updates the AI settings with OCC revision check and blockers validation.
     Stores non-secret configs in SQLite and writes versioned credentials snapshot to disk.
     """
-    blocker = repo.get_ai_settings_update_blocker()
-    if blocker:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot update AI settings: active work present ({blocker})",
-        )
-
     cred_store = CredentialStore()
     next_revision = req.expected_revision + 1
 
-    # Prepare credentials snapshot
-    try:
-        stt_val = req.stt_api_key.value.get_secret_value() if req.stt_api_key.value else None
-        llm_val = req.llm_api_key.value.get_secret_value() if req.llm_api_key.value else None
-        cred_store.prepare_snapshot(
-            expected_revision=req.expected_revision,
-            stt_action=req.stt_api_key.action,
-            stt_value=stt_val,
-            llm_action=req.llm_api_key.action,
-            llm_value=llm_val,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+    # Snapshot publication and DB activation must be serialized in this process.
+    # The snapshot store additionally refuses to replace an existing revision,
+    # protecting the active credential file from stale or cross-process writers.
+    with _ai_settings_update_lock:
+        current, _ = resolve_ai_settings(repo, cred_store)
+        if current.revision != req.expected_revision:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"AI settings conflict: expected revision {req.expected_revision}, "
+                    f"but current revision is {current.revision}"
+                ),
+            )
+        if current.update_blocker:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot update AI settings: active work present ({current.update_blocker})",
+            )
 
-    # Commit settings update into DB with atomic OCC & blocker re-check
-    try:
-        repo.update_ai_settings(
-            expected_revision=req.expected_revision,
-            transcription_config=req.transcription.model_dump(mode="json"),
-            text_analysis_config=req.text_analysis.model_dump(mode="json"),
+        _validate_preserved_credential_origin(
+            label="STT",
+            old_url=current.transcription.endpoint_url,
+            new_url=req.transcription.endpoint_url,
+            action=req.stt_api_key.action,
+            credential_configured=current.stt_credentials.configured,
+            credential_source=current.stt_credentials.source,
         )
-    except RepositoryConflictError as exc:
-        cred_store.cleanup_snapshot(next_revision)
-        raise HTTPException(status_code=409, detail=str(exc))
-    except Exception:
-        cred_store.cleanup_snapshot(next_revision)
-        logger.exception("Failed to update AI settings in DB")
-        raise HTTPException(status_code=500, detail="Failed to persist AI settings")
+        _validate_preserved_credential_origin(
+            label="LLM",
+            old_url=current.text_analysis.base_url,
+            new_url=req.text_analysis.base_url,
+            action=req.llm_api_key.action,
+            credential_configured=current.llm_credentials.configured,
+            credential_source=current.llm_credentials.source,
+        )
+
+        snapshot_created = False
+        try:
+            stt_val = req.stt_api_key.value.get_secret_value() if req.stt_api_key.value else None
+            llm_val = req.llm_api_key.value.get_secret_value() if req.llm_api_key.value else None
+            cred_store.prepare_snapshot(
+                expected_revision=req.expected_revision,
+                stt_action=req.stt_api_key.action,
+                stt_value=stt_val,
+                llm_action=req.llm_api_key.action,
+                llm_value=llm_val,
+            )
+            snapshot_created = True
+        except FileExistsError:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Credentials snapshot for revision {next_revision} already exists",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+        try:
+            repo.update_ai_settings(
+                expected_revision=req.expected_revision,
+                transcription_config=req.transcription.model_dump(mode="json"),
+                text_analysis_config=req.text_analysis.model_dump(mode="json"),
+            )
+        except RepositoryConflictError as exc:
+            if snapshot_created:
+                cred_store.cleanup_snapshot(next_revision)
+            raise HTTPException(status_code=409, detail=str(exc))
+        except Exception:
+            if snapshot_created:
+                cred_store.cleanup_snapshot(next_revision)
+            logger.exception("Failed to update AI settings in DB")
+            raise HTTPException(status_code=500, detail="Failed to persist AI settings")
 
     # Prune old snapshot files (keeps current and previous)
     cred_store.prune_old_snapshots(next_revision)
@@ -2521,12 +2630,15 @@ async def test_ai_settings_endpoint(
                 detail="transcription settings must be provided when target is 'stt'",
             )
         t_cfg = req.transcription
-        # Resolve test key
-        if req.api_key and req.api_key.get_secret_value():
-            api_key = req.api_key.get_secret_value()
-        else:
-            _, runtime_config = resolve_ai_settings(repo, cred_store)
-            api_key = runtime_config.stt_credentials.api_key
+        active, runtime_config = resolve_ai_settings(repo, cred_store)
+        candidate_key = req.api_key.get_secret_value() if req.api_key else None
+        api_key = _probe_api_key(
+            candidate_key=candidate_key,
+            auth_mode=t_cfg.auth_mode,
+            candidate_url=t_cfg.endpoint_url,
+            active_url=active.transcription.endpoint_url,
+            active_key=runtime_config.stt_credentials.api_key,
+        )
 
         stt_profile = STTProfile(
             id=f"test-stt-{t_cfg.provider_id}",
@@ -2552,7 +2664,7 @@ async def test_ai_settings_endpoint(
                 filename="test_probe.wav",
                 content_type="audio/wav",
                 language=t_cfg.language,
-                max_retries=0,
+                max_retries=1,
                 timeout_seconds=min(15.0, t_cfg.timeout_seconds),
             )
             latency_ms = int((time.perf_counter() - t0) * 1000)
@@ -2568,7 +2680,7 @@ async def test_ai_settings_endpoint(
         except Exception as exc:
             latency_ms = int((time.perf_counter() - t0) * 1000)
             err_code = exc.__class__.__name__
-            clean_msg = str(exc).strip() or err_code
+            clean_msg = _safe_probe_error(exc)
             return TestAiSettingsResponse(
                 success=False,
                 target=TestTarget.STT,
@@ -2586,30 +2698,25 @@ async def test_ai_settings_endpoint(
                 detail="text_analysis settings must be provided when target is 'llm'",
             )
         llm_cfg = req.text_analysis
-        # Resolve test key
-        if req.api_key and req.api_key.get_secret_value():
-            api_key = req.api_key.get_secret_value()
-        else:
-            _, runtime_config = resolve_ai_settings(repo, cred_store)
-            api_key = runtime_config.llm_credentials.api_key
+        active, runtime_config = resolve_ai_settings(repo, cred_store)
+        candidate_key = req.api_key.get_secret_value() if req.api_key else None
+        api_key = _probe_api_key(
+            candidate_key=candidate_key,
+            auth_mode=llm_cfg.auth_mode,
+            candidate_url=llm_cfg.base_url,
+            active_url=active.text_analysis.base_url,
+            active_key=runtime_config.llm_credentials.api_key,
+        )
 
         provider = ProviderProfile(
             id=llm_cfg.provider_id,
             name=llm_cfg.provider_name,
             base_url=llm_cfg.base_url,
-            models=(llm_cfg.primary_model.model_id,),
             api_key_env="NEBULA_LLM_API_KEY",
+            timeout_seconds=min(15.0, llm_cfg.timeout_seconds),
             max_concurrency=llm_cfg.max_concurrency,
         )
-        model = ModelProfile(
-            id=f"test-model-{llm_cfg.primary_model.model_id}",
-            provider_id=llm_cfg.provider_id,
-            upstream_model_id=llm_cfg.primary_model.model_id,
-            structured_output_mode=llm_cfg.primary_model.structured_output_mode.value,
-            context_window_tokens=llm_cfg.primary_model.context_window_tokens,
-            max_output_tokens=llm_cfg.primary_model.max_output_tokens,
-            supports_temperature=llm_cfg.primary_model.supports_temperature,
-        )
+        model = to_model_profile(llm_cfg.provider_id, llm_cfg.primary_model)
 
         adapter = OpenAICompatibleAdapter(
             provider=provider,
@@ -2633,8 +2740,7 @@ async def test_ai_settings_endpoint(
                 messages=messages,
                 json_schema=json_schema,
                 schema_name="probe_test",
-                max_retries=0,
-                timeout_seconds=min(15.0, llm_cfg.timeout_seconds),
+                max_retries=1,
             )
             latency_ms = int((time.perf_counter() - t0) * 1000)
             actual_model = getattr(adapter.model, "upstream_model_id", llm_cfg.primary_model.model_id)
@@ -2649,7 +2755,7 @@ async def test_ai_settings_endpoint(
         except Exception as exc:
             latency_ms = int((time.perf_counter() - t0) * 1000)
             err_code = exc.__class__.__name__
-            clean_msg = str(exc).strip() or err_code
+            clean_msg = _safe_probe_error(exc)
             return TestAiSettingsResponse(
                 success=False,
                 target=TestTarget.LLM,
@@ -2661,4 +2767,3 @@ async def test_ai_settings_endpoint(
             )
     else:
         raise HTTPException(status_code=422, detail=f"Unsupported target: {req.target}")
-

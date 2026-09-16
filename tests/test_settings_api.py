@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from backend.api.app import app
 from backend.core.credential_store import CredentialStore
 from backend.db.database import Database
-from backend.db.repository import Repository
+from backend.db.repository import Repository, RepositoryConflictError
 from contracts.domain import InterviewStatus
 
 
@@ -127,6 +127,7 @@ def test_put_ai_settings_success_and_get(test_setup):
 
 def test_put_ai_settings_occ_conflict(test_setup):
     client = test_setup["client"]
+    cred_store = test_setup["cred_store"]
 
     # First update to rev 1
     payload = {
@@ -148,16 +149,106 @@ def test_put_ai_settings_occ_conflict(test_setup):
             "auth_mode": "none",
             "primary_model": {"model_id": "m1"},
         },
-        "stt_api_key": {"action": "preserve"},
-        "llm_api_key": {"action": "preserve"},
+        "stt_api_key": {"action": "replace", "value": "original-stt-secret"},
+        "llm_api_key": {"action": "replace", "value": "original-llm-secret"},
     }
     res1 = client.put("/api/v1/settings/ai", json=payload)
     assert res1.status_code == 200
 
     # Repeat with expected_revision=0 should fail with 409
+    payload["stt_api_key"] = {"action": "replace", "value": "stale-overwrite"}
     res2 = client.put("/api/v1/settings/ai", json=payload)
     assert res2.status_code == 409
     assert "conflict: expected revision" in res2.json()["detail"].lower()
+    assert cred_store.read_snapshot(1)["NEBULA_STT_API_KEY"] == "original-stt-secret"
+    assert cred_store.read_snapshot(1)["NEBULA_LLM_API_KEY"] == "original-llm-secret"
+
+
+def test_put_ai_settings_requires_explicit_key_action_when_origin_changes(test_setup):
+    client = test_setup["client"]
+    cred_store = test_setup["cred_store"]
+
+    initial = {
+        "expected_revision": 0,
+        "transcription": {
+            "preset": "custom",
+            "provider_id": "stt-one",
+            "provider_name": "STT One",
+            "endpoint_url": "http://127.0.0.1:8080/v1/audio/transcriptions",
+            "model_id": "stt-model",
+            "auth_mode": "bearer",
+            "language": "ru",
+        },
+        "text_analysis": {
+            "preset": "custom",
+            "provider_id": "llm-one",
+            "provider_name": "LLM One",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "auth_mode": "bearer",
+            "primary_model": {"model_id": "llm-model"},
+        },
+        "stt_api_key": {"action": "replace", "value": "stt-origin-one"},
+        "llm_api_key": {"action": "replace", "value": "llm-origin-one"},
+    }
+    assert client.put("/api/v1/settings/ai", json=initial).status_code == 200
+
+    changed = {
+        **initial,
+        "expected_revision": 1,
+        "transcription": {
+            **initial["transcription"],
+            "endpoint_url": "http://127.0.0.1:9090/v1/audio/transcriptions",
+        },
+        "text_analysis": {
+            **initial["text_analysis"],
+            "base_url": "http://127.0.0.1:9090/v1",
+        },
+        "stt_api_key": {"action": "preserve"},
+        "llm_api_key": {"action": "preserve"},
+    }
+    res = client.put("/api/v1/settings/ai", json=changed)
+    assert res.status_code == 422
+    assert "origin" in res.json()["detail"].lower()
+    assert cred_store.read_snapshot(1)["NEBULA_STT_API_KEY"] == "stt-origin-one"
+    assert cred_store.read_snapshot(1)["NEBULA_LLM_API_KEY"] == "llm-origin-one"
+    assert not (cred_store.data_dir / "provider-secrets-v2.env").exists()
+
+
+def test_put_ai_settings_cleans_uncommitted_snapshot_after_repository_conflict(test_setup):
+    client = test_setup["client"]
+    repo = test_setup["repo"]
+    cred_store = test_setup["cred_store"]
+    payload = {
+        "expected_revision": 0,
+        "transcription": {
+            "preset": "custom",
+            "provider_id": "stt",
+            "provider_name": "STT",
+            "endpoint_url": "http://127.0.0.1:8080/v1/audio/transcriptions",
+            "model_id": "stt-model",
+            "auth_mode": "none",
+        },
+        "text_analysis": {
+            "preset": "custom",
+            "provider_id": "llm",
+            "provider_name": "LLM",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "auth_mode": "none",
+            "primary_model": {"model_id": "llm-model"},
+        },
+        "stt_api_key": {"action": "preserve"},
+        "llm_api_key": {"action": "preserve"},
+    }
+
+    with patch.object(
+        repo,
+        "update_ai_settings",
+        side_effect=RepositoryConflictError("job appeared before commit"),
+    ):
+        res = client.put("/api/v1/settings/ai", json=payload)
+
+    assert res.status_code == 409
+    assert not (cred_store.data_dir / "provider-secrets-v1.env").exists()
 
 
 def test_put_ai_settings_blocker_recording_interview(test_setup):
@@ -285,6 +376,7 @@ def test_post_ai_settings_test_stt_success(test_setup):
         assert data["provider_id"] == "custom-stt"
         assert data["model_id"] == "whisper-test-probe"
         assert "probe successful" in data["message"].lower()
+        assert mock_stt.await_args.kwargs["max_retries"] == 1
 
 
 def test_post_ai_settings_test_llm_success(test_setup):
@@ -314,6 +406,83 @@ def test_post_ai_settings_test_llm_success(test_setup):
         assert data["target"] == "llm"
         assert data["model_id"] == "probe-model"
         assert "probe successful" in data["message"].lower()
+        assert mock_llm.await_args.kwargs["max_retries"] == 1
+        assert "timeout_seconds" not in mock_llm.await_args.kwargs
+
+
+def test_probe_failure_does_not_return_raw_upstream_content_or_key(test_setup):
+    client = test_setup["client"]
+    secret = "probe-secret-value"
+    req_payload = {
+        "target": "llm",
+        "text_analysis": {
+            "preset": "custom",
+            "provider_id": "custom-llm",
+            "provider_name": "Custom LLM",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "auth_mode": "bearer",
+            "primary_model": {"model_id": "probe-model"},
+        },
+        "api_key": secret,
+    }
+    raw_upstream = f"<think>private trace</think> echoed Authorization: Bearer {secret}"
+
+    with patch(
+        "backend.api.app.OpenAICompatibleAdapter.execute_request",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError(raw_upstream),
+    ):
+        res = client.post("/api/v1/settings/ai/test", json=req_payload)
+
+    assert res.status_code == 200
+    data = res.json()
+    assert data["success"] is False
+    assert data["error_code"] == "RuntimeError"
+    assert data["message"] == "LLM probe failed: Probe request failed"
+    assert secret not in res.text
+    assert "private trace" not in res.text
+
+
+def test_probe_does_not_reuse_saved_key_for_different_origin(test_setup):
+    client = test_setup["client"]
+
+    update_payload = {
+        "expected_revision": 0,
+        "transcription": {
+            "preset": "custom",
+            "provider_id": "custom-stt",
+            "provider_name": "Custom STT",
+            "endpoint_url": "http://127.0.0.1:8080/v1/audio/transcriptions",
+            "model_id": "stt-model",
+            "auth_mode": "none",
+            "language": "ru",
+        },
+        "text_analysis": {
+            "preset": "custom",
+            "provider_id": "custom-llm",
+            "provider_name": "Custom LLM",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "auth_mode": "bearer",
+            "primary_model": {"model_id": "llm-model"},
+        },
+        "stt_api_key": {"action": "preserve"},
+        "llm_api_key": {"action": "replace", "value": "saved-origin-key"},
+    }
+    assert client.put("/api/v1/settings/ai", json=update_payload).status_code == 200
+
+    probe_payload = {
+        "target": "llm",
+        "text_analysis": {
+            **update_payload["text_analysis"],
+            "base_url": "http://127.0.0.1:9090/v1",
+        },
+    }
+    with patch("backend.api.app.OpenAICompatibleAdapter.execute_request", new_callable=AsyncMock) as mock_llm:
+        res = client.post("/api/v1/settings/ai/test", json=probe_payload)
+
+    assert res.status_code == 422
+    assert "api key" in res.json()["detail"].lower()
+    mock_llm.assert_not_awaited()
 
 
 def test_system_models_endpoint_reflects_db_update(test_setup):

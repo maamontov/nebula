@@ -84,6 +84,26 @@ def test_legacy_environment_fallback(store, monkeypatch):
     assert status_custom.source == "none"
 
 
+def test_clear_suppresses_legacy_environment_fallback(store, monkeypatch):
+    monkeypatch.delenv(STT_KEY_NAME, raising=False)
+    monkeypatch.delenv(LLM_KEY_NAME, raising=False)
+    monkeypatch.setenv("ROUTERAI_API_KEY", "legacy-router-key")
+
+    store.prepare_snapshot(
+        expected_revision=0,
+        stt_action=ApiKeyAction.PRESERVE,
+        stt_value=None,
+        llm_action=ApiKeyAction.CLEAR,
+        llm_value=None,
+    )
+
+    key, status = store.resolve_credential("llm", revision=1, preset=ProviderPreset.ROUTERAI)
+    assert key is None
+    assert status.configured is False
+    assert status.source == "none"
+    assert store.read_snapshot(1)[LLM_KEY_NAME] == ""
+
+
 def test_separate_keys_preserve_replace_clear(store, monkeypatch):
     monkeypatch.delenv(STT_KEY_NAME, raising=False)
     monkeypatch.delenv(LLM_KEY_NAME, raising=False)
@@ -167,6 +187,30 @@ def test_snapshot_file_permissions_on_unix(store, monkeypatch):
     if os.name != "nt":
         mode = path.stat().st_mode & 0o777
         assert mode == 0o600
+
+
+def test_prepare_snapshot_never_overwrites_existing_revision(store, monkeypatch):
+    monkeypatch.delenv(STT_KEY_NAME, raising=False)
+    monkeypatch.delenv(LLM_KEY_NAME, raising=False)
+
+    store.prepare_snapshot(
+        expected_revision=0,
+        stt_action=ApiKeyAction.REPLACE,
+        stt_value="original-stt-secret",
+        llm_action=ApiKeyAction.PRESERVE,
+        llm_value=None,
+    )
+
+    with pytest.raises(FileExistsError):
+        store.prepare_snapshot(
+            expected_revision=0,
+            stt_action=ApiKeyAction.REPLACE,
+            stt_value="replacement-must-not-win",
+            llm_action=ApiKeyAction.PRESERVE,
+            llm_value=None,
+        )
+
+    assert store.read_snapshot(1)[STT_KEY_NAME] == "original-stt-secret"
 
 
 def test_cleanup_and_prune_snapshots(store, monkeypatch):

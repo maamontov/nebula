@@ -858,6 +858,7 @@ export const SettingsScreen: React.FC = () => {
                   >
                     <option value="json_object">JSON Object (response_format)</option>
                     <option value="json_schema">JSON Schema (Strict Structured Output)</option>
+                    <option value="prompt_instruction">Только инструкция в prompt</option>
                   </select>
                 </div>
 
@@ -983,6 +984,7 @@ export const SettingsScreen: React.FC = () => {
                           >
                             <option value="json_object">JSON Object</option>
                             <option value="json_schema">JSON Schema</option>
+                            <option value="prompt_instruction">Инструкция в prompt</option>
                           </select>
                         </div>
 

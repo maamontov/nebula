@@ -317,6 +317,7 @@ async def test_job_execution_deadline_and_rate_limit_backoff(tmp_path):
     mock_client = httpx.AsyncClient(transport=httpx.MockTransport(rate_limit_handler))
     stt = OpenAICompatibleSTTAdapter(
         profile=get_plusvibe_whisper_stt(),
+        api_key="test-key",
         http_client=mock_client,
     )
     t0 = time.perf_counter()

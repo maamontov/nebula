@@ -213,4 +213,5 @@ class TestAiSettingsResponse(BaseModel):
     provider_id: str
     model_id: str
     latency_ms: float
+    error_code: str | None = None
     message: str

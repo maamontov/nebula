@@ -143,7 +143,7 @@ async def test_successful_request_with_mock_transport():
 
     provider = ProviderProfile(id="p1", name="P1", base_url="http://localhost:8000/v1", api_key_env="DUMMY")
     model = ModelProfile(id="m1", provider_id="p1", upstream_model_id="test-model", structured_output_mode=StructuredOutputMode.JSON_OBJECT)
-    adapter = OpenAICompatibleAdapter(provider, model, http_client=client)
+    adapter = OpenAICompatibleAdapter(provider, model, api_key="test-key", http_client=client)
 
     schema = {"type": "object", "properties": {"score": {"type": "number"}}}
     result = await adapter.execute_request([{"role": "user", "content": "Rate"}], json_schema=schema)
@@ -162,7 +162,7 @@ async def test_auth_error_not_retried():
 
     provider = ProviderProfile(id="p1", name="P1", base_url="http://localhost:8000/v1", api_key_env="DUMMY")
     model = ModelProfile(id="m1", provider_id="p1", upstream_model_id="test-model")
-    adapter = OpenAICompatibleAdapter(provider, model, http_client=client)
+    adapter = OpenAICompatibleAdapter(provider, model, api_key="test-key", http_client=client)
 
     with pytest.raises(LLMAuthenticationError):
         await adapter.execute_request([{"role": "user", "content": "Hi"}], max_retries=3)
@@ -188,7 +188,7 @@ async def test_transient_503_retries_and_succeeds():
 
     provider = ProviderProfile(id="p1", name="P1", base_url="http://localhost:8000/v1", api_key_env="DUMMY")
     model = ModelProfile(id="m1", provider_id="p1", upstream_model_id="test-model")
-    adapter = OpenAICompatibleAdapter(provider, model, http_client=client)
+    adapter = OpenAICompatibleAdapter(provider, model, api_key="test-key", http_client=client)
 
     res = await adapter.execute_request(
         [{"role": "user", "content": "Hi"}],

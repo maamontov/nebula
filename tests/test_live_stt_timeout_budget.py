@@ -94,7 +94,7 @@ async def test_per_attempt_timeout_override_reaches_the_request():
         return httpx.Response(200, json={"text": "ок"})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    adapter = ADAPTER_CLS(_profile(timeout_seconds=60.0), http_client=client)
+    adapter = ADAPTER_CLS(_profile(timeout_seconds=60.0), api_key="test-key", http_client=client)
 
     await adapter.transcribe_audio(b"RIFF....", timeout_seconds=STT_TURN_ATTEMPT_TIMEOUT_SEC)
     assert observed == [STT_TURN_ATTEMPT_TIMEOUT_SEC]
@@ -120,7 +120,7 @@ async def test_adapter_timeout_fails_fast_with_single_attempt():
         raise httpx.ReadTimeout("upstream did not answer", request=request)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    adapter = ADAPTER_CLS(_profile(timeout_seconds=60.0), http_client=client)
+    adapter = ADAPTER_CLS(_profile(timeout_seconds=60.0), api_key="test-key", http_client=client)
 
     with pytest.raises(STTTransientError):
         await adapter.transcribe_audio(
@@ -150,7 +150,7 @@ async def test_adapter_retries_its_own_timeout_within_budget():
         return httpx.Response(200, json={"text": "со второй попытки"})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    adapter = ADAPTER_CLS(_profile(timeout_seconds=60.0), http_client=client)
+    adapter = ADAPTER_CLS(_profile(timeout_seconds=60.0), api_key="test-key", http_client=client)
 
     res = await adapter.transcribe_audio(
         b"RIFF....",

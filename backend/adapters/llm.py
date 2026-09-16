@@ -66,6 +66,12 @@ def extract_clean_json_content(raw_text: str) -> str:
     return cleaned.strip()
 
 
+def _safe_upstream_text(text: str, api_key: str, limit: int = 1000) -> str:
+    """Redacts the active credential from untrusted upstream error content."""
+    safe = text.replace(api_key, "[REDACTED]") if api_key else text
+    return safe[:limit]
+
+
 class OpenAICompatibleAdapter:
     def __init__(
         self,
@@ -193,11 +199,12 @@ class OpenAICompatibleAdapter:
         headers = {
             "Content-Type": "application/json",
         }
+        api_key = ""
         if self.auth_mode == AuthMode.BEARER:
             api_key = self._get_api_key()
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
-            elif self._external_client is None:
+            else:
                 raise LLMAuthenticationError(
                     f"Missing API key: provider '{self.provider.name}' requires Bearer authentication."
                 )
@@ -219,7 +226,8 @@ class OpenAICompatibleAdapter:
 
                     if resp.status_code in (401, 403):
                         raise LLMAuthenticationError(
-                            f"Authentication error {resp.status_code}: {resp.text}"
+                            f"Authentication error {resp.status_code}: "
+                            f"{_safe_upstream_text(resp.text, api_key)}"
                         )
 
                     if resp.status_code == 429:
@@ -228,7 +236,8 @@ class OpenAICompatibleAdapter:
                         retry_after = min(raw_retry_after, 5.0)
                         if attempt >= max_retries:
                             raise LLMRateLimitError(
-                                f"Rate limit exceeded after {attempt} attempts: {resp.text}",
+                                f"Rate limit exceeded after {attempt} attempts: "
+                                f"{_safe_upstream_text(resp.text, api_key)}",
                                 retry_after=raw_retry_after,
                             )
                         logger.warning("Rate limit hit, sleeping for %.2fs (capped from %.2fs)", retry_after, raw_retry_after)
@@ -238,14 +247,17 @@ class OpenAICompatibleAdapter:
 
                     if resp.status_code >= 500:
                         if attempt >= max_retries:
-                            raise LLMTransientError(f"Server error {resp.status_code}: {resp.text}")
+                            raise LLMTransientError(
+                                f"Server error {resp.status_code}: "
+                                f"{_safe_upstream_text(resp.text, api_key)}"
+                            )
                         logger.warning("Upstream server error %d, retry %d/%d", resp.status_code, attempt, max_retries)
                         await asyncio.sleep(backoff)
                         backoff *= 2.0
                         continue
 
                     if resp.status_code != 200:
-                        err_body = resp.text
+                        err_body = _safe_upstream_text(resp.text, api_key)
                         if "context_length_exceeded" in err_body.lower() or "maximum context length" in err_body.lower():
                             raise LLMContextLengthExceededError(f"Context length exceeded: {err_body}")
                         raise LLMAdapterError(f"Unexpected response status {resp.status_code}: {err_body}")
@@ -253,7 +265,9 @@ class OpenAICompatibleAdapter:
                     data = resp.json()
                     choices = data.get("choices", [])
                     if not choices:
-                        raise LLMTransientError(f"Empty choices in response: {data}")
+                        raise LLMTransientError(
+                            f"Empty choices in response: {_safe_upstream_text(str(data), api_key)}"
+                        )
 
                     raw_content = choices[0].get("message", {}).get("content", "")
                     if not raw_content:
@@ -282,7 +296,8 @@ class OpenAICompatibleAdapter:
                                 })
                                 continue
                             raise LLMInvalidResponseFormatError(
-                                f"Failed to obtain valid JSON from model after {attempt} attempts: {raw_content}"
+                                f"Failed to obtain valid JSON from model after {attempt} attempts: "
+                                f"{_safe_upstream_text(raw_content, api_key)}"
                             )
 
                     return {

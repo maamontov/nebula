@@ -17,6 +17,12 @@ from contracts.settings import AuthMode
 logger = logging.getLogger(__name__)
 
 
+def _safe_upstream_text(text: str, api_key: str, limit: int = 1000) -> str:
+    """Redacts the active credential from untrusted upstream error content."""
+    safe = text.replace(api_key, "[REDACTED]") if api_key else text
+    return safe[:limit]
+
+
 class STTAdapterError(Exception):
     """Base exception for STT failures."""
 
@@ -97,11 +103,12 @@ class OpenAICompatibleSTTAdapter:
         дедлайна, иначе внешняя отмена сработает раньше и ретраи этого метода не выполнятся.
         """
         headers = {}
+        api_key = ""
         if self.auth_mode == AuthMode.BEARER:
             api_key = self._get_api_key()
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
-            elif self._external_client is None:
+            else:
                 raise STTAuthenticationError(
                     f"Missing STT API key: provider '{self.profile.name}' requires Bearer authentication."
                 )
@@ -139,14 +146,16 @@ class OpenAICompatibleSTTAdapter:
 
                     if resp.status_code in (401, 403):
                         raise STTAuthenticationError(
-                            f"STT Authentication error {resp.status_code}: {resp.text}"
+                            f"STT Authentication error {resp.status_code}: "
+                            f"{_safe_upstream_text(resp.text, api_key)}"
                         )
 
                     if resp.status_code == 429:
                         retry_h = resp.headers.get("Retry-After")
                         retry_sec = float(retry_h) if retry_h and retry_h.isdigit() else 10.0
                         raise STTRateLimitError(
-                            f"STT Rate limit exceeded (retry_after={retry_sec}s): {resp.text}",
+                            f"STT Rate limit exceeded (retry_after={retry_sec}s): "
+                            f"{_safe_upstream_text(resp.text, api_key)}",
                             retry_after=retry_sec,
                         )
 
@@ -164,7 +173,8 @@ class OpenAICompatibleSTTAdapter:
                     if resp.status_code >= 500:
                         if attempt >= max_retries:
                             raise STTTransientError(
-                                f"STT Server error {resp.status_code}: {resp.text}"
+                                f"STT Server error {resp.status_code}: "
+                                f"{_safe_upstream_text(resp.text, api_key)}"
                             )
                         logger.warning("STT upstream error %d, retrying (%d/%d)", resp.status_code, attempt, max_retries)
                         await asyncio.sleep(backoff)
@@ -173,7 +183,8 @@ class OpenAICompatibleSTTAdapter:
 
                     if resp.status_code != 200:
                         raise STTAdapterError(
-                            f"Unexpected STT response status {resp.status_code}: {resp.text}"
+                            f"Unexpected STT response status {resp.status_code}: "
+                            f"{_safe_upstream_text(resp.text, api_key)}"
                         )
 
                     latency = time.perf_counter() - t0

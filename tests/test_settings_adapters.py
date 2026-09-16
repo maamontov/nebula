@@ -40,7 +40,10 @@ async def test_auth_mode_none_does_not_send_authorization_header():
 
 
 @pytest.mark.asyncio
-async def test_bearer_without_key_fails_before_http_call():
+async def test_bearer_without_key_fails_before_http_call(monkeypatch):
+    monkeypatch.delenv("NEBULA_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("NEBULA_STT_API_KEY", raising=False)
+    monkeypatch.delenv("NOT_SET", raising=False)
     provider = ProviderProfile(id="p1", name="P1", base_url="http://127.0.0.1:8000/v1", api_key_env="NOT_SET")
     model = ModelProfile(id="m1", provider_id="p1", upstream_model_id="m1")
 
@@ -59,6 +62,83 @@ async def test_bearer_without_key_fails_before_http_call():
     stt_adapter = OpenAICompatibleSTTAdapter(stt_prof, api_key=None, auth_mode=AuthMode.BEARER)
     with pytest.raises(STTAuthenticationError, match="requires Bearer authentication"):
         await stt_adapter.transcribe_audio(b"fake-audio")
+
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    llm_with_client = OpenAICompatibleAdapter(
+        provider,
+        model,
+        api_key=None,
+        auth_mode=AuthMode.BEARER,
+        http_client=client,
+    )
+    with pytest.raises(LLMAuthenticationError, match="requires Bearer authentication"):
+        await llm_with_client.execute_request([{"role": "user", "content": "hi"}])
+
+    stt_with_client = OpenAICompatibleSTTAdapter(
+        stt_prof,
+        api_key=None,
+        auth_mode=AuthMode.BEARER,
+        http_client=client,
+    )
+    with pytest.raises(STTAuthenticationError, match="requires Bearer authentication"):
+        await stt_with_client.transcribe_audio(b"fake-audio")
+
+    assert calls == 0
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_upstream_auth_errors_redact_api_keys():
+    secret = "secret-that-must-not-leak"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text=f"Rejected Authorization: Bearer {secret}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = ProviderProfile(
+        id="p1",
+        name="P1",
+        base_url="http://127.0.0.1:8000/v1",
+        api_key_env="NOT_SET",
+    )
+    model = ModelProfile(id="m1", provider_id="p1", upstream_model_id="m1")
+    llm = OpenAICompatibleAdapter(
+        provider,
+        model,
+        api_key=secret,
+        auth_mode=AuthMode.BEARER,
+        http_client=client,
+    )
+    with pytest.raises(LLMAuthenticationError) as llm_error:
+        await llm.execute_request([{"role": "user", "content": "hi"}], max_retries=1)
+    assert secret not in str(llm_error.value)
+    assert "[REDACTED]" in str(llm_error.value)
+
+    stt_profile = STTProfile(
+        id="stt1",
+        name="STT1",
+        endpoint_url="http://127.0.0.1:8000/v1/audio/transcriptions",
+        protocol=STTProtocol.BATCH,
+        model_id="whisper",
+    )
+    stt = OpenAICompatibleSTTAdapter(
+        stt_profile,
+        api_key=secret,
+        auth_mode=AuthMode.BEARER,
+        http_client=client,
+    )
+    with pytest.raises(STTAuthenticationError) as stt_error:
+        await stt.transcribe_audio(b"fake-audio", max_retries=1)
+    assert secret not in str(stt_error.value)
+    assert "[REDACTED]" in str(stt_error.value)
+    await client.aclose()
 
 
 @pytest.mark.asyncio

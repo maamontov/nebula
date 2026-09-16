@@ -41,8 +41,10 @@ class CredentialStore:
 
     def read_snapshot(self, revision: int) -> dict[str, str]:
         """
-        Reads non-empty key-value pairs from the versioned secrets snapshot.
+        Reads key-value pairs from the versioned secrets snapshot.
         Only allowed keys (NEBULA_STT_API_KEY, NEBULA_LLM_API_KEY) are extracted.
+        An explicitly empty value is retained as a tombstone that suppresses a
+        legacy provider-specific environment fallback after a clear action.
         """
         if revision <= 0:
             return {}
@@ -62,7 +64,7 @@ class CredentialStore:
                     k, v = line.split("=", 1)
                     k = k.strip()
                     v = v.strip()
-                    if k in ALLOWED_KEYS and v:
+                    if k in ALLOWED_KEYS:
                         secrets[k] = v
         except OSError as err:
             logger.warning("Failed to read credentials snapshot %s: %s", path.name, err)
@@ -99,11 +101,17 @@ class CredentialStore:
 
         # 2. UI-managed snapshot
         snapshot = self.read_snapshot(revision)
-        snapshot_val = snapshot.get(key_name)
-        if snapshot_val:
-            return snapshot_val, CredentialStatus(
-                configured=True,
-                source="runtime_file",
+        if key_name in snapshot:
+            snapshot_val = snapshot[key_name]
+            if snapshot_val:
+                return snapshot_val, CredentialStatus(
+                    configured=True,
+                    source="runtime_file",
+                    editable=True,
+                )
+            return None, CredentialStatus(
+                configured=False,
+                source="none",
                 editable=True,
             )
 
@@ -163,7 +171,7 @@ class CredentialStore:
             if action == ApiKeyAction.PRESERVE:
                 return current_snapshot.get(key)
             if action == ApiKeyAction.CLEAR:
-                return None
+                return ""
             if action == ApiKeyAction.REPLACE:
                 if not val or not val.strip():
                     raise ValueError("Replacement key must not be empty or whitespace")
@@ -189,9 +197,9 @@ class CredentialStore:
         temp_path = Path(temp_path_str)
         try:
             with open(fd, "w", encoding="utf-8") as f:
-                if next_stt:
+                if next_stt is not None:
                     f.write(f"{STT_KEY_NAME}={next_stt}\n")
-                if next_llm:
+                if next_llm is not None:
                     f.write(f"{LLM_KEY_NAME}={next_llm}\n")
                 f.flush()
                 os.fsync(f.fileno())
@@ -200,12 +208,13 @@ class CredentialStore:
             if os.name != "nt":
                 os.chmod(temp_path, 0o600)
 
-            os.replace(temp_path, target_path)
+            # Publish the fully written snapshot without ever replacing an existing
+            # revision. Revisions are immutable: overwriting one could corrupt the
+            # credentials currently referenced by SQLite after a stale/concurrent PUT.
+            os.link(temp_path, target_path)
             return target_path
-        except Exception:
-            if temp_path.exists():
-                temp_path.unlink(missing_ok=True)
-            raise
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def cleanup_snapshot(self, revision: int) -> None:
         """Deletes a snapshot file (used when an update transaction fails)."""

@@ -28,7 +28,7 @@ async def test_successful_stt_transcription(stt_profile):
 
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
-    adapter = OpenAICompatibleSTTAdapter(stt_profile, http_client=client)
+    adapter = OpenAICompatibleSTTAdapter(stt_profile, api_key="test-key", http_client=client)
 
     fake_wav = b"RIFF....WAVEfmt ...."
     res = await adapter.transcribe_audio(fake_wav, language="ru")
@@ -46,7 +46,7 @@ async def test_stt_auth_error_not_retried(stt_profile):
 
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
-    adapter = OpenAICompatibleSTTAdapter(stt_profile, http_client=client)
+    adapter = OpenAICompatibleSTTAdapter(stt_profile, api_key="test-key", http_client=client)
 
     fake_wav = b"RIFF...."
     with pytest.raises(STTAuthenticationError):
@@ -68,7 +68,7 @@ async def test_stt_server_error_retries_and_succeeds(stt_profile):
 
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
-    adapter = OpenAICompatibleSTTAdapter(stt_profile, http_client=client)
+    adapter = OpenAICompatibleSTTAdapter(stt_profile, api_key="test-key", http_client=client)
 
     fake_wav = b"RIFF...."
     res = await adapter.transcribe_audio(fake_wav, max_retries=3, initial_backoff=0.01)

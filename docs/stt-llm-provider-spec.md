@@ -167,8 +167,9 @@ Nebula поддерживает динамическую независимую 
 #### 6.1. Архитектура разделения конфигурации и секретов
 - **Не секретная конфигурация**: хранится в таблице SQLite `ai_settings` (singleton строка `id=1`) в виде JSON-конфигураций `transcription_config_json` и `text_analysis_config_json`. Включает URL, имена провайдеров, model ID, параметры reasoning, температуру, лимиты токенов, таймауты и concurrency.
 - **Секреты (API-ключи)**: API-ключи **никогда не сохраняются в БД, не логируются и не возвращаются клиенту** (write-only). При сохранении настроек через UI/API ключи записываются в версионированный защищённый файл `data/provider-secrets-v<revision>.env` с правами доступа `0600` на Unix.
-- **Приоритет окружения**: если ключ задан через системные переменные окружения (`NEBULA_STT_API_KEY`, `NEBULA_LLM_API_KEY`, `ROUTERAI_API_KEY`, `PLUSVIBE_API_KEY`), он имеет высший приоритет, помечается источником `process_environment` и блокируется для редактирования через UI (`editable=false`).
+- **Приоритет окружения**: фиксированные переменные процесса `NEBULA_STT_API_KEY` и `NEBULA_LLM_API_KEY` имеют высший приоритет, помечаются источником `process_environment` и блокируются для редактирования через UI (`editable=false`). Legacy-переменные `ROUTERAI_API_KEY` и `PLUSVIBE_API_KEY` используются только для соответствующего встроенного пресета на его штатном сетевом origin.
 - **Действия с ключами (ApiKeyAction)**: поддерживаются `preserve` (сохранить текущий активный ключ), `replace` (записать новое переданное значение) и `clear` (удалить ключ из хранилища).
+- **Привязка к origin**: UI-managed или legacy-ключ нельзя молча перенести на другой сетевой origin через `preserve`; при смене origin требуется явное действие `replace` или `clear`. Probe без переданного ключа может повторно использовать активный ключ только на том же origin.
 
 #### 6.2. OCC и транзакционные блокировки
 - Запросы на обновление настроек (`PUT /api/v1/settings/ai`) передают `expected_revision`. При несовпадении ревизии возвращается `409 Conflict` (Optimistic Concurrency Control).
@@ -196,8 +197,9 @@ Nebula supports dynamic, independent configuration of STT and LLM providers dire
 #### 6.1. Configuration and Secret Separation Architecture
 - **Non-Secret Configuration**: Persisted in the SQLite `ai_settings` table (singleton row `id=1`) as JSON documents `transcription_config_json` and `text_analysis_config_json`. Holds URLs, provider identifiers, model IDs, reasoning policies, temperature, token bounds, timeouts, and concurrency caps.
 - **Secrets (API Keys)**: API keys are **never stored in the database, never logged, and never returned to clients** (write-only). When saved via UI/API, secrets are committed to a versioned, restricted file `data/provider-secrets-v<revision>.env` with `0600` permissions on Unix.
-- **Environment Precedence**: If credentials are provided via process environment variables (`NEBULA_STT_API_KEY`, `NEBULA_LLM_API_KEY`, `ROUTERAI_API_KEY`, `PLUSVIBE_API_KEY`), they take top precedence, are marked as `process_environment`, and cannot be modified via UI (`editable=false`).
+- **Environment Precedence**: The fixed process variables `NEBULA_STT_API_KEY` and `NEBULA_LLM_API_KEY` take top precedence, are reported as `process_environment`, and cannot be modified via UI (`editable=false`). Legacy `ROUTERAI_API_KEY` and `PLUSVIBE_API_KEY` values are used only for the matching built-in preset on its canonical network origin.
 - **Key Actions (ApiKeyAction)**: Supported actions are `preserve` (retain current active secret), `replace` (commit newly supplied secret), and `clear` (remove key from runtime store).
+- **Origin binding**: A UI-managed or legacy credential cannot be silently carried to a different network origin with `preserve`; changing origin requires an explicit `replace` or `clear`. A probe without a supplied key may reuse the active credential only for the same origin.
 
 #### 6.2. OCC and Transactional Blockers
 - Update requests (`PUT /api/v1/settings/ai`) submit `expected_revision`. A mismatch returns `409 Conflict` (Optimistic Concurrency Control).

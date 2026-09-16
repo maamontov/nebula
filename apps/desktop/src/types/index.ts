@@ -334,7 +334,7 @@ export interface JobStatusResponse {
 
 export type ProviderPreset = 'routerai' | 'plusvibe' | 'custom';
 export type AuthMode = 'bearer' | 'none';
-export type StructuredOutputMode = 'json_object' | 'json_schema';
+export type StructuredOutputMode = 'json_object' | 'json_schema' | 'prompt_instruction';
 export type ReasoningPolicy = 'provider_default' | 'disable_enable_thinking' | 'disable_reasoning_effort';
 export type ApiKeyAction = 'preserve' | 'replace' | 'clear';
 export type TestTarget = 'stt' | 'llm';

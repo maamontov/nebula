@@ -170,7 +170,7 @@ UI не должен позволять вводить произвольное 
 Для UI-managed ключей использовать versioned dotenv snapshots в каноническом
 `NEBULA_DATA_DIR`, например `provider-secrets-v3.env`. Номер файла равен revision строки
 `ai_settings`. Каталог `data/` уже исключён из Git. Snapshot сначала полностью записывается через
-временный файл и atomic replace и только после этого новая DB revision делает его активным. На
+временный файл и атомарно публикуется без замены уже существующей revision; только после этого новая DB revision делает его активным. На
 Unix выставить `0600`. На Windows файл должен создаваться в user-owned app data directory, без
 расширения ACL на других пользователей.
 
@@ -382,7 +382,7 @@ SQLite и filesystem нельзя обновить одной транзакци
 1. прочитать current revision и effective credentials, не возвращая их наружу;
 2. полностью провалидировать request;
 3. собрать полный snapshot для `expected_revision + 1` во временном файле;
-4. atomically rename его в `provider-secrets-v<next_revision>.env`; пока DB не обновлена, этот файл
+4. atomically опубликовать его как `provider-secrets-v<next_revision>.env`, не заменяя существующий файл; пока DB не обновлена, этот файл
    никем не используется;
 5. выполнить `update_ai_settings()` с повторной проверкой blockers и OCC в одной DB transaction;
 6. если transaction не прошла, удалить неактивный новый snapshot; старая DB revision продолжает

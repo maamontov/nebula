@@ -90,6 +90,39 @@ def test_resolver_reasoning_policy_mapping():
     assert custom.primary_model.reasoning_policy == ReasoningPolicy.PROVIDER_DEFAULT
 
 
+def test_legacy_provider_key_is_not_used_for_a_different_origin(repo, cred_store, monkeypatch):
+    monkeypatch.delenv("NEBULA_STT_API_KEY", raising=False)
+    monkeypatch.delenv("NEBULA_LLM_API_KEY", raising=False)
+    monkeypatch.setenv("ROUTERAI_API_KEY", "legacy-router-secret")
+
+    stt_conf = TranscriptionSettings(
+        preset=ProviderPreset.ROUTERAI,
+        provider_id="routerai",
+        provider_name="RouterAI-compatible STT",
+        endpoint_url="https://unrelated.example/v1/audio/transcriptions",
+        model_id="stt-model",
+    )
+    llm_conf = TextAnalysisSettings(
+        preset=ProviderPreset.ROUTERAI,
+        provider_id="routerai",
+        provider_name="RouterAI-compatible LLM",
+        base_url="https://unrelated.example/v1",
+        primary_model=AnalysisModelSettings(model_id="llm-model"),
+    )
+    repo.update_ai_settings(
+        expected_revision=0,
+        transcription_config=stt_conf.model_dump(mode="json"),
+        text_analysis_config=llm_conf.model_dump(mode="json"),
+    )
+
+    response, runtime = resolve_ai_settings(repo, cred_store)
+
+    assert response.stt_credentials.configured is False
+    assert response.llm_credentials.configured is False
+    assert runtime.stt_credentials.api_key is None
+    assert runtime.llm_credentials.api_key is None
+
+
 def test_resolver_from_database_row(repo, cred_store, monkeypatch):
     # Set env vars that should NOT leak into DB-managed config
     monkeypatch.setenv("NEBULA_LLM_MODEL", "ignored-env-model")
