@@ -28,11 +28,11 @@ from backend.adapters.llm import OpenAICompatibleAdapter
 from backend.adapters.stt import OpenAICompatibleSTTAdapter, STTAuthenticationError
 from backend.core.evidence_validator import validate_proposal
 from backend.core.profiles import (
+    get_default_provider,
+    get_default_stt_profile,
     get_plusvibe_deepseek_model,
     get_plusvibe_gemini_model,
-    get_plusvibe_provider,
     get_plusvibe_qwen_model,
-    get_plusvibe_whisper_stt,
 )
 from contracts.audio import TrackType
 from contracts.domain import (
@@ -65,30 +65,31 @@ def generate_synthetic_wav_bytes(duration_sec: float = 2.0, freq_hz: float = 440
 
 
 async def run_stage2_evaluation() -> int:
-    api_key = os.getenv("PLUSVIBE_API_KEY", "")
-    base_url = os.getenv("NEBULA_LLM_BASE_URL", "https://plusvibeapi.ru/v1")
-    stt_model_id = os.getenv("NEBULA_STT_MODEL", "whisper-large-v3-turbo")
+    api_key = os.getenv("ROUTERAI_API_KEY", "") or os.getenv("PLUSVIBE_API_KEY", "")
+    key_env_var = "ROUTERAI_API_KEY" if os.getenv("ROUTERAI_API_KEY") else "PLUSVIBE_API_KEY"
+    base_url = os.getenv("NEBULA_LLM_BASE_URL", "https://routerai.ru/api/v1")
+    stt_model_id = os.getenv("NEBULA_STT_MODEL", "qwen/qwen3-asr-1.7b")
 
     print("==================================================")
     print("Nebula Stage 2: AI & STT Live Acceptance Probe")
     print("==================================================")
     print(f"Base URL:      {base_url}")
     print(f"STT Model:     {stt_model_id}")
-    print(f"API Key:       {'[CONFIGURED]' if api_key else '[MISSING in .env]'}")
+    print(f"API Key ({key_env_var}): {'[CONFIGURED]' if api_key else '[MISSING in .env]'}")
     print("==================================================\n")
 
     if not api_key:
-        print("ОШИБКА: Переменная PLUSVIBE_API_KEY не задана в .env или окружении.")
-        print("Заполни PLUSVIBE_API_KEY в файле .env")
+        print(f"ОШИБКА: Переменная {key_env_var} не задана в .env или окружении.")
+        print(f"Заполни {key_env_var} в файле .env")
         return 1
 
-    provider = get_plusvibe_provider()
+    provider = get_default_provider()
     provider.base_url = base_url
 
-    stt_profile = get_plusvibe_whisper_stt()
+    stt_profile = get_default_stt_profile()
     stt_profile.model_id = stt_model_id
 
-    stt_adapter = OpenAICompatibleSTTAdapter(stt_profile, api_key_env="PLUSVIBE_API_KEY")
+    stt_adapter = OpenAICompatibleSTTAdapter(stt_profile, api_key_env=key_env_var)
 
     stt_ok = False
     stt_latency = 0.0

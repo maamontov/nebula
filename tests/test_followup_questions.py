@@ -335,3 +335,116 @@ def test_validate_followup_response_prompt_injection_sanitization():
     res, errors = validate_followup_response(raw_response, ctx)
     assert any("suspicious injection pattern" in e for e in errors)
     assert any("forbidden attribute" in e for e in errors)
+
+
+def _guide_question() -> PlannedQuestion:
+    return PlannedQuestion(
+        id="q1",
+        title="Кэширование",
+        prompt="Как избежать повторной обработки сообщения?",
+        criteria=[RubricCriterion(id="c1", title="Идемпотентность", description="Ключи дедупликации", min_score=1, max_score=5, weight=1.0)],
+    )
+
+
+def _guide_context_without_answer():
+    return build_followup_context(
+        interview_id="inv-guide-1",
+        question_id="q1",
+        mode=FollowUpMode.GUIDE,
+        rubric_questions=[_guide_question()],
+        transcript_segments=[
+            TranscriptSegment(
+                id="s_inter",
+                track_id="interviewer",
+                start_time_ms=0,
+                end_time_ms=3000,
+                text="Как избежать повторной обработки сообщения?",
+                is_final=True,
+            )
+        ],
+        existing_associations=[],
+    )
+
+
+def test_guide_context_without_candidate_answer_is_allowed():
+    """Наводящий вопрос можно запросить без ответа кандидата; уточняющий — нельзя."""
+    ctx = _guide_context_without_answer()
+    assert ctx.has_candidate_answer is False
+    assert ctx.candidate_segments == []
+    assert ctx.candidate_fingerprint is None
+
+
+def test_guide_prompt_without_answer_forbids_fabricated_quotes():
+    """Промпт для наводящего вопроса без ответа прямо запрещает выдумывать цитаты."""
+    ctx = _guide_context_without_answer()
+    messages = format_followup_prompt(ctx)
+    system_message = messages[0]["content"]
+    assert "БЕЗ ОТВЕТА КАНДИДАТА" in system_message
+    assert "ОБЯЗАНО быть пустым списком []" in system_message
+    # Обычное требование цитировать ответ кандидата в этом режиме не должно применяться
+    assert "ОБЯЗАНО ссылаться на 1..3 конкретных цитаты" not in system_message
+    # Реплики интервьюера не подставляются как доказательство кандидата
+    assert messages[1]["content"].count("ОТВЕТ КАНДИДАТА") == 1
+
+
+def test_validate_guide_without_answer_accepts_empty_source_refs():
+    """Пустой source_refs допустим только для guide без ответа кандидата."""
+    ctx = _guide_context_without_answer()
+    raw_response = {
+        "suggestions": [
+            {
+                "kind": "guide",
+                "question_text": "Что можно сохранить вместе с сообщением, чтобы узнать, обрабатывали ли его раньше?",
+                "purpose": "Подтолкнуть к идее ключа дедупликации, не называя готового решения.",
+                "criterion_ids": ["c1"],
+                "source_refs": [],
+            }
+        ]
+    }
+    res, errors = validate_followup_response(raw_response, ctx)
+    assert errors == []
+    assert len(res.suggestions) == 1
+    assert res.suggestions[0].source_refs == []
+
+
+def test_validate_guide_without_answer_rejects_fabricated_refs():
+    """Даже без ответа кандидата подставленная цитата проверяется и отклоняется."""
+    ctx = _guide_context_without_answer()
+    raw_response = {
+        "suggestions": [
+            {
+                "kind": "guide",
+                "question_text": "Что можно сохранить вместе с сообщением, чтобы узнать, обрабатывали ли его раньше?",
+                "purpose": "Подтолкнуть к идее ключа дедупликации.",
+                "criterion_ids": ["c1"],
+                "source_refs": [{"segment_id": "s_inter", "exact_quote": "Как избежать повторной обработки сообщения?"}],
+            }
+        ]
+    }
+    _, errors = validate_followup_response(raw_response, ctx)
+    assert any("not found in candidate snapshot" in e for e in errors)
+
+
+def test_probe_without_answer_still_requires_candidate_evidence():
+    """Для probe требование ссылок на ответ кандидата не ослабляется."""
+    ctx = build_followup_context(
+        interview_id="inv-probe-1",
+        question_id="q1",
+        mode=FollowUpMode.PROBE,
+        rubric_questions=[_guide_question()],
+        transcript_segments=[],
+        existing_associations=[],
+    )
+    raw_response = {
+        "suggestions": [
+            {
+                "kind": "clarify",
+                "question_text": "Какой ключ вы использовали?",
+                "purpose": "Проверка деталей.",
+                "criterion_ids": ["c1"],
+                "source_refs": [],
+            }
+        ]
+    }
+    _, errors = validate_followup_response(raw_response, ctx)
+    assert any("source_refs must have 1..3 references" in e for e in errors)

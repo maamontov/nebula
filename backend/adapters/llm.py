@@ -85,6 +85,11 @@ class OpenAICompatibleAdapter:
                 api_key = os.getenv(self.provider.api_key_env, "")
             except Exception:
                 pass
+        if not api_key:
+            for fallback_env in ("ROUTERAI_API_KEY", "PLUSVIBE_API_KEY", "OPENAI_API_KEY", "NEBULA_API_KEY"):
+                api_key = os.getenv(fallback_env, "")
+                if api_key:
+                    break
         return api_key
 
     def _build_url(self, endpoint: str) -> str:
@@ -112,6 +117,21 @@ class OpenAICompatibleAdapter:
 
         if self.model.max_output_tokens:
             payload["max_tokens"] = self.model.max_output_tokens
+
+        # Vendor-specific switch that disables internal reasoning/thinking tokens. Only sent when
+        # the exact provider/model pair declared it (see ModelProfile.thinking_disable_payload).
+        # Reserved keys are never overridden so a bad profile cannot corrupt the request contract.
+        if self.model.thinking_disable_payload:
+            reserved_keys = {"model", "messages", "response_format"}
+            for extra_key, extra_value in self.model.thinking_disable_payload.items():
+                if extra_key in reserved_keys:
+                    logger.warning(
+                        "Ignoring reserved key '%s' in thinking_disable_payload of model profile %s",
+                        extra_key,
+                        self.model.id,
+                    )
+                    continue
+                payload[extra_key] = extra_value
 
         # Handle structured output
         if json_schema is not None:

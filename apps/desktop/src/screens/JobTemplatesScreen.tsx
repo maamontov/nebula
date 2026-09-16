@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { JobTemplate, PlannedQuestion, RubricCriterion } from '../types';
 import {
   listJobTemplates,
@@ -27,9 +27,41 @@ import {
   ArrowRight,
 } from 'lucide-react';
 
+const createDefaultTemplate = () => ({
+  title: 'Новая должность',
+  role: 'Software Engineer',
+  level: 'Middle',
+  description: '',
+  questions: [
+    {
+      id: `q-${Date.now()}-1`,
+      title: 'Основной вопрос',
+      prompt: 'Сформулируйте вопрос для кандидата...',
+      weight: 1.0,
+      order_index: 0,
+      criteria: [
+        {
+          id: `crit-${Date.now()}-1`,
+          title: 'Качество ответа',
+          description: 'Критерии оценки и ожидаемые аспекты ответа',
+          min_score: 1.0,
+          max_score: 5.0,
+          weight: 1.0,
+          levels_description: {
+            1: 'Ответ не раскрыт',
+            3: 'Базовое понимание',
+            5: 'Глубокие экспертные знания',
+          },
+        },
+      ],
+    },
+  ],
+});
+
 export const JobTemplatesScreen: React.FC = () => {
   const [templates, setTemplates] = useState<JobTemplate[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
+  const [isCreatingNew, setIsCreatingNew] = useState(false);
   const [includeArchived, setIncludeArchived] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
@@ -45,13 +77,10 @@ export const JobTemplatesScreen: React.FC = () => {
     level: string;
     description: string;
     questions: PlannedQuestion[];
-  }>({
-    title: '',
-    role: '',
-    level: 'Middle',
-    description: '',
-    questions: [],
-  });
+  }>(createDefaultTemplate());
+
+  const isCreatingNewRef = useRef(isCreatingNew);
+  isCreatingNewRef.current = isCreatingNew;
 
   // Modal for copying question to another template
   const [copyQuestionModal, setCopyQuestionModal] = useState<{
@@ -60,28 +89,55 @@ export const JobTemplatesScreen: React.FC = () => {
     targetTemplateId: string;
   } | null>(null);
 
+  // Modal for deleting template
+  const [deletingTemplate, setDeletingTemplate] = useState<{
+    id: string;
+    title: string;
+  } | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteErrorMsg, setDeleteErrorMsg] = useState<string | null>(null);
+
   const fetchTemplates = useCallback(async () => {
     setIsLoading(true);
     try {
       const data = await listJobTemplates(includeArchived);
       setTemplates(data);
-      if (data.length > 0 && !selectedTemplateId) {
-        setSelectedTemplateId(data[0].id);
-      }
+      return data;
     } catch (err: any) {
       setErrorMsg(err.message || 'Ошибка загрузки шаблонов должностей');
+      return [];
     } finally {
       setIsLoading(false);
     }
-  }, [includeArchived, selectedTemplateId]);
+  }, [includeArchived]);
 
   useEffect(() => {
-    fetchTemplates();
+    let isCancelled = false;
+    fetchTemplates().then((data) => {
+      if (isCancelled || !data) return;
+      if (!isCreatingNewRef.current) {
+        if (data.length === 0) {
+          setIsCreatingNew(true);
+          setSelectedTemplateId(null);
+          setEditingTemplate(createDefaultTemplate());
+        } else {
+          setSelectedTemplateId((prev) => {
+            if (prev && data.some((t) => t.id === prev)) {
+              return prev;
+            }
+            return data[0].id;
+          });
+        }
+      }
+    });
+    return () => {
+      isCancelled = true;
+    };
   }, [fetchTemplates]);
 
   // Load selected template into editor
   useEffect(() => {
-    if (!selectedTemplateId) return;
+    if (isCreatingNew || !selectedTemplateId) return;
     const tpl = templates.find((t) => t.id === selectedTemplateId);
     if (tpl) {
       setEditingTemplate({
@@ -94,40 +150,18 @@ export const JobTemplatesScreen: React.FC = () => {
       });
       setSaveSuccessMsg(null);
     }
-  }, [selectedTemplateId, templates]);
+  }, [selectedTemplateId, templates, isCreatingNew]);
 
   const handleCreateNew = () => {
-    const newTpl = {
-      title: 'Новая должность',
-      role: 'Software Engineer',
-      level: 'Middle',
-      description: '',
-      questions: [
-        {
-          id: `q-${Date.now()}-1`,
-          title: 'Основной вопрос',
-          prompt: 'Сформулируйте вопрос для кандидата...',
-          weight: 1.0,
-          criteria: [
-            {
-              id: `crit-${Date.now()}-1`,
-              title: 'Качество ответа',
-              description: 'Критерии оценки и ожидаемые аспекты ответа',
-              min_score: 1.0,
-              max_score: 5.0,
-              weight: 1.0,
-              levels_description: {
-                1: 'Ответ не раскрыт',
-                3: 'Базовое понимание',
-                5: 'Глубокие экспертные знания',
-              },
-            },
-          ],
-        },
-      ],
-    };
-    setEditingTemplate(newTpl);
+    setIsCreatingNew(true);
     setSelectedTemplateId(null);
+    setSaveSuccessMsg(null);
+    setEditingTemplate(createDefaultTemplate());
+  };
+
+  const handleSelectTemplate = (id: string) => {
+    setIsCreatingNew(false);
+    setSelectedTemplateId(id);
     setSaveSuccessMsg(null);
   };
 
@@ -180,8 +214,17 @@ export const JobTemplatesScreen: React.FC = () => {
           questions: editingTemplate.questions,
         });
         setSaveSuccessMsg('Должность успешно создана');
-        await fetchTemplates();
+        setEditingTemplate({
+          id: created.id,
+          title: created.title,
+          role: created.role,
+          level: created.level || 'Middle',
+          description: created.description || '',
+          questions: JSON.parse(JSON.stringify(created.questions || [])),
+        });
+        setIsCreatingNew(false);
         setSelectedTemplateId(created.id);
+        await fetchTemplates();
       }
       setTimeout(() => setSaveSuccessMsg(null), 3000);
     } catch (err: any) {
@@ -195,8 +238,9 @@ export const JobTemplatesScreen: React.FC = () => {
     e.stopPropagation();
     try {
       const dup = await duplicateJobTemplate(id);
-      await fetchTemplates();
+      setIsCreatingNew(false);
       setSelectedTemplateId(dup.id);
+      await fetchTemplates();
     } catch (err: any) {
       alert(`Ошибка дублирования: ${err.message || err}`);
     }
@@ -216,17 +260,46 @@ export const JobTemplatesScreen: React.FC = () => {
     }
   };
 
-  const handleDelete = async (id: string, e: React.MouseEvent) => {
+  const handleOpenDeleteModal = (tpl: JobTemplate, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!confirm('Вы уверены, что хотите удалить эту должность?')) return;
+    setDeleteErrorMsg(null);
+    setDeletingTemplate({ id: tpl.id, title: tpl.title });
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deletingTemplate) return;
+    setIsDeleting(true);
+    setDeleteErrorMsg(null);
     try {
-      await deleteJobTemplate(id);
-      if (selectedTemplateId === id) {
-        setSelectedTemplateId(null);
+      await deleteJobTemplate(deletingTemplate.id);
+      const data = await fetchTemplates();
+      if (selectedTemplateId === deletingTemplate.id) {
+        if (data.length > 0) {
+          setIsCreatingNew(false);
+          setSelectedTemplateId(data[0].id);
+        } else {
+          handleCreateNew();
+        }
       }
-      await fetchTemplates();
+      setDeletingTemplate(null);
     } catch (err: any) {
-      alert(`Ошибка удаления: ${err.message || err}`);
+      setDeleteErrorMsg(err.message || 'Ошибка при удалении должности');
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  const handleArchiveInstead = async () => {
+    if (!deletingTemplate) return;
+    setIsDeleting(true);
+    try {
+      await archiveJobTemplate(deletingTemplate.id);
+      await fetchTemplates();
+      setDeletingTemplate(null);
+    } catch (err: any) {
+      setDeleteErrorMsg(`Ошибка архивации: ${err.message || err}`);
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -365,7 +438,11 @@ export const JobTemplatesScreen: React.FC = () => {
             </h2>
             <button
               onClick={handleCreateNew}
-              className="flex items-center space-x-1 px-3 py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition shadow"
+              className={`flex items-center space-x-1 px-3 py-1.5 text-xs font-semibold rounded-lg transition shadow cursor-pointer ${
+                isCreatingNew
+                  ? 'bg-indigo-700 ring-2 ring-indigo-400 text-white'
+                  : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+              }`}
             >
               <Plus className="w-3.5 h-3.5" />
               <span>Создать</span>
@@ -405,19 +482,40 @@ export const JobTemplatesScreen: React.FC = () => {
 
         {/* Template Cards List */}
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
+          {isCreatingNew && (
+            <div className="p-3 rounded-xl border border-indigo-500/80 bg-indigo-950/40 text-left space-y-1 shadow-md">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-indigo-200 truncate">
+                  {editingTemplate.title.trim() || 'Новая должность'}
+                </h3>
+                <span className="px-1.5 py-0.5 text-[10px] font-semibold bg-indigo-600 text-white rounded">
+                  Новый
+                </span>
+              </div>
+              <div className="flex items-center space-x-2 text-[11px] text-slate-400">
+                <span className="px-1.5 py-0.5 text-[10px] font-medium bg-slate-800 text-slate-300 rounded border border-slate-700">
+                  {editingTemplate.level || 'Middle'}
+                </span>
+                <span className="truncate max-w-[120px]">
+                  {editingTemplate.role.trim() || 'Не указана'}
+                </span>
+              </div>
+            </div>
+          )}
+
           {isLoading ? (
             <div className="p-8 text-center text-xs text-slate-500">Загрузка должностей...</div>
-          ) : filteredTemplates.length === 0 ? (
+          ) : filteredTemplates.length === 0 && !isCreatingNew ? (
             <div className="p-8 text-center text-xs text-slate-500">
               {searchQuery ? 'Ничего не найдено' : 'Нет созданных должностей'}
             </div>
           ) : (
             filteredTemplates.map((tpl) => {
-              const isSelected = selectedTemplateId === tpl.id;
+              const isSelected = !isCreatingNew && selectedTemplateId === tpl.id;
               return (
                 <div
                   key={tpl.id}
-                  onClick={() => setSelectedTemplateId(tpl.id)}
+                  onClick={() => handleSelectTemplate(tpl.id)}
                   className={`p-3 rounded-xl cursor-pointer border transition text-left space-y-2 group ${
                     isSelected
                       ? 'bg-indigo-950/40 border-indigo-600/80 shadow-md'
@@ -476,9 +574,9 @@ export const JobTemplatesScreen: React.FC = () => {
                         )}
                       </button>
                       <button
-                        onClick={(e) => handleDelete(tpl.id, e)}
+                        onClick={(e) => handleOpenDeleteModal(tpl, e)}
                         title="Удалить должность"
-                        className="p-1 hover:text-rose-400 rounded"
+                        className="p-1 hover:text-rose-400 rounded cursor-pointer"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -511,13 +609,25 @@ export const JobTemplatesScreen: React.FC = () => {
                 <span>{saveSuccessMsg}</span>
               </span>
             )}
+            {isCreatingNew && templates.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setIsCreatingNew(false);
+                  setSelectedTemplateId(templates[0].id);
+                }}
+                className="px-3.5 py-2 text-xs font-semibold text-slate-400 hover:text-slate-200 border border-slate-700 hover:border-slate-600 rounded-xl transition cursor-pointer"
+              >
+                Отмена
+              </button>
+            )}
             <button
               onClick={handleSave}
               disabled={isSaving}
-              className="flex items-center space-x-2 px-5 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition shadow-lg shadow-indigo-600/30 disabled:opacity-50"
+              className="flex items-center space-x-2 px-5 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition shadow-lg shadow-indigo-600/30 disabled:opacity-50 cursor-pointer"
             >
               <Save className="w-4 h-4" />
-              <span>{isSaving ? 'Сохранение...' : 'Сохранить должность'}</span>
+              <span>{isSaving ? 'Сохранение...' : editingTemplate.id ? 'Сохранить должность' : 'Создать должность'}</span>
             </button>
           </div>
         </div>
@@ -877,6 +987,65 @@ export const JobTemplatesScreen: React.FC = () => {
                 className="px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition disabled:opacity-50"
               >
                 Скопировать вопрос
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Template Confirmation Modal */}
+      {deletingTemplate && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl max-w-md w-full shadow-2xl space-y-4">
+            <h3 className="text-base font-bold text-slate-100 flex items-center space-x-2">
+              <Trash2 className="w-5 h-5 text-rose-500" />
+              <span>Удаление должности</span>
+            </h3>
+            <p className="text-sm text-slate-300">
+              Вы уверены, что хотите удалить должность{' '}
+              <span className="text-slate-100 font-semibold">«{deletingTemplate.title}»</span>?
+            </p>
+
+            {deleteErrorMsg && (
+              <div className="p-3 bg-rose-950/60 border border-rose-800 text-rose-300 text-xs rounded-xl space-y-2">
+                <div className="flex items-start space-x-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-rose-400 mt-0.5" />
+                  <span className="leading-relaxed">{deleteErrorMsg}</span>
+                </div>
+                {deleteErrorMsg.includes('архивирование') && (
+                  <button
+                    type="button"
+                    onClick={handleArchiveInstead}
+                    disabled={isDeleting}
+                    className="mt-1 w-full flex items-center justify-center space-x-1.5 px-3 py-1.5 text-xs font-semibold bg-amber-600 hover:bg-amber-500 text-white rounded-lg transition disabled:opacity-50 cursor-pointer"
+                  >
+                    <Archive className="w-3.5 h-3.5" />
+                    <span>Архивировать вместо удаления</span>
+                  </button>
+                )}
+              </div>
+            )}
+
+            <div className="flex items-center justify-end space-x-3 pt-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setDeletingTemplate(null);
+                  setDeleteErrorMsg(null);
+                }}
+                disabled={isDeleting}
+                className="px-4 py-2 text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-lg transition disabled:opacity-50 cursor-pointer"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                disabled={isDeleting}
+                className="px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition disabled:opacity-50 flex items-center space-x-1.5 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{isDeleting ? 'Удаление...' : 'Да, удалить'}</span>
               </button>
             </div>
           </div>

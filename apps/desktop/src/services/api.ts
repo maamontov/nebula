@@ -329,6 +329,28 @@ export async function getSystemConfig(): Promise<SystemConfig> {
   }
 }
 
+/**
+ * Provider and model profiles the backend actually uses for live work.
+ * Kept separate from the Tauri system config: the desktop shell knows nothing about them.
+ */
+export interface ActiveModelInfo {
+  provider_id: string;
+  provider_name: string;
+  model_profile_id: string;
+  upstream_model_id: string;
+}
+
+export interface ActiveModelsInfo {
+  llm: ActiveModelInfo;
+  stt: ActiveModelInfo;
+}
+
+export async function getActiveModels(): Promise<ActiveModelsInfo> {
+  const res = await fetch(`${API_BASE}/system/models`);
+  if (!res.ok) throw new Error(`Get active models error: ${res.statusText}`);
+  return res.json();
+}
+
 // -------------------------------------------------------------
 // Backend API (FastAPI)
 // -------------------------------------------------------------
@@ -1090,7 +1112,16 @@ export async function deleteJobTemplate(
   const res = await fetch(`${API_BASE}/job-templates/${templateId}`, {
     method: 'DELETE',
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) {
+    let msg = res.statusText;
+    try {
+      const data = await res.json();
+      msg = data.detail || msg;
+    } catch {
+      msg = await res.text();
+    }
+    throw new Error(msg);
+  }
   return res.json();
 }
 

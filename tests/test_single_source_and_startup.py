@@ -564,3 +564,191 @@ def test_live_speaker_role_preserved_across_stt_upserts(repo: Repository):
     assert updated_segs[0]["speaker_role"] == "candidate"
     assert updated_segs[0]["text"] == "Привет, я кандидат на вакансию!"
 
+
+# ============================================================================
+# 8. Привязка короткого ответа кандидата к текущему вопросу (регрессия)
+# ============================================================================
+_SHORT_ANSWER_QUESTIONS = [
+    {
+        "id": "q1",
+        "title": "Выбор хранилища",
+        "prompt": "Сколько лап у паука",
+        "criteria": [{"id": "c1", "title": "знания количества лап", "min_score": 1, "max_score": 5, "weight": 1}],
+    },
+    {
+        "id": "q2",
+        "title": "Новый вопрос 2",
+        "prompt": "бывает больше лап?",
+        "criteria": [{"id": "c2", "title": "варианты встречаемые", "min_score": 1, "max_score": 5, "weight": 1}],
+    },
+]
+
+
+def _short_answer_segments() -> list[dict]:
+    return [
+        {
+            "id": "seg-int-1",
+            "track_id": "shared",
+            "speaker_role": "interviewer",
+            "start_time_ms": 1957,
+            "end_time_ms": 4960,
+            "text": "Еще раз проверяем, сколько лапа паука?",
+        },
+        {
+            "id": "seg-int-2",
+            "track_id": "shared",
+            "speaker_role": "interviewer",
+            "start_time_ms": 5477,
+            "end_time_ms": 10576,
+            "text": "ну тут сложно сказать так просто если ну как бы",
+        },
+        {
+            "id": "seg-cand-1",
+            "track_id": "shared",
+            "speaker_role": "candidate",
+            "start_time_ms": 11777,
+            "end_time_ms": 13352,
+            "text": "Ну не больше десяти точно.",
+        },
+        {
+            "id": "seg-cand-2",
+            "track_id": "shared",
+            "speaker_role": "candidate",
+            "start_time_ms": 17555,
+            "end_time_ms": 20137,
+            "text": "Давай скажи точно, какое число? Десять.",
+        },
+    ]
+
+
+def test_matcher_keeps_short_answer_with_active_question(repo: Repository):
+    """
+    Регрессия: короткий ответ кандидата не должен уезжать к вопросу, который ещё не задавали,
+    из-за одного случайно совпавшего слова ("больше" в следующем вопросе).
+    Иначе оценка текущего вопроса сообщает «Ответ кандидата отсутствует», хотя ответ есть.
+    """
+    assocs = QuestionMatcher().associate_segments(_SHORT_ANSWER_QUESTIONS, _short_answer_segments())
+    by_seg = {a.segment_id: a for a in assocs}
+
+    assert by_seg["seg-int-1"].question_id == "q1"
+    # Ответ кандидата остаётся у вопроса, который реально был задан (текущий вопрос интервью)
+    assert by_seg["seg-cand-1"].question_id == "q1"
+    assert by_seg["seg-cand-2"].question_id == "q1"
+    # Низкая тематическая уверенность честно помечается для ревью, но не скрывается
+    assert by_seg["seg-cand-1"].is_ambiguous is True
+    assert "Требуется ревью" in by_seg["seg-cand-1"].notes
+
+
+def test_matcher_reassigns_answer_to_already_asked_question():
+    """Перенос ответа к ранее заданному вопросу по-прежнему работает (ответ не «залипает» на активном вопросе)."""
+    questions = [
+        {
+            "id": "q1",
+            "text": "Расскажите про GIL в Python и способы его обхода",
+            "criteria": [{"id": "c1", "title": "Понимание Global Interpreter Lock и multiprocessing"}],
+        },
+        {
+            "id": "q2",
+            "text": "Как устроена изоляция транзакций в PostgreSQL?",
+            "criteria": [{"id": "c2", "title": "Уровни изоляции транзакций и MVCC"}],
+        },
+    ]
+    segments = [
+        {
+            "id": "seg-q1-int",
+            "track_id": "interviewer",
+            "speaker_role": "interviewer",
+            "start_time_ms": 0,
+            "end_time_ms": 3000,
+            "text": "Расскажите про GIL в Python и способы его обхода",
+        },
+        {
+            "id": "seg-q2-int",
+            "track_id": "interviewer",
+            "speaker_role": "interviewer",
+            "start_time_ms": 5000,
+            "end_time_ms": 8000,
+            "text": "Как устроена изоляция транзакций в PostgreSQL?",
+        },
+        {
+            "id": "seg-answer-q2",
+            "track_id": "candidate",
+            "speaker_role": "candidate",
+            "start_time_ms": 10000,
+            "end_time_ms": 14000,
+            "text": "Уровни изоляции в PostgreSQL реализованы через MVCC и снимки данных.",
+        },
+        {
+            "id": "seg-answer-q1",
+            "track_id": "candidate",
+            "speaker_role": "candidate",
+            "start_time_ms": 20000,
+            "end_time_ms": 26000,
+            "text": (
+                "Асинхронный код на asyncio работает в одном потоке и решает задачи "
+                "ввода-вывода без блокировки GIL."
+            ),
+        },
+    ]
+
+    assocs = {a.segment_id: a for a in QuestionMatcher().associate_segments(questions, segments)}
+    assert assocs["seg-answer-q2"].question_id == "q2"
+    # Ответ про GIL привязан к q1, хотя активным в этот момент был q2
+    assert assocs["seg-answer-q1"].question_id == "q1"
+    assert assocs["seg-answer-q1"].is_ambiguous is True  # решение всё равно требует ревью
+
+
+@pytest.mark.asyncio
+async def test_evaluate_uses_short_candidate_answer_for_current_question(repo: Repository):
+    """
+    Регрессия сквозного пути: при живом назначении ролей оценка текущего вопроса
+    должна использовать ответ кандидата, а не сообщать «Ответ кандидата отсутствует».
+    """
+    interview_id = "inv-short-answer-1"
+    repo.create_interview(
+        interview_id=interview_id,
+        title="Short Answer Test",
+        candidate_name="Test Cand",
+        role="Engineer",
+        capture_mode="single_source",
+    )
+    repo.save_plan("plan-short-1", interview_id, {"questions": _SHORT_ANSWER_QUESTIONS}, version=1)
+
+    for seg in _short_answer_segments():
+        repo.add_transcript_segment(
+            segment_id=seg["id"],
+            interview_id=interview_id,
+            track_id=seg["track_id"],
+            start_time_ms=seg["start_time_ms"],
+            end_time_ms=seg["end_time_ms"],
+            text=seg["text"],
+            speaker_role=seg["speaker_role"],
+        )
+
+    mock_llm = AsyncMock()
+    mock_llm.execute_request.return_value = (
+        {
+            "scores": [
+                {
+                    "criterion_id": "c1",
+                    "score": 2.0,
+                    "explanation": "Кандидат назвал число, но не назвал точное количество лап",
+                    "evidence": [
+                        {"segment_id": "seg-cand-1", "exact_quote": "Ну не больше десяти точно."}
+                    ],
+                }
+            ],
+            "critical_errors": [],
+        },
+        "mock-model-v1",
+    )
+
+    worker = PipelineWorker(repository=repo, llm_adapter=mock_llm)
+    await worker._handle_evaluate(interview_id, {"question_id": "q1"})
+
+    assert mock_llm.execute_request.call_count == 1, "Оценка должна использовать ответ кандидата"
+
+    props = repo.get_assessment_proposals(interview_id)
+    assert len(props) == 1
+    assert props[0]["scores"][0]["score"] == 2.0
+    assert props[0]["scores"][0]["evidence"][0]["segment_id"] == "seg-cand-1"

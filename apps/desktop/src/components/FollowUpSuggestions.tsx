@@ -115,7 +115,11 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
 
         if (res.status === 'waiting') {
           setIsGenerating(false);
-          if (res.wait_reason === 'needs_role_assignment') {
+          // A guide hint is allowed before the candidate answers, so only probe is blocked here.
+          // Наводящий вопрос доступен до ответа кандидата, поэтому «не ответил» показываем только для probe.
+          if (mode === 'guide') {
+            setErrorMessage('Не удалось подготовить наводящий вопрос. Повторите попытку.');
+          } else if (res.wait_reason === 'needs_role_assignment') {
             setErrorMessage('Для генерации подсказок подтвердите роли кандидата в стенограмме');
           } else if (trigger === 'manual') {
             setErrorMessage('Кандидат ещё не ответил на текущий вопрос');
@@ -526,6 +530,9 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
         <div className="p-3 text-center text-xs text-slate-400 border border-dashed border-slate-800 rounded-lg space-y-1">
           <Clock className="w-4 h-4 mx-auto text-slate-500" />
           <p>Ожидание ответа кандидата на текущий вопрос</p>
+          <p className="text-[10px] text-slate-500">
+            «Мягко направить» можно запросить уже сейчас, даже без ответа
+          </p>
           {unassignedSharedCount > 0 && (
             <p className="text-[10px] text-amber-400 font-medium">
               Назначьте реплики кандидата в стенограмме для генерации подсказок

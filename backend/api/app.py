@@ -34,6 +34,11 @@ from backend.core.followup_generator import (
     is_candidate_segment,
 )
 from backend.core.matcher import QuestionMatcher
+from backend.core.profiles import (
+    get_default_llm_model,
+    get_default_provider,
+    get_default_stt_profile,
+)
 from backend.core.revisions import TranscriptDiffEngine
 from backend.core.scoring import (
     ScoringError,
@@ -84,7 +89,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -1428,7 +1433,13 @@ async def get_followups_endpoint(
         mode=mode.value if hasattr(mode, "value") else str(mode),
     )
 
-    if not fu_context.candidate_segments:
+    # A guide hint exists precisely for a candidate who is stuck, so it must stay available
+    # without a candidate answer. Probe suggestions still need something to probe, and an
+    # oversized context still blocks both modes.
+    # Наводящий вопрос нужен именно тогда, когда кандидат затрудняется, поэтому доступен и без
+    # ответа; уточняющие вопросы по-прежнему требуют ответа, а переросший контекст блокирует оба.
+    is_guide = mode == FollowUpMode.GUIDE
+    if not fu_context.candidate_segments and not is_guide:
         state["can_generate"] = False
         has_shared_unknown = any(
             str(s.get("track_id", "")).lower() == "shared" and (s.get("speaker_role") or "unknown").lower() == "unknown"
@@ -1544,7 +1555,9 @@ async def generate_followups_endpoint(
     if fu_context.is_context_too_large:
         raise HTTPException(status_code=400, detail="Candidate response context is too large for follow-up generation")
 
-    if not fu_context.candidate_segments:
+    # Guide may run before the candidate answers; probe may not.
+    # Наводящий вопрос допустим до ответа кандидата, уточняющий — нет.
+    if not fu_context.candidate_segments and payload.mode != FollowUpMode.GUIDE:
         has_shared_unknown = any(
             str(s.get("track_id", "")).lower() == "shared" and (s.get("speaker_role") or "unknown").lower() == "unknown"
             for s in segments
@@ -2376,5 +2389,34 @@ async def get_system_config_endpoint(
         "capture_spool_dir": str(Path(capture_spool).resolve()),
         "backup_dir": str(backup_dir.resolve()),
         "db_path": str(Path(db_path).resolve()),
+    }
+
+
+@app.get("/api/v1/system/models")
+async def get_system_models_endpoint():
+    """
+    Returns the provider and model profiles that live work actually uses.
+    UI must display these instead of a hard-coded model name: provider_id is kept separate from
+    the exact upstream model_id, and nothing here may claim a capability the profile lacks.
+
+    Возвращает фактически используемые профили провайдера и модели, чтобы интерфейс не показывал
+    выдуманное название модели.
+    """
+    provider = get_default_provider()
+    llm_model = get_default_llm_model()
+    stt_profile = get_default_stt_profile()
+    return {
+        "llm": {
+            "provider_id": provider.id,
+            "provider_name": provider.name,
+            "model_profile_id": llm_model.id,
+            "upstream_model_id": llm_model.upstream_model_id,
+        },
+        "stt": {
+            "provider_id": provider.id,
+            "provider_name": provider.name,
+            "model_profile_id": stt_profile.id,
+            "upstream_model_id": stt_profile.model_id,
+        },
     }
 

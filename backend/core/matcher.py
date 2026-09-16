@@ -111,8 +111,9 @@ class QuestionMatcher:
         1. Preservation of manual adjustments (never overwritten by automated matcher).
         2. Contextual continuity from interviewer questions.
         3. Clarifications (short follow-ups from interviewer).
-        4. Interruption detection.
-        5. Ambiguity flagging.
+        4. Answers are attributed only to questions the interviewer has already asked.
+        5. Interruption detection.
+        6. Ambiguity flagging.
         """
         associations: list[SegmentAssociation] = []
         if not questions or not segments:
@@ -124,14 +125,29 @@ class QuestionMatcher:
 
         interruptions = self.detect_interruptions(segments)
         active_question_id = questions[0].get("id") or questions[0].get("question_id")
+        # Questions the interviewer has actually asked so far in the transcript.
+        # A candidate answer can only belong to a question that was already asked: otherwise the
+        # answer to the question currently in progress is moved to a question that has not been
+        # reached yet, and the evaluation of the current question falsely reports "no answer".
+        # Вопросы, которые интервьюер реально задал. Ответ кандидата нельзя приписать вопросу,
+        # который ещё не прозвучал.
+        asked_question_ids: set[str] = set()
 
         for _idx, seg in enumerate(segments):
             seg_id = seg["id"]
+
+            seg_text = seg["text"].strip()
+            track = str(seg.get("track_id", "")).lower()
+            role = str(seg.get("speaker_role", "")).lower()
+            if not role or role == "unknown":
+                role = "unknown" if track == "shared" else track
 
             # If segment was already manually adjusted by a human reviewer, strictly preserve it!
             existing = existing_by_seg.get(seg_id)
             if existing and existing.get("is_manually_adjusted"):
                 active_question_id = existing["question_id"]
+                if role == "interviewer":
+                    asked_question_ids.add(existing["question_id"])
                 associations.append(
                     SegmentAssociation(
                         segment_id=seg_id,
@@ -145,12 +161,6 @@ class QuestionMatcher:
                     )
                 )
                 continue
-
-            seg_text = seg["text"].strip()
-            track = str(seg.get("track_id", "")).lower()
-            role = str(seg.get("speaker_role", "")).lower()
-            if not role or role == "unknown":
-                role = "unknown" if track == "shared" else track
 
             # Find if this segment experienced an interruption
             seg_int = next(
@@ -188,6 +198,8 @@ class QuestionMatcher:
 
                 if matched_qid and best_sim > 0.3:
                     active_question_id = matched_qid
+                if active_question_id:
+                    asked_question_ids.add(active_question_id)
 
                 associations.append(
                     SegmentAssociation(
@@ -247,11 +259,23 @@ class QuestionMatcher:
                     is_ambiguous = True
                     candidate_other_matches.sort(key=lambda x: x[1], reverse=True)
                     alt_id, alt_rel = candidate_other_matches[0]
-                    if relevance < 0.15 and alt_rel >= 0.15:
+                    # Moving the answer to another question is allowed only when it does not steal
+                    # the answer from a question the interviewer has already asked: either the
+                    # alternative question has already been asked, or no question has been asked yet
+                    # (no conversational context at all, so lexical matching is the only signal).
+                    # A lexical coincidence with a question that has not been reached yet must not
+                    # take the answer away from the question currently in progress.
+                    # Перенос ответа разрешён, только если он не отбирает ответ у уже заданного вопроса:
+                    # либо альтернативный вопрос уже прозвучал, либо ни один вопрос ещё не прозвучал.
+                    alt_was_asked = alt_id in asked_question_ids
+                    active_was_asked = active_question_id in asked_question_ids
+                    if relevance < 0.15 and alt_rel >= 0.15 and (alt_was_asked or not active_was_asked):
                         target_qid = alt_id
                         active_question_id = alt_id
                         target_confidence = alt_rel
                         notes = f"Неоднозначность: ответ отнесен к вопросу {alt_id} (уверенность {alt_rel:.2f}) при несовпадении с активным ({relevance:.2f}). Требуется ревью."
+                    elif not alt_was_asked and active_was_asked:
+                        notes = f"Неоднозначность: ответ лексически ближе к вопросу {alt_id}, но этот вопрос ещё не задан. Требуется ревью человека."
                     else:
                         notes = f"Неоднозначность: ответ больше похож на вопрос {alt_id}. Требуется ревью человека."
                 elif relevance < self.ambiguity_threshold:

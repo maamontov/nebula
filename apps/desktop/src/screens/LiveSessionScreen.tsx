@@ -15,6 +15,7 @@ import {
   getInterviewJobsStatus,
   setSegmentSpeakerRole,
   getActiveSession,
+  getActiveModels,
 } from '../services/api';
 import { FollowUpSuggestions } from '../components/FollowUpSuggestions';
 import { Square, Pause, Play, CheckCircle, MessageSquare, Quote, Sparkles, AlertTriangle, ExternalLink, Loader2, ArrowDown } from 'lucide-react';
@@ -51,6 +52,8 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   const [stoppingStage, setStoppingStage] = useState<string | null>(null);
   const [evalSuccessNotice, setEvalSuccessNotice] = useState<string | null>(null);
   const [backendError, setBackendError] = useState<string | null>(null);
+  // Actual model profile used for live assessment. Rendered instead of a hard-coded name.
+  const [activeLlmModel, setActiveLlmModel] = useState<{ label: string; provider: string } | null>(null);
 
   // Real initial state: strictly empty, no synthetic speech or mock scores
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
@@ -77,6 +80,25 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
         console.warn('Could not restore live session active state:', err);
       });
   }, [interviewId]);
+
+  // Show the model the backend actually uses, never a hard-coded name
+  useEffect(() => {
+    let isSubscribed = true;
+    getActiveModels()
+      .then((models) => {
+        if (!isSubscribed || !models.llm) return;
+        setActiveLlmModel({
+          label: models.llm.upstream_model_id,
+          provider: models.llm.provider_name || models.llm.provider_id,
+        });
+      })
+      .catch((err) => {
+        console.warn('Could not load active model profile:', err);
+      });
+    return () => {
+      isSubscribed = false;
+    };
+  }, []);
 
   // Restore active EVALUATE_QUESTION jobs on mount
   useEffect(() => {
@@ -631,7 +653,12 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
                 <Sparkles className="w-4 h-4 text-indigo-400" />
                 <span className="text-xs font-bold uppercase tracking-wider text-slate-200 break-words">Оперативная оценка</span>
               </div>
-              <span className="shrink-0 text-[10px] text-slate-400 bg-slate-800/80 px-2 py-0.5 rounded">Gemini 3.8 Flash</span>
+              <span
+                className="shrink-0 text-[10px] text-slate-400 bg-slate-800/80 px-2 py-0.5 rounded"
+                title={activeLlmModel ? `Провайдер: ${activeLlmModel.provider}` : undefined}
+              >
+                {activeLlmModel ? activeLlmModel.label : 'Модель не определена'}
+              </span>
             </div>
 
             {/* Quick Action to evaluate current question */}

@@ -443,3 +443,352 @@ async def test_stage4_http_client_reuse_and_close(tmp_path):
 
     await worker_default.close()
     assert default_client.is_closed
+
+
+def _setup_multi_question_interview(repo: Repository, interview_id: str, question_count: int) -> list[str]:
+    """Creates an interview whose plan holds `question_count` independently evaluable questions."""
+    questions = [
+        {
+            "id": f"q-{i}",
+            "title": f"Question {i}",
+            "prompt": f"Explain topic {i}",
+            "criteria": [
+                {
+                    "id": f"crit-{i}",
+                    "title": f"Criterion {i}",
+                    "description": "Details",
+                    "min_score": 1,
+                    "max_score": 5,
+                    "weight": 1.0,
+                }
+            ],
+        }
+        for i in range(question_count)
+    ]
+    repo.create_interview(
+        interview_id=interview_id,
+        title="Senior Backend Engineer",
+        candidate_name="Алексей",
+        role="Go Developer",
+        status=InterviewStatus.RECORDING,
+    )
+    repo.save_plan(f"plan-{interview_id}", interview_id, {"title": "Plan", "questions": questions}, version=1)
+
+    for i in range(question_count):
+        repo.add_transcript_segment(
+            segment_id=f"seg-{i}",
+            interview_id=interview_id,
+            track_id="candidate",
+            start_time_ms=i * 1000,
+            end_time_ms=(i + 1) * 1000,
+            text=f"Ответ кандидата номер {i} про партиционирование и шардирование.",
+            speaker_role="candidate",
+        )
+        repo.save_association(
+            assoc_id=f"assoc-{i}",
+            interview_id=interview_id,
+            question_id=f"q-{i}",
+            segment_id=f"seg-{i}",
+            confidence=0.9,
+        )
+    return [q["id"] for q in questions]
+
+
+def _assessment_response(criterion_id: str) -> tuple[dict, str]:
+    return (
+        {
+            "scores": [
+                {
+                    "criterion_id": criterion_id,
+                    "score": 4.0,
+                    "explanation": "Ответ содержательный.",
+                    "evidence": [],
+                }
+            ],
+            "critical_errors": [],
+        },
+        "mock-model",
+    )
+
+
+@pytest.mark.asyncio
+async def test_stage4_assessment_questions_evaluated_in_parallel(tmp_path):
+    """
+    Acceptance 5:
+    Independent questions of one review run MUST be evaluated concurrently instead of
+    one-by-one. Regression guard for the serial assessment consumer that made a 10-question
+    review take as long as the sum of every question.
+    """
+    db = Database(tmp_path / "test_assessment_parallel.db")
+    db.init_schema()
+    repo = Repository(db)
+    inv_id = "inv-assess-parallel"
+    question_count = 6
+    q_ids = _setup_multi_question_interview(repo, inv_id, question_count)
+
+    in_flight = 0
+    max_in_flight = 0
+    counter_lock = asyncio.Lock()
+    all_slots_busy = asyncio.Event()
+    expected_parallel = 5  # DEFAULT_ASSESSMENT_CONCURRENCY
+
+    async def mock_llm_execute(*args, **kwargs):
+        nonlocal in_flight, max_in_flight
+        async with counter_lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            if in_flight >= expected_parallel:
+                all_slots_busy.set()
+        # Hold the slot so the peak concurrency is observable, then release together.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(all_slots_busy.wait(), timeout=3.0)
+        async with counter_lock:
+            in_flight -= 1
+        return _assessment_response("crit-0")
+
+    mock_llm = MagicMock()
+    mock_llm.execute_request = AsyncMock(side_effect=mock_llm_execute)
+
+    worker = PipelineWorker(repository=repo, llm_adapter=mock_llm)
+    assert worker._assessment_concurrency == expected_parallel
+
+    for i, q_id in enumerate(q_ids):
+        repo.enqueue_job(f"job-par-eval-{i}", "EVALUATE_QUESTION", inv_id, {"question_id": q_id})
+
+    loop_task = asyncio.create_task(worker.run_loop(poll_interval_sec=0.02))
+    try:
+        await asyncio.wait_for(all_slots_busy.wait(), timeout=5.0)
+        assert max_in_flight >= expected_parallel
+
+        for _ in range(100):
+            counts = repo.get_interview_jobs_status(inv_id)["counts"]
+            if counts.get("COMPLETED") == question_count:
+                break
+            await asyncio.sleep(0.05)
+        assert repo.get_interview_jobs_status(inv_id)["counts"].get("COMPLETED") == question_count
+    finally:
+        all_slots_busy.set()
+        worker.stop()
+        try:
+            await asyncio.wait_for(loop_task, timeout=1.0)
+        except (TimeoutError, asyncio.CancelledError):
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+
+
+@pytest.mark.asyncio
+async def test_stage4_assessment_parallelism_does_not_starve_live_stt(tmp_path):
+    """
+    Acceptance 6:
+    Saturating every assessment slot MUST NOT block live recognition. This is the guarantee
+    that makes widening assessment fan-out safe: the reservation is what fails if someone
+    raises the fan-out without leaving permits for the live path.
+    """
+    db = Database(tmp_path / "test_no_starvation.db")
+    db.init_schema()
+    repo = Repository(db)
+    inv_id = "inv-nostarve"
+    question_count = 5
+    q_ids = _setup_multi_question_interview(repo, inv_id, question_count)
+
+    release_assessments = asyncio.Event()
+    in_flight = 0
+    counter_lock = asyncio.Lock()
+    all_slots_busy = asyncio.Event()
+
+    async def mock_llm_execute(*args, **kwargs):
+        nonlocal in_flight
+        async with counter_lock:
+            in_flight += 1
+            if in_flight >= worker._assessment_concurrency:
+                all_slots_busy.set()
+        await release_assessments.wait()
+        async with counter_lock:
+            in_flight -= 1
+        return _assessment_response("crit-0")
+
+    mock_llm = MagicMock()
+    mock_llm.execute_request = AsyncMock(side_effect=mock_llm_execute)
+
+    mock_stt = MagicMock()
+    mock_stt.transcribe_audio = AsyncMock(
+        return_value=STTTranscriptionResult(
+            text="Живая реплика кандидата.", model_id="m", latency_seconds=0.1, raw_response={}
+        )
+    )
+
+    # Deliberately tight cap with a fan-out request larger than the cap. The reservation is the
+    # only thing keeping permits free for live STT here: without it, every permit is taken by
+    # blocked assessments and the live turn below can never run.
+    worker = PipelineWorker(
+        repository=repo,
+        stt_adapter=mock_stt,
+        llm_adapter=mock_llm,
+        provider_concurrency_cap=5,
+        assessment_concurrency=5,
+    )
+    assert worker._assessment_concurrency == 1
+    assert worker._assessment_concurrency + 4 <= worker._provider_concurrency_cap
+
+    for i, q_id in enumerate(q_ids):
+        repo.enqueue_job(f"job-nostarve-eval-{i}", "EVALUATE_QUESTION", inv_id, {"question_id": q_id})
+
+    loop_task = asyncio.create_task(worker.run_loop(poll_interval_sec=0.02))
+    try:
+        await asyncio.wait_for(all_slots_busy.wait(), timeout=5.0)
+
+        # Every assessment slot is blocked. Live STT must still be served.
+        _save_dummy_chunk(repo, inv_id, "candidate", 1, 20000, 22000, tmp_path / "spool")
+        repo.enqueue_job(
+            "job-nostarve-turn",
+            "TRANSCRIBE_TURN",
+            inv_id,
+            {
+                "track_id": "candidate",
+                "start_ms": 20000,
+                "end_ms": 22000,
+                "first_sequence": 1,
+                "first_sample_offset": 0,
+                "last_sequence": 1,
+                "last_sample_offset": 32000,
+                "capture_epoch": 1,
+            },
+        )
+
+        turn_status = None
+        for _ in range(60):
+            turn_status = repo.get_interview_jobs_status(inv_id, job_ids=["job-nostarve-turn"])["active_jobs"]
+            if turn_status and turn_status[0]["status"] == "COMPLETED":
+                break
+            await asyncio.sleep(0.05)
+        assert turn_status and turn_status[0]["status"] == "COMPLETED", (
+            "live STT was starved while all assessment slots were busy"
+        )
+    finally:
+        release_assessments.set()
+        worker.stop()
+        try:
+            await asyncio.wait_for(loop_task, timeout=1.0)
+        except (TimeoutError, asyncio.CancelledError):
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+
+
+@pytest.mark.asyncio
+async def test_stage4_assessment_concurrency_clamped_to_protect_live_path(tmp_path):
+    """
+    Acceptance 7:
+    The fan-out defaults to the provider's declared max_concurrency, and is clamped so that it
+    can never consume the permits reserved for live STT, follow-ups and background work.
+    """
+    db = Database(tmp_path / "test_clamp.db")
+    db.init_schema()
+    repo = Repository(db)
+
+    client = httpx.AsyncClient()
+    default_worker = PipelineWorker(repository=repo, http_client=client)
+    # Provider profile declares max_concurrency=10, so the cap follows it instead of a guess.
+    assert default_worker._provider_concurrency_cap == 10
+    assert default_worker._assessment_concurrency == 5
+    assert default_worker._live_stt_concurrency == 2
+
+    # A cap with no room for the other consumers clamps assessment to a single consumer.
+    small_worker = PipelineWorker(repository=repo, http_client=client, provider_concurrency_cap=5)
+    assert small_worker._assessment_concurrency == 1
+
+    # An explicit fan-out is honoured while the cap still leaves room for everyone else.
+    wide_worker = PipelineWorker(
+        repository=repo, http_client=client, provider_concurrency_cap=10, assessment_concurrency=6
+    )
+    assert wide_worker._assessment_concurrency == 6
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stage4_global_cap_enforced_across_assessment_and_stt(tmp_path):
+    """
+    Acceptance 8:
+    With assessment fanned out, the single provider semaphore must still bound the TOTAL number
+    of in-flight provider calls (LLM and STT combined) by provider_concurrency_cap.
+    """
+    db = Database(tmp_path / "test_mixed_cap.db")
+    db.init_schema()
+    repo = Repository(db)
+    inv_id = "inv-mixed-cap"
+    q_ids = _setup_multi_question_interview(repo, inv_id, 6)
+
+    cap = 8
+    in_flight = 0
+    max_in_flight = 0
+    counter_lock = asyncio.Lock()
+
+    async def tracked_llm(*args, **kwargs):
+        nonlocal in_flight, max_in_flight
+        async with counter_lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.1)
+        async with counter_lock:
+            in_flight -= 1
+        return _assessment_response("crit-0")
+
+    async def tracked_stt(*args, **kwargs):
+        nonlocal in_flight, max_in_flight
+        async with counter_lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.1)
+        async with counter_lock:
+            in_flight -= 1
+        return STTTranscriptionResult(text="ok", model_id="m", latency_seconds=0.1, raw_response={})
+
+    mock_llm = MagicMock()
+    mock_llm.execute_request = AsyncMock(side_effect=tracked_llm)
+    mock_stt = MagicMock()
+    mock_stt.transcribe_audio = AsyncMock(side_effect=tracked_stt)
+
+    worker = PipelineWorker(
+        repository=repo, stt_adapter=mock_stt, llm_adapter=mock_llm, provider_concurrency_cap=cap
+    )
+
+    for i, q_id in enumerate(q_ids):
+        repo.enqueue_job(f"job-mixed-eval-{i}", "EVALUATE_QUESTION", inv_id, {"question_id": q_id})
+    for i in range(3):
+        _save_dummy_chunk(repo, inv_id, "candidate", i, i * 1000, (i + 1) * 1000, tmp_path / "spool")
+        repo.enqueue_job(
+            f"job-mixed-turn-{i}",
+            "TRANSCRIBE_TURN",
+            inv_id,
+            {
+                "track_id": "candidate",
+                "start_ms": i * 1000,
+                "end_ms": (i + 1) * 1000,
+                "first_sequence": i,
+                "first_sample_offset": 0,
+                "last_sequence": i,
+                "last_sample_offset": 16000,
+                "capture_epoch": 1,
+            },
+        )
+
+    loop_task = asyncio.create_task(worker.run_loop(poll_interval_sec=0.02))
+    try:
+        for _ in range(120):
+            counts = repo.get_interview_jobs_status(inv_id)["counts"]
+            if counts.get("COMPLETED") == len(q_ids) + 3:
+                break
+            await asyncio.sleep(0.05)
+        assert repo.get_interview_jobs_status(inv_id)["counts"].get("COMPLETED") == len(q_ids) + 3
+        assert max_in_flight <= cap
+        assert max_in_flight >= 1
+    finally:
+        worker.stop()
+        try:
+            await asyncio.wait_for(loop_task, timeout=1.0)
+        except (TimeoutError, asyncio.CancelledError):
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task

@@ -15,11 +15,15 @@ import httpx
 
 from backend.adapters.llm import LLMAuthenticationError, OpenAICompatibleAdapter
 from backend.core.profiles import (
+    get_default_provider,
     get_plusvibe_deepseek_model,
     get_plusvibe_gemini_model,
-    get_plusvibe_provider,
     get_plusvibe_qwen_model,
+    get_routerai_deepseek_model,
+    get_routerai_qwen_flash_model,
+    get_routerai_qwen_plus_model,
 )
+from contracts.provider import ModelProfile, ProviderProfile
 
 logger = logging.getLogger("nebula.resilient_llm")
 
@@ -29,11 +33,22 @@ class ResilientLLMAdapter:
         self,
         force_primary_fail: bool = False,
         http_client: httpx.AsyncClient | None = None,
+        provider: ProviderProfile | None = None,
+        primary_model: ModelProfile | None = None,
+        fallback_model_1: ModelProfile | None = None,
+        fallback_model_2: ModelProfile | None = None,
     ):
-        self.provider = get_plusvibe_provider()
-        self.primary_model = get_plusvibe_gemini_model()
-        self.fallback_model_1 = get_plusvibe_qwen_model()
-        self.fallback_model_2 = get_plusvibe_deepseek_model()
+        self.provider = provider or get_default_provider()
+        is_router = (self.provider.id == "routerai")
+        self.primary_model = primary_model or (
+            get_routerai_qwen_flash_model() if is_router else get_plusvibe_gemini_model()
+        )
+        self.fallback_model_1 = fallback_model_1 or (
+            get_routerai_qwen_plus_model() if is_router else get_plusvibe_qwen_model()
+        )
+        self.fallback_model_2 = fallback_model_2 or (
+            get_routerai_deepseek_model() if is_router else get_plusvibe_deepseek_model()
+        )
 
         self.primary_adapter = OpenAICompatibleAdapter(
             self.provider, self.primary_model, http_client=http_client

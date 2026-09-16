@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import struct
 import uuid
@@ -49,9 +50,9 @@ from backend.core.followup_generator import (
 )
 from backend.core.matcher import QuestionMatcher
 from backend.core.profiles import (
-    get_plusvibe_gemini_model,
-    get_plusvibe_provider,
-    get_plusvibe_whisper_stt,
+    get_default_llm_model,
+    get_default_provider,
+    get_default_stt_profile,
 )
 from backend.core.revisions import TranscriptDiffEngine
 from backend.core.summary_generator import ExecutiveSummaryGenerator
@@ -90,14 +91,174 @@ def is_pcm_silence(audio_bytes: bytes, threshold_mean_abs: float = 12.0) -> bool
     return mean_abs < threshold_mean_abs
 
 
+# ---------------------------------------------------------------------------------------
+# ASR output quality gate.
+#
+# ASR models do not return "nothing" for a fragment that carries no intelligible speech: they
+# return plausible-looking text. Observed on real sessions: a short quiet fragment came back as
+# Czech, another as Chinese, another as a repeated single token. Such a segment can be labelled
+# as candidate speech and then used as scoring evidence, which breaks the requirement that every
+# assessment rests on verifiable candidate speech.
+#
+# Гейт качества распознавания: на коротких/неразборчивых фрагментах ASR отдаёт правдоподобный,
+# но посторонний текст (наблюдались другие языки и зацикленное повторение одного слова). Такой
+# сегмент может попасть в evidence оценки, поэтому он не сохраняется в стенограмму.
+# ---------------------------------------------------------------------------------------
+
+# Russian subtitle boilerplate that Whisper-family models emit on silence.
+ASR_BOILERPLATE_HALLUCINATIONS = frozenset(
+    {
+        "продолжение следует...",
+        "продолжение следует",
+        "субтитры сделал",
+        "субтитры создавал",
+        "спасибо за просмотр",
+        "спасибо за просмотр!",
+        "до скорых встреч!",
+        "до скорых встреч",
+        "редактор субтитров",
+    }
+)
+
+# Scripts an ASR model can fall back to. A CJK fragment is never a legitimate answer for the
+# interview languages this product supports, so it is rejected at any duration.
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+_CJK_RE = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF]")
+
+# Extended (non-ASCII) Latin: Latin-1 Supplement and Latin Extended-A/B. This is what
+# distinguishes a genuine other-language transcription (Czech "No vratme duvod" carries
+# diacritics) from a legitimate short technical answer written in plain ASCII Latin
+# ("PostgreSQL.", "MVCC.", "Yes."). Those must never be discarded.
+_EXTENDED_LATIN_RE = re.compile(r"[\u00C0-\u024F]")
+
+# Expected script per interview language. Languages absent from this map are not script-checked.
+_LANGUAGE_SCRIPTS: dict[str, str] = {
+    "ru": "cyrillic",
+    "uk": "cyrillic",
+    "bg": "cyrillic",
+    "sr": "cyrillic",
+    "en": "latin",
+}
+
+# A wrong-script fragment is only treated as a hallucination on a short turn. Longer turns may be
+# a legitimate answer in another language, so this bound keeps the rule conservative.
+STT_SHORT_TURN_MS = 2500
+
+
+def is_quality_gate_enabled() -> bool:
+    """Operators can disable the heuristic gate with NEBULA_STT_QUALITY_GATE=0."""
+    return os.getenv("NEBULA_STT_QUALITY_GATE", "1").strip().lower() not in ("0", "false", "no")
+
+
+def is_script_mismatch(text: str, language: str | None, duration_ms: int | None = None) -> bool:
+    """
+    True when the text cannot plausibly be speech in the interview language.
+
+    Rejects any CJK output at any duration, and rejects a short turn whose only Latin content
+    carries non-ASCII diacritics while containing no Cyrillic at all.
+
+    Deliberately does NOT reject plain-ASCII Latin text: short answers like "PostgreSQL.",
+    "MVCC." or "Yes." are legitimate in a Russian interview, and discarding real candidate
+    speech is worse than keeping a questionable segment a human can dismiss.
+    """
+    if not text:
+        return False
+
+    if _CJK_RE.search(text):
+        return True
+
+    expected = _LANGUAGE_SCRIPTS.get((language or "").lower())
+    if expected is None:
+        return False
+    if duration_ms is not None and duration_ms > STT_SHORT_TURN_MS:
+        return False
+
+    if expected == "cyrillic":
+        # Only a diacritic-bearing Latin fragment with no Cyrillic is treated as another language.
+        return not _CYRILLIC_RE.search(text) and bool(_EXTENDED_LATIN_RE.search(text))
+    if expected == "latin":
+        return not re.search(r"[A-Za-z]", text) and bool(_CYRILLIC_RE.search(text))
+    return False
+
+
+def transcript_skip_reason(
+    text: str,
+    language: str | None = None,
+    duration_ms: int | None = None,
+) -> str | None:
+    """
+    Returns a machine-readable reason when the recognised text must not become a transcript
+    segment, or None when it is usable. Returning a reason keeps the skip auditable instead of
+    silently dropping candidate speech.
+
+    Возвращает причину, по которой распознанный текст нельзя сохранять как сегмент стенограммы.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return "empty"
+    if cleaned in (".", "...", ",", "!", "?", "—", "-"):
+        return "punctuation_only"
+    if cleaned.lower() in ASR_BOILERPLATE_HALLUCINATIONS:
+        return "boilerplate_hallucination"
+    if not is_quality_gate_enabled():
+        return None
+    if is_script_mismatch(cleaned, language, duration_ms):
+        return "script_mismatch"
+    return None
+
+
 DEFAULT_JOB_DEADLINES: dict[str, float | None] = {
     "TRANSCRIBE_AUDIO": 30.0,
-    "TRANSCRIBE_TURN": 30.0,
+    "TRANSCRIBE_TURN": 25.0,
     "EVALUATE_QUESTION": 30.0,
     "GENERATE_FOLLOWUPS": 20.0,
     "GENERATE_SUMMARY": 60.0,
     "BATCH_RETRANSCRIBE": None,
 }
+
+# Live STT budget. A live turn is at most TurnAssembler's MAX_TURN_DURATION_MS (12s) of audio,
+# so a single attempt gets a generous 15s and fails fast afterwards. The outer job deadline is
+# strictly larger than one attempt, so the adapter's own HTTP timeout and retry handling run
+# first; an outer cancellation would otherwise pre-empt them and the adapter's retries would
+# never execute.
+#
+# Ранее дедлайн (30s) был вдвое меньше клиентского таймаута (60s): внешняя отмена срабатывала
+# раньше таймаута httpx, ретраи адаптера не выполнялись, а полоса live-STT занималась на три
+# подряд 30-секундных ожидания. Бюджет попытки и дедлайн обязаны быть согласованы.
+STT_TURN_ATTEMPT_TIMEOUT_SEC = 15.0
+STT_TURN_MAX_RETRIES = 1
+
+
+def assert_stt_turn_budget(deadline_sec: float | None, attempt_timeout_sec: float) -> None:
+    """
+    Enforces the invariant that broke live STT: the outer job deadline must leave room for one
+    full HTTP attempt. When it does not, the outer `asyncio.wait_for` cancels the request first,
+    the adapter sees CancelledError (which it does not handle), its retry loop never runs, and
+    the live STT lane stays blocked for the whole deadline on every attempt.
+
+    Проверяет инвариант, нарушение которого ломало живую транскрибацию: внешний дедлайн задания
+    обязан оставлять место хотя бы на одну полную HTTP-попытку.
+    """
+    if deadline_sec is None:
+        return
+    if deadline_sec <= attempt_timeout_sec:
+        raise ValueError(
+            f"STT job deadline ({deadline_sec}s) must exceed the per-attempt timeout "
+            f"({attempt_timeout_sec}s), otherwise the outer cancellation pre-empts the "
+            f"adapter's own timeout and retry handling"
+        )
+
+
+assert_stt_turn_budget(DEFAULT_JOB_DEADLINES["TRANSCRIBE_TURN"], STT_TURN_ATTEMPT_TIMEOUT_SEC)
+
+# Consumer fan-out. Assessment is the only fan-out that is parallelised: a single review run
+# enqueues one independent EVALUATE_QUESTION job per question, and measured latency for 10
+# questions drops 60.5s -> 13.1s going from 1 to 5 concurrent assessments (RouterAI, thinking
+# disabled). Assembly, live STT, follow-ups and background stay at their tuned widths.
+DEFAULT_LIVE_STT_CONCURRENCY = 2
+DEFAULT_ASSESSMENT_CONCURRENCY = 5
+FOLLOWUP_CONCURRENCY = 1
+BACKGROUND_CONCURRENCY = 1
 
 
 class PipelineWorker:
@@ -108,26 +269,54 @@ class PipelineWorker:
         llm_adapter: OpenAICompatibleAdapter | ResilientLLMAdapter | None = None,
         followup_llm_adapter: OpenAICompatibleAdapter | None = None,
         http_client: httpx.AsyncClient | None = None,
-        provider_concurrency_cap: int = 5,
+        provider_concurrency_cap: int | None = None,
+        assessment_concurrency: int = DEFAULT_ASSESSMENT_CONCURRENCY,
+        live_stt_concurrency: int = DEFAULT_LIVE_STT_CONCURRENCY,
     ) -> None:
         self.repo = repository
-        self.provider = get_plusvibe_provider()
-        self._provider_concurrency_cap = provider_concurrency_cap
-        self._provider_semaphore = asyncio.Semaphore(provider_concurrency_cap)
+        self.provider = get_default_provider()
+        # Default to the concurrency the provider profile actually declares (routerai and
+        # plusvibe both advertise 10) rather than a hard-coded guess. The latency audit noted
+        # that `max_concurrency` existed in the profile but no code ever used it.
+        resolved_cap = provider_concurrency_cap or self.provider.max_concurrency
+        self._provider_concurrency_cap = resolved_cap
+        self._provider_semaphore = asyncio.Semaphore(resolved_cap)
+        self._live_stt_concurrency = live_stt_concurrency
+        # Reserve permits for the other consumers so that widening assessment parallelism can
+        # never starve the live path: a blocked review must not delay live recognition.
+        reserved_for_other_consumers = live_stt_concurrency + FOLLOWUP_CONCURRENCY + BACKGROUND_CONCURRENCY
+        self._assessment_concurrency = max(
+            1, min(assessment_concurrency, resolved_cap - reserved_for_other_consumers)
+        )
+        if self._assessment_concurrency != assessment_concurrency:
+            logger.warning(
+                "Assessment concurrency reduced from %d to %d: provider cap %d reserves %d "
+                "permits for live STT/follow-ups/background. Raise provider_concurrency_cap to "
+                "widen assessment parallelism.",
+                assessment_concurrency,
+                self._assessment_concurrency,
+                resolved_cap,
+                reserved_for_other_consumers,
+            )
         self._owns_http_client = http_client is None
         self._http_client = http_client or httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, connect=10.0)
         )
 
+        stt_prof = get_default_stt_profile()
         self.stt_adapter = stt_adapter or OpenAICompatibleSTTAdapter(
-            get_plusvibe_whisper_stt(),
-            api_key_env="PLUSVIBE_API_KEY",
+            stt_prof,
+            api_key_env=self.provider.api_key_env,
             http_client=self._http_client,
         )
-        self.llm_adapter = llm_adapter or ResilientLLMAdapter(http_client=self._http_client)
+        self.llm_adapter = llm_adapter or ResilientLLMAdapter(
+            provider=self.provider,
+            primary_model=get_default_llm_model(),
+            http_client=self._http_client,
+        )
         self.followup_llm_adapter = followup_llm_adapter or OpenAICompatibleAdapter(
             self.provider,
-            get_plusvibe_gemini_model(),
+            get_default_llm_model(),
             http_client=self._http_client,
         )
         self._running = False
@@ -507,36 +696,28 @@ class PipelineWorker:
                 filename=filename,
                 content_type="audio/wav",
                 language=language,
+                max_retries=STT_TURN_MAX_RETRIES,
+                timeout_seconds=STT_TURN_ATTEMPT_TIMEOUT_SEC,
             )
 
         cleaned_text = res.text.strip()
-        WHISPER_HALLUCINATIONS = {
-            "продолжение следует...",
-            "продолжение следует",
-            "субтитры сделал",
-            "спасибо за просмотр",
-            "спасибо за просмотр!",
-            "до скорых встреч!",
-            "до скорых встреч",
-            "редактор субтитров",
-        }
         audio_duration_ms = max(0, end_ms - start_ms)
         call_duration_ms = int(getattr(res, "latency_seconds", 0) * 1000)
         provider_id = getattr(getattr(self, "provider", None), "id", "system")
         upstream_model_id = getattr(res, "model_id", "default")
 
-        if (
-            not cleaned_text
-            or cleaned_text in (".", "...", ",", "!", "?", "—", "-")
-            or cleaned_text.lower() in WHISPER_HALLUCINATIONS
-        ):
-            logger.debug("Transcribed turn %s produced empty/hallucination text, skipping segment.", filename)
+        skip_reason = transcript_skip_reason(cleaned_text, language, audio_duration_ms)
+        if skip_reason:
+            logger.info(
+                "Turn %s produced unusable transcript (%s), skipping segment.", filename, skip_reason
+            )
             return {
                 "audio_duration_ms": audio_duration_ms,
                 "call_duration_ms": call_duration_ms,
                 "provider_id": provider_id,
                 "upstream_model_id": upstream_model_id,
                 "is_skipped": True,
+                "skip_reason": skip_reason,
             }
 
         speaker_role = payload.get("speaker_role")
@@ -591,24 +772,19 @@ class PipelineWorker:
                 filename=filename,
                 content_type="audio/wav",
                 language=language,
+                max_retries=STT_TURN_MAX_RETRIES,
+                timeout_seconds=STT_TURN_ATTEMPT_TIMEOUT_SEC,
             )
 
         cleaned_text = res.text.strip()
-        WHISPER_HALLUCINATIONS = {
-            "продолжение следует...",
-            "продолжение следует",
-            "субтитры сделал",
-            "спасибо за просмотр",
-            "спасибо за просмотр!",
-            "до скорых встреч!",
-            "до скорых встреч",
-            "редактор субтитров",
-        }
-        if (
-            not cleaned_text
-            or cleaned_text in (".", "...", ",", "!", "?", "—", "-")
-            or cleaned_text.lower() in WHISPER_HALLUCINATIONS
-        ):
+        legacy_duration_ms = max(0, end_ms - start_ms)
+        skip_reason = transcript_skip_reason(cleaned_text, language, legacy_duration_ms)
+        if skip_reason:
+            logger.info(
+                "Legacy chunk %s produced unusable transcript (%s), skipping segment.",
+                filename,
+                skip_reason,
+            )
             return
 
         if not self.repo.get_interview(interview_id):
@@ -1673,15 +1849,15 @@ Respond strictly with a JSON object conforming to:
                 owner_token=owner_token,
                 suggestions=sug_payload,
                 outcome=outcome,
-                model_profile_id=getattr(self.followup_llm_adapter.model, "id", "google/gemini-3.8-flash"),
-                provider_id=getattr(self.followup_llm_adapter.provider, "id", "plusvibe"),
+                model_profile_id=getattr(self.followup_llm_adapter.model, "id", self.provider.id),
+                provider_id=getattr(self.followup_llm_adapter.provider, "id", self.provider.id),
                 usage_tokens=usage_tokens,
                 latency_ms=latency_ms,
             )
         return {
             "question_id": req_row["question_id"],
             "call_duration_ms": latency_ms,
-            "provider_id": getattr(self.followup_llm_adapter.provider, "id", "plusvibe"),
+            "provider_id": getattr(self.followup_llm_adapter.provider, "id", self.provider.id),
             "upstream_model": upstream_model,
             "usage_tokens": usage_tokens,
             "suggestions_count": len(sug_payload),
@@ -1689,12 +1865,15 @@ Respond strictly with a JSON object conforming to:
 
     async def run_loop(self, poll_interval_sec: float = 0.25) -> None:
         """
-        Runs dedicated consumers matching Stage 4 specifications:
+        Runs dedicated consumers matching Stage 4 specifications, with assessment fanned out:
         1. Assembly: TRANSCRIBE_AUDIO (concurrency 1)
-        2. Live STT: TRANSCRIBE_TURN (concurrency 2)
-        3. Assessment: EVALUATE_QUESTION (concurrency 1)
+        2. Live STT: TRANSCRIBE_TURN (concurrency DEFAULT_LIVE_STT_CONCURRENCY)
+        3. Assessment: EVALUATE_QUESTION (concurrency self._assessment_concurrency)
         4. Follow-ups: GENERATE_FOLLOWUPS (concurrency 1)
         5. Background: BATCH_RETRANSCRIBE, GENERATE_SUMMARY, etc. (concurrency 1)
+
+        Every consumer still shares one provider semaphore, so the total number of in-flight
+        provider calls never exceeds provider_concurrency_cap regardless of consumer count.
         """
         self._running = True
         self._stop_event.clear()
@@ -1724,12 +1903,21 @@ Respond strictly with a JSON object conforming to:
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(self._stop_event.wait(), timeout=poll_interval_sec)
 
-        # Concurrency: 1 Assembly + 2 Live STT + 1 Assessment + 1 Followups + 1 Background = 6 workers
+        # Assessment gets its own fan-out; every other stage keeps a single tuned consumer.
         consumers = [
             asyncio.create_task(_consumer_loop("assembly", include_types=["TRANSCRIBE_AUDIO"])),
-            asyncio.create_task(_consumer_loop("live_stt_1", include_types=["TRANSCRIBE_TURN"])),
-            asyncio.create_task(_consumer_loop("live_stt_2", include_types=["TRANSCRIBE_TURN"])),
-            asyncio.create_task(_consumer_loop("assessment", include_types=["EVALUATE_QUESTION"])),
+            *[
+                asyncio.create_task(
+                    _consumer_loop(f"live_stt_{i + 1}", include_types=["TRANSCRIBE_TURN"])
+                )
+                for i in range(self._live_stt_concurrency)
+            ],
+            *[
+                asyncio.create_task(
+                    _consumer_loop(f"assessment_{i + 1}", include_types=["EVALUATE_QUESTION"])
+                )
+                for i in range(self._assessment_concurrency)
+            ],
             asyncio.create_task(_consumer_loop("followups", include_types=["GENERATE_FOLLOWUPS"])),
             asyncio.create_task(
                 _consumer_loop(
@@ -1774,7 +1962,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     from backend.adapters.resilient_llm import ResilientLLMAdapter
     from backend.adapters.stt import OpenAICompatibleSTTAdapter
-    from backend.core.profiles import get_plusvibe_whisper_stt
+    from backend.core.profiles import get_default_stt_profile
     from backend.db.database import get_db
     from backend.db.repository import Repository
 

@@ -22,7 +22,12 @@ def client(tmp_path):
     app.dependency_overrides.clear()
 
 
-def _create_recording_interview(client: TestClient, repo: Repository, interview_id: str = "inv-api-1") -> str:
+def _create_recording_interview(
+    client: TestClient,
+    repo: Repository,
+    interview_id: str = "inv-api-1",
+    with_candidate_answer: bool = True,
+) -> str:
     # 1. Create interview
     res = client.post(
         "/api/v1/interviews",
@@ -68,21 +73,22 @@ def _create_recording_interview(client: TestClient, repo: Repository, interview_
     assert res_status.status_code == 200
 
     # 4. Add candidate segment and associate with q1
-    repo.add_transcript_segment(
-        segment_id=f"seg-{interview_id}",
-        interview_id=interview_id,
-        track_id="candidate",
-        start_time_ms=0,
-        end_time_ms=5000,
-        text="Я использовал asyncio Event Loop для запуска фоновых корутин.",
-        is_final=True,
-        speaker_role="candidate",
-    )
-    repo.reassociate_segment(
-        interview_id=interview_id,
-        segment_id=f"seg-{interview_id}",
-        new_question_id="q1",
-    )
+    if with_candidate_answer:
+        repo.add_transcript_segment(
+            segment_id=f"seg-{interview_id}",
+            interview_id=interview_id,
+            track_id="candidate",
+            start_time_ms=0,
+            end_time_ms=5000,
+            text="Я использовал asyncio Event Loop для запуска фоновых корутин.",
+            is_final=True,
+            speaker_role="candidate",
+        )
+        repo.reassociate_segment(
+            interview_id=interview_id,
+            segment_id=f"seg-{interview_id}",
+            new_question_id="q1",
+        )
 
     return interview_id
 
@@ -327,3 +333,80 @@ def test_get_interview_and_export_contains_followups(client):
     assert "followup_questions" in export_data
     assert len(export_data["followup_questions"]) == 1
     assert export_data["followup_questions"][0]["id"] == sug_id
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["http://localhost:1420", "http://127.0.0.1:1420", "tauri://localhost", "https://tauri.localhost"],
+)
+def test_followup_decision_patch_preflight_allowed_for_desktop_origins(client, origin):
+    """
+    Desktop sends PATCH /followups/{suggestion_id} when the interviewer marks a suggestion as asked.
+    CORS must allow PATCH, otherwise the browser/WebView preflight is rejected and fetch fails
+    with an opaque network error (e.g. "Load failed") instead of reaching the endpoint.
+    Десктоп отправляет PATCH при нажатии «Задан»; без PATCH в CORS preflight запрос не доходит до API.
+    """
+    test_client, _ = client
+    res = test_client.options(
+        "/api/v1/interviews/inv-preflight/followups/sug-preflight",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "PATCH",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.headers["access-control-allow-origin"] == origin
+    allowed = {m.strip().upper() for m in res.headers["access-control-allow-methods"].split(",")}
+    assert "PATCH" in allowed
+
+
+def test_guide_available_without_candidate_answer(client):
+    """
+    Наводящий вопрос можно запросить до ответа кандидата: состояние не блокирует,
+    генерация принимается, а уточняющий вопрос по-прежнему ждёт ответа.
+    """
+    test_client, repo = client
+    interview_id = _create_recording_interview(
+        test_client, repo, "inv-guide-noanswer-1", with_candidate_answer=False
+    )
+
+    # Probe без ответа кандидата остаётся заблокированным
+    probe_state = test_client.get(
+        f"/api/v1/interviews/{interview_id}/followups?question_id=q1&mode=probe"
+    ).json()
+    assert probe_state["can_generate"] is False
+    assert probe_state["wait_reason"] in ("waiting_for_candidate", "needs_role_assignment", "needs_association")
+
+    probe_gen = test_client.post(
+        f"/api/v1/interviews/{interview_id}/followups/generate",
+        json={"question_id": "q1", "mode": "probe", "trigger": "manual"},
+    )
+    assert probe_gen.status_code == 200
+    assert probe_gen.json()["status"] == "waiting"
+
+    # Guide без ответа кандидата доступен и принимается в очередь
+    guide_state = test_client.get(
+        f"/api/v1/interviews/{interview_id}/followups?question_id=q1&mode=guide"
+    ).json()
+    assert guide_state["can_generate"] is True
+    assert guide_state["wait_reason"] is None
+
+    guide_gen = test_client.post(
+        f"/api/v1/interviews/{interview_id}/followups/generate",
+        json={"question_id": "q1", "mode": "guide", "trigger": "manual"},
+    )
+    assert guide_gen.status_code == 202
+    guide_data = guide_gen.json()
+    assert guide_data["status"] == "enqueued"
+    assert guide_data["mode"] == "guide"
+    assert guide_data["job_id"]
+
+    # Очередь действительно содержит задание на генерацию подсказки
+    with repo.db.transaction() as conn:
+        job_row = conn.execute(
+            "SELECT type, status FROM jobs WHERE id = ?", (guide_data["job_id"],)
+        ).fetchone()
+    assert job_row is not None
+    assert job_row["type"] == "GENERATE_FOLLOWUPS"
+    assert job_row["status"] in ("PENDING", "PROCESSING")

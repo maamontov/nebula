@@ -47,7 +47,7 @@ class OpenAICompatibleSTTAdapter:
     def __init__(
         self,
         profile: STTProfile,
-        api_key_env: str = "PLUSVIBE_API_KEY",
+        api_key_env: str = "ROUTERAI_API_KEY",
         http_client: httpx.AsyncClient | None = None,
     ):
         self.profile = profile
@@ -63,6 +63,11 @@ class OpenAICompatibleSTTAdapter:
                 key = os.getenv(self.api_key_env, "")
             except Exception:
                 pass
+        if not key:
+            for fallback_env in ("ROUTERAI_API_KEY", "PLUSVIBE_API_KEY", "OPENAI_API_KEY", "NEBULA_API_KEY"):
+                key = os.getenv(fallback_env, "")
+                if key:
+                    break
         return key
 
     async def transcribe_audio(
@@ -73,9 +78,19 @@ class OpenAICompatibleSTTAdapter:
         language: str | None = "ru",
         max_retries: int = 3,
         initial_backoff: float = 1.0,
+        timeout_seconds: float | None = None,
     ) -> STTTranscriptionResult:
         """
         Transcribes an audio chunk or file via the standard multipart/form-data endpoint.
+
+        `timeout_seconds` bounds a single HTTP attempt and overrides the client/profile default
+        for this call only. Callers that run under an outer job deadline must pass a per-attempt
+        timeout smaller than that deadline, otherwise the outer cancellation fires first and this
+        method's retry loop never runs (the request is cancelled, not timed out).
+
+        `timeout_seconds` ограничивает одну HTTP-попытку и переопределяет таймаут клиента только
+        для этого вызова. Если снаружи есть дедлайн задания, таймаут попытки обязан быть меньше
+        дедлайна, иначе внешняя отмена сработает раньше и ретраи этого метода не выполнятся.
         """
         api_key = self._get_api_key()
         headers = {}
@@ -86,7 +101,8 @@ class OpenAICompatibleSTTAdapter:
                 f"Missing API key: environment variable '{self.api_key_env}' is not set or empty."
             )
 
-        client = self._external_client or httpx.AsyncClient(timeout=self.profile.timeout_seconds)
+        request_timeout = timeout_seconds if timeout_seconds is not None else self.profile.timeout_seconds
+        client = self._external_client or httpx.AsyncClient(timeout=request_timeout)
         close_client = self._external_client is None
 
         attempt = 0
@@ -113,6 +129,7 @@ class OpenAICompatibleSTTAdapter:
                         files=files,
                         data=data,
                         headers=headers,
+                        timeout=request_timeout,
                     )
 
                     if resp.status_code in (401, 403):

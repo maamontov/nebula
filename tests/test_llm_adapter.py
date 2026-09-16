@@ -56,6 +56,68 @@ def test_build_payload_modes():
     assert "STRICTLY with a valid JSON" in p3["messages"][0]["content"]
 
 
+def test_build_payload_thinking_disable_payload():
+    provider = ProviderProfile(id="p1", name="P1", base_url="http://localhost:8000/v1", api_key_env="DUMMY")
+    schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+
+    # Capability not declared -> the switch is never sent, so other providers are unaffected.
+    plain = ModelProfile(
+        id="m-plain", provider_id="p1", upstream_model_id="plain-model",
+        structured_output_mode=StructuredOutputMode.JSON_OBJECT,
+    )
+    p_plain = OpenAICompatibleAdapter(provider, plain).build_payload(
+        [{"role": "user", "content": "Hi"}], json_schema=schema
+    )
+    assert "enable_thinking" not in p_plain
+    assert "reasoning_effort" not in p_plain
+
+    # Declared -> the fragment is merged verbatim without disturbing the request contract.
+    qwen = ModelProfile(
+        id="m-qwen", provider_id="p1", upstream_model_id="qwen-model",
+        structured_output_mode=StructuredOutputMode.JSON_OBJECT,
+        thinking_disable_payload={"enable_thinking": False},
+    )
+    p_qwen = OpenAICompatibleAdapter(provider, qwen).build_payload(
+        [{"role": "user", "content": "Hi"}], json_schema=schema
+    )
+    assert p_qwen["enable_thinking"] is False
+    assert p_qwen["model"] == "qwen-model"
+    # JSON_OBJECT mode prepends a system schema instruction; the caller's turn must survive.
+    assert p_qwen["messages"][-1] == {"role": "user", "content": "Hi"}
+    assert p_qwen["response_format"]["type"] == "json_object"
+
+    # DeepSeek-style fragment: a different key expresses the same capability.
+    deepseek = ModelProfile(
+        id="m-ds", provider_id="p1", upstream_model_id="ds-model",
+        structured_output_mode=StructuredOutputMode.JSON_OBJECT,
+        thinking_disable_payload={"reasoning_effort": "none"},
+    )
+    p_ds = OpenAICompatibleAdapter(provider, deepseek).build_payload(
+        [{"role": "user", "content": "Hi"}], json_schema=schema
+    )
+    assert p_ds["reasoning_effort"] == "none"
+    assert "enable_thinking" not in p_ds
+
+    # A misconfigured fragment must never be able to hijack the request contract.
+    hijack = ModelProfile(
+        id="m-bad", provider_id="p1", upstream_model_id="real-model",
+        structured_output_mode=StructuredOutputMode.JSON_OBJECT,
+        thinking_disable_payload={
+            "model": "attacker-model",
+            "messages": [],
+            "response_format": {"type": "text"},
+            "reasoning_effort": "none",
+        },
+    )
+    p_bad = OpenAICompatibleAdapter(provider, hijack).build_payload(
+        [{"role": "user", "content": "Hi"}], json_schema=schema
+    )
+    assert p_bad["model"] == "real-model"
+    assert p_bad["messages"][-1] == {"role": "user", "content": "Hi"}
+    assert p_bad["response_format"]["type"] == "json_object"
+    # Non-reserved keys from the same fragment still apply.
+    assert p_bad["reasoning_effort"] == "none"
+
 @pytest.mark.asyncio
 async def test_successful_request_with_mock_transport():
     mock_response = {

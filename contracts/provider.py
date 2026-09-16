@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -59,6 +60,18 @@ class ModelProfile(BaseModel):
     supports_temperature: bool = Field(default=True)
     default_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     supports_seed: bool = Field(default=False)
+    thinking_disable_payload: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Exact JSON fragment merged into the chat/completions request body to disable "
+            "internal reasoning/thinking tokens. Vendor-specific and NOT interchangeable: "
+            "Qwen honours {'enable_thinking': False}, DeepSeek ignores that key and requires "
+            "{'reasoning_effort': 'none'}, and some models regress (more reasoning tokens) when "
+            "sent an unrecognised key because the gateway silently drops it instead of erroring. "
+            "Keep None until the exact provider/model pair is verified with "
+            "`evals/provider_probe.py --thinking-disable-json`. None means never sent."
+        ),
+    )
 
 
 class TaskRoute(BaseModel):

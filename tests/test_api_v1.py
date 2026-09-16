@@ -149,3 +149,29 @@ def test_system_backup_and_integrity(client, tmp_path, monkeypatch):
     assert backup_res.status_code == 200
     assert (tmp_path / "backup.db").exists()
 
+
+
+def test_system_models_endpoint_reports_resolved_profiles(client, monkeypatch):
+    """
+    UI показывает фактическую модель, поэтому эндпоинт обязан возвращать реально
+    сконфигурированные профили провайдера/модели, а не выдуманное название.
+    """
+    monkeypatch.setenv("NEBULA_LLM_PROVIDER", "routerai")
+    monkeypatch.setenv("NEBULA_LLM_MODEL", "qwen/qwen3.7-flash")
+    monkeypatch.setenv("NEBULA_STT_MODEL", "qwen/qwen3-asr-1.7b")
+
+    res = client.get("/api/v1/system/models")
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["llm"]["provider_id"] == "routerai"
+    assert data["llm"]["upstream_model_id"] == "qwen/qwen3.7-flash"
+    assert data["llm"]["model_profile_id"]
+    assert data["llm"]["provider_name"]
+
+    assert data["stt"]["provider_id"] == "routerai"
+    assert data["stt"]["upstream_model_id"] == "qwen/qwen3-asr-1.7b"
+    assert data["stt"]["model_profile_id"]
+
+    # Провайдер и точный upstream model_id хранятся раздельно
+    assert data["llm"]["provider_id"] != data["llm"]["upstream_model_id"]

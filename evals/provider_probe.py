@@ -42,6 +42,7 @@ async def run_probe(
     model_id: str,
     api_key_env: str,
     mode: StructuredOutputMode,
+    thinking_disable_payload: dict | None = None,
 ) -> int:
     print("==================================================")
     print("Nebula Provider Probe")
@@ -65,6 +66,7 @@ async def run_probe(
         upstream_model_id=model_id,
         structured_output_mode=mode,
         max_output_tokens=1024,
+        thinking_disable_payload=thinking_disable_payload,
     )
 
     adapter = OpenAICompatibleAdapter(provider=provider, model=model)
@@ -115,7 +117,25 @@ async def run_probe(
         parsed_data = res2.get("data")
         print(f"  ✓ Success ({elapsed2:.2f}s)")
         print(f"  Parsed JSON: {json.dumps(parsed_data, ensure_ascii=False, indent=2)}")
-        print(f"  Usage: {res2.get('usage', {})}\n")
+        usage = res2.get("usage", {})
+        reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        print(f"  Usage: {usage}")
+        print(f"  reasoning_tokens: {reasoning_tokens}\n")
+
+        # A gateway silently drops unknown parameters instead of returning 4xx, so a wrong
+        # switch looks like success while costing latency (or even adding reasoning tokens).
+        # Never record a thinking_disable_payload capability without this check passing.
+        if thinking_disable_payload is not None:
+            print("[2b] Verifying reasoning is actually disabled...")
+            print(f"  Sent fragment: {json.dumps(thinking_disable_payload, ensure_ascii=False)}")
+            if reasoning_tokens:
+                print(
+                    f"  ✗ FAILED: model still emitted {reasoning_tokens} reasoning tokens. "
+                    "The upstream gateway ignored the fragment. Do NOT record this capability "
+                    "for this provider/model pair.\n"
+                )
+                return 3
+            print("  ✓ Zero/absent reasoning tokens. Capability verified for this provider/model.\n")
     except Exception as e:  # noqa: BLE001
         print(f"  ✗ FAILED: {e}\n")
         return 2
@@ -143,7 +163,27 @@ def main():
         choices=["json_schema", "json_object", "prompt_instruction"],
         default="json_object",
     )
+    parser.add_argument(
+        "--thinking-disable-json",
+        default=None,
+        help=(
+            "Exact JSON object merged into the request to disable reasoning, e.g. "
+            "'{\"enable_thinking\": false}' for Qwen or '{\"reasoning_effort\": \"none\"}' "
+            "for DeepSeek. When set, the probe fails unless the model emits zero reasoning tokens."
+        ),
+    )
     args = parser.parse_args()
+
+    thinking_payload: dict | None = None
+    if args.thinking_disable_json:
+        try:
+            thinking_payload = json.loads(args.thinking_disable_json)
+        except json.JSONDecodeError as exc:
+            print(f"Invalid --thinking-disable-json: {exc}")
+            sys.exit(2)
+        if not isinstance(thinking_payload, dict):
+            print("--thinking-disable-json must be a JSON object")
+            sys.exit(2)
 
     mode_enum = StructuredOutputMode(args.mode)
     code = asyncio.run(
@@ -152,6 +192,7 @@ def main():
             model_id=args.model,
             api_key_env=args.api_key_env,
             mode=mode_enum,
+            thinking_disable_payload=thinking_payload,
         )
     )
     sys.exit(code)
