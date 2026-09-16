@@ -4177,4 +4177,124 @@ class Repository:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    # -------------------------------------------------------------
+    # AI Settings
+    # -------------------------------------------------------------
 
+    def get_ai_settings(self) -> dict[str, Any] | None:
+        """
+        Retrieves the active AI settings singleton (id=1), or None if not configured in DB.
+        """
+        conn = self.db.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT id, revision, transcription_config_json, text_analysis_config_json, created_at, updated_at "
+                "FROM ai_settings WHERE id = 1"
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "id": row["id"],
+                "revision": row["revision"],
+                "transcription_config": json.loads(row["transcription_config_json"]),
+                "text_analysis_config": json.loads(row["text_analysis_config_json"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        finally:
+            conn.close()
+
+    def get_ai_settings_update_blocker(self, conn: sqlite3.Connection | None = None) -> str | None:
+        """
+        Returns a human-readable description of why AI settings cannot be updated, or None if safe.
+        Settings cannot be updated if an interview is recording/paused, or if a job is PENDING/PROCESSING.
+        """
+        def _check(c: sqlite3.Connection) -> str | None:
+            active_interview = c.execute(
+                "SELECT id, status FROM interviews WHERE status IN ('recording', 'paused') LIMIT 1"
+            ).fetchone()
+            if active_interview:
+                return f"Interview {active_interview['id']} is currently {active_interview['status']}"
+
+            active_job = c.execute(
+                "SELECT id, type, status FROM jobs WHERE status IN ('PENDING', 'PROCESSING') LIMIT 1"
+            ).fetchone()
+            if active_job:
+                return f"Background job {active_job['id']} ({active_job['type']}) is {active_job['status']}"
+
+            return None
+
+        if conn is not None:
+            return _check(conn)
+
+        c = self.db.get_connection()
+        try:
+            return _check(c)
+        finally:
+            c.close()
+
+    def update_ai_settings(
+        self,
+        expected_revision: int,
+        transcription_config: dict[str, Any],
+        text_analysis_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Atomically updates the AI settings singleton row (id=1).
+        Enforces OCC (expected_revision matches current revision, or 0 if row does not exist)
+        and verifies that no interviews are recording/paused and no jobs are PENDING/PROCESSING.
+        Raises RepositoryConflictError if OCC fails or active work is present.
+        """
+        with self.db.transaction() as conn:
+            blocker = self.get_ai_settings_update_blocker(conn=conn)
+            if blocker:
+                raise RepositoryConflictError(f"Cannot update AI settings: {blocker}")
+
+            row = conn.execute(
+                "SELECT revision, created_at FROM ai_settings WHERE id = 1"
+            ).fetchone()
+            current_revision = row["revision"] if row else 0
+
+            if current_revision != expected_revision:
+                raise RepositoryConflictError(
+                    f"AI settings conflict: expected revision {expected_revision}, "
+                    f"but current revision is {current_revision}"
+                )
+
+            next_revision = current_revision + 1
+            now_iso = datetime.now(UTC).isoformat()
+            trans_json = json.dumps(transcription_config, ensure_ascii=False)
+            text_json = json.dumps(text_analysis_config, ensure_ascii=False)
+
+            if row:
+                conn.execute(
+                    """
+                    UPDATE ai_settings
+                    SET revision = ?,
+                        transcription_config_json = ?,
+                        text_analysis_config_json = ?,
+                        updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (next_revision, trans_json, text_json, now_iso),
+                )
+                created_at = row["created_at"]
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO ai_settings (
+                        id, revision, transcription_config_json, text_analysis_config_json, created_at, updated_at
+                    ) VALUES (1, ?, ?, ?, ?, ?)
+                    """,
+                    (next_revision, trans_json, text_json, now_iso, now_iso),
+                )
+                created_at = now_iso
+
+            return {
+                "id": 1,
+                "revision": next_revision,
+                "transcription_config": transcription_config,
+                "text_analysis_config": text_analysis_config,
+                "created_at": created_at,
+                "updated_at": now_iso,
+            }

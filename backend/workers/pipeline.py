@@ -15,6 +15,7 @@ import re
 import sqlite3
 import struct
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +42,9 @@ from backend.adapters.stt import (
     STTRateLimitError,
     STTTransientError,
 )
+from backend.core.ai_settings import resolve_ai_settings
 from backend.core.audio_utils import pcm_s16le_to_wav_bytes
+from backend.core.credential_store import CredentialStore
 from backend.core.evidence_validator import validate_proposal
 from backend.core.followup_generator import (
     FollowUpContext,
@@ -77,6 +80,7 @@ from contracts.followups import (
     FollowUpLLMResponse,
     FollowUpMode,
 )
+from contracts.provider import ProviderProfile, STTProfile
 
 logger = logging.getLogger("nebula.pipeline")
 
@@ -261,6 +265,20 @@ FOLLOWUP_CONCURRENCY = 1
 BACKGROUND_CONCURRENCY = 1
 
 
+@dataclass(frozen=True)
+class WorkerAiBundle:
+    revision: int
+    stt_provider: ProviderProfile
+    stt_profile: STTProfile
+    stt_adapter: OpenAICompatibleSTTAdapter | Any
+    stt_semaphore: asyncio.Semaphore
+    llm_provider: ProviderProfile
+    llm_adapter: ResilientLLMAdapter | OpenAICompatibleAdapter | Any
+    llm_semaphore: asyncio.Semaphore
+    followup_llm_adapter: OpenAICompatibleAdapter | Any
+    default_language: str
+
+
 class PipelineWorker:
     def __init__(
         self,
@@ -272,55 +290,166 @@ class PipelineWorker:
         provider_concurrency_cap: int | None = None,
         assessment_concurrency: int = DEFAULT_ASSESSMENT_CONCURRENCY,
         live_stt_concurrency: int = DEFAULT_LIVE_STT_CONCURRENCY,
+        credential_store: CredentialStore | None = None,
     ) -> None:
         self.repo = repository
-        self.provider = get_default_provider()
-        # Default to the concurrency the provider profile actually declares (routerai and
-        # plusvibe both advertise 10) rather than a hard-coded guess. The latency audit noted
-        # that `max_concurrency` existed in the profile but no code ever used it.
-        resolved_cap = provider_concurrency_cap or self.provider.max_concurrency
-        self._provider_concurrency_cap = resolved_cap
-        self._provider_semaphore = asyncio.Semaphore(resolved_cap)
-        self._live_stt_concurrency = live_stt_concurrency
-        # Reserve permits for the other consumers so that widening assessment parallelism can
-        # never starve the live path: a blocked review must not delay live recognition.
-        reserved_for_other_consumers = live_stt_concurrency + FOLLOWUP_CONCURRENCY + BACKGROUND_CONCURRENCY
-        self._assessment_concurrency = max(
-            1, min(assessment_concurrency, resolved_cap - reserved_for_other_consumers)
-        )
-        if self._assessment_concurrency != assessment_concurrency:
-            logger.warning(
-                "Assessment concurrency reduced from %d to %d: provider cap %d reserves %d "
-                "permits for live STT/follow-ups/background. Raise provider_concurrency_cap to "
-                "widen assessment parallelism.",
-                assessment_concurrency,
-                self._assessment_concurrency,
-                resolved_cap,
-                reserved_for_other_consumers,
-            )
+        self._cred_store = credential_store or CredentialStore()
         self._owns_http_client = http_client is None
         self._http_client = http_client or httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, connect=10.0)
         )
+        self._refresh_lock = asyncio.Lock()
+        self._user_assessment_concurrency = assessment_concurrency
+        self._user_live_stt_concurrency = live_stt_concurrency
+        self._provider_concurrency_cap = provider_concurrency_cap
 
-        stt_prof = get_default_stt_profile()
-        self.stt_adapter = stt_adapter or OpenAICompatibleSTTAdapter(
-            stt_prof,
-            api_key_env=self.provider.api_key_env,
-            http_client=self._http_client,
+        # If any adapter was explicitly injected, keep them fixed (do not reload from DB in unit tests)
+        self._fixed_adapters = (
+            stt_adapter is not None
+            or llm_adapter is not None
+            or followup_llm_adapter is not None
         )
-        self.llm_adapter = llm_adapter or ResilientLLMAdapter(
-            provider=self.provider,
-            primary_model=get_default_llm_model(),
-            http_client=self._http_client,
-        )
-        self.followup_llm_adapter = followup_llm_adapter or OpenAICompatibleAdapter(
-            self.provider,
-            get_default_llm_model(),
-            http_client=self._http_client,
-        )
+
+        if self._fixed_adapters:
+            self.provider = get_default_provider()
+            resolved_cap = provider_concurrency_cap or self.provider.max_concurrency
+            self._provider_concurrency_cap = resolved_cap
+            self._provider_semaphore = asyncio.Semaphore(resolved_cap)
+            self._live_stt_concurrency = live_stt_concurrency
+            reserved_for_other_consumers = live_stt_concurrency + FOLLOWUP_CONCURRENCY + BACKGROUND_CONCURRENCY
+            self._assessment_concurrency = max(
+                1, min(assessment_concurrency, resolved_cap - reserved_for_other_consumers)
+            )
+            self._stt_semaphore = (
+                self._provider_semaphore
+                if provider_concurrency_cap is not None
+                else asyncio.Semaphore(live_stt_concurrency)
+            )
+
+            stt_prof = get_default_stt_profile()
+            self.stt_adapter = stt_adapter or OpenAICompatibleSTTAdapter(
+                stt_prof,
+                api_key_env=self.provider.api_key_env,
+                http_client=self._http_client,
+            )
+            self.llm_adapter = llm_adapter or ResilientLLMAdapter(
+                provider=self.provider,
+                primary_model=get_default_llm_model(),
+                http_client=self._http_client,
+            )
+            self.followup_llm_adapter = followup_llm_adapter or OpenAICompatibleAdapter(
+                self.provider,
+                get_default_llm_model(),
+                http_client=self._http_client,
+            )
+            self._ai_bundle = WorkerAiBundle(
+                revision=0,
+                stt_provider=self.provider,
+                stt_profile=stt_prof,
+                stt_adapter=self.stt_adapter,
+                stt_semaphore=self._stt_semaphore,
+                llm_provider=self.provider,
+                llm_adapter=self.llm_adapter,
+                llm_semaphore=self._provider_semaphore,
+                followup_llm_adapter=self.followup_llm_adapter,
+                default_language="ru",
+            )
+        else:
+            self._ai_bundle = self._build_ai_bundle()
+            self.provider = self._ai_bundle.llm_provider
+            resolved_cap = provider_concurrency_cap or self._ai_bundle.llm_provider.max_concurrency
+            self._provider_concurrency_cap = resolved_cap
+            self.stt_adapter = self._ai_bundle.stt_adapter
+            self.llm_adapter = self._ai_bundle.llm_adapter
+            self.followup_llm_adapter = self._ai_bundle.followup_llm_adapter
+            self._live_stt_concurrency = live_stt_concurrency
+            reserved_for_other_consumers = live_stt_concurrency + FOLLOWUP_CONCURRENCY + BACKGROUND_CONCURRENCY
+            self._assessment_concurrency = max(
+                1,
+                min(
+                    assessment_concurrency,
+                    resolved_cap - reserved_for_other_consumers,
+                ),
+            )
+            self._provider_semaphore = (
+                asyncio.Semaphore(resolved_cap)
+                if provider_concurrency_cap is not None
+                else self._ai_bundle.llm_semaphore
+            )
+            self._stt_semaphore = (
+                self._provider_semaphore
+                if provider_concurrency_cap is not None
+                else self._ai_bundle.stt_semaphore
+            )
+
         self._running = False
         self._stop_event = asyncio.Event()
+
+    def _build_ai_bundle(self) -> WorkerAiBundle:
+        response, runtime_config = resolve_ai_settings(self.repo, self._cred_store)
+        stt_adapter = OpenAICompatibleSTTAdapter(
+            runtime_config.stt_profile,
+            api_key=runtime_config.stt_credentials.api_key,
+            auth_mode=response.transcription.auth_mode,
+            http_client=self._http_client,
+        )
+        llm_adapter = ResilientLLMAdapter(
+            provider=runtime_config.llm_provider,
+            primary_model=runtime_config.llm_primary,
+            fallback_models=runtime_config.llm_fallbacks,
+            api_key=runtime_config.llm_credentials.api_key,
+            auth_mode=response.text_analysis.auth_mode,
+            http_client=self._http_client,
+        )
+        followup_llm_adapter = OpenAICompatibleAdapter(
+            runtime_config.llm_provider,
+            runtime_config.llm_primary,
+            api_key=runtime_config.llm_credentials.api_key,
+            auth_mode=response.text_analysis.auth_mode,
+            http_client=self._http_client,
+        )
+        stt_concurrency = (
+            self._user_live_stt_concurrency
+            if self._user_live_stt_concurrency != DEFAULT_LIVE_STT_CONCURRENCY
+            else runtime_config.stt_provider.max_concurrency
+        )
+        llm_concurrency = self._provider_concurrency_cap or runtime_config.llm_provider.max_concurrency
+        stt_sem = asyncio.Semaphore(stt_concurrency)
+        llm_sem = asyncio.Semaphore(llm_concurrency)
+
+        return WorkerAiBundle(
+            revision=runtime_config.revision,
+            stt_provider=runtime_config.stt_provider,
+            stt_profile=runtime_config.stt_profile,
+            stt_adapter=stt_adapter,
+            stt_semaphore=stt_sem,
+            llm_provider=runtime_config.llm_provider,
+            llm_adapter=llm_adapter,
+            llm_semaphore=llm_sem,
+            followup_llm_adapter=followup_llm_adapter,
+            default_language=runtime_config.language,
+        )
+
+    async def _get_current_bundle(self) -> WorkerAiBundle:
+        if self._fixed_adapters:
+            return self._ai_bundle
+
+        db_settings = self.repo.get_ai_settings()
+        current_rev = db_settings["revision"] if db_settings else 0
+        if current_rev != self._ai_bundle.revision:
+            async with self._refresh_lock:
+                db_settings = self.repo.get_ai_settings()
+                current_rev = db_settings["revision"] if db_settings else 0
+                if current_rev != self._ai_bundle.revision:
+                    self._ai_bundle = self._build_ai_bundle()
+                    self.provider = self._ai_bundle.llm_provider
+                    self.stt_adapter = self._ai_bundle.stt_adapter
+                    self.llm_adapter = self._ai_bundle.llm_adapter
+                    self.followup_llm_adapter = self._ai_bundle.followup_llm_adapter
+                    self._provider_semaphore = self._ai_bundle.llm_semaphore
+                    self._stt_semaphore = self._ai_bundle.stt_semaphore
+                    logger.info("PipelineWorker reloaded AI bundle to revision %d", self._ai_bundle.revision)
+        return self._ai_bundle
 
     async def _lease_heartbeat(
         self,
@@ -389,24 +518,34 @@ class PipelineWorker:
                 c_dt = datetime.fromisoformat(job["created_at"])
                 queue_wait_ms = max(0, int((now_dt - c_dt).total_seconds() * 1000))
 
+        bundle = await self._get_current_bundle()
+
         try:
             async def _run_handler():
                 if job_type == "TRANSCRIBE_AUDIO":
                     return await self._handle_transcribe_audio(
-                        interview_id, payload, owner_token=owner_token, job_id=job_id
+                        interview_id, payload, owner_token=owner_token, job_id=job_id, bundle=bundle
                     )
                 elif job_type == "TRANSCRIBE_TURN":
                     return await self._handle_transcribe_turn(
-                        interview_id, payload, owner_token=owner_token, job_id=job_id
+                        interview_id, payload, owner_token=owner_token, job_id=job_id, bundle=bundle
                     )
                 elif job_type == "EVALUATE_QUESTION":
-                    return await self._handle_evaluate(interview_id, payload, owner_token=owner_token, job_id=job_id)
+                    return await self._handle_evaluate(
+                        interview_id, payload, owner_token=owner_token, job_id=job_id, bundle=bundle
+                    )
                 elif job_type == "BATCH_RETRANSCRIBE":
-                    return await self._handle_batch_retranscribe(interview_id, payload, owner_token=owner_token, job_id=job_id)
+                    return await self._handle_batch_retranscribe(
+                        interview_id, payload, owner_token=owner_token, job_id=job_id, bundle=bundle
+                    )
                 elif job_type == "GENERATE_SUMMARY":
-                    return await self._handle_generate_summary(interview_id, payload, owner_token=owner_token, job_id=job_id)
+                    return await self._handle_generate_summary(
+                        interview_id, payload, owner_token=owner_token, job_id=job_id, bundle=bundle
+                    )
                 elif job_type == "GENERATE_FOLLOWUPS":
-                    return await self._handle_generate_followups(interview_id, payload, owner_token=owner_token, job_id=job_id)
+                    return await self._handle_generate_followups(
+                        interview_id, payload, owner_token=owner_token, job_id=job_id, bundle=bundle
+                    )
                 else:
                     raise ValueError(f"Unknown job type: {job_type}")
 
@@ -528,6 +667,7 @@ class PipelineWorker:
         payload: dict[str, Any],
         owner_token: str | None = None,
         job_id: str | None = None,
+        bundle: WorkerAiBundle | None = None,
     ) -> None:
         """
         Chunk ingestion event handler. Runs TurnAssembler on continuous audio chunks from cursor
@@ -560,7 +700,7 @@ class PipelineWorker:
         if capture_epoch is None or sequence is None:
             if "audio_hex" in payload:
                 logger.info("Executing legacy direct STT fallback for job %s (missing epoch/sequence)", job_id)
-                await self._handle_legacy_direct_transcribe(interview_id, payload)
+                await self._handle_legacy_direct_transcribe(interview_id, payload, bundle=bundle)
                 return
             raise ValueError(f"Cannot identify audio chunk sequence/epoch for TRANSCRIBE_AUDIO job {job_id}")
 
@@ -617,6 +757,7 @@ class PipelineWorker:
                 except Exception:
                     pass
 
+        default_lang = bundle.default_language if bundle else "ru"
         assembler = TurnAssembler()
         out = assembler.assemble(
             chunks=chunk_refs,
@@ -624,7 +765,7 @@ class PipelineWorker:
             is_flush=is_flush,
             track_id=track_id,
             capture_epoch=capture_epoch,
-            language=payload.get("language", "ru"),
+            language=payload.get("language") or default_lang,
         )
 
         self.repo.commit_turn_assembly_results(
@@ -648,6 +789,7 @@ class PipelineWorker:
         payload: dict[str, Any],
         owner_token: str | None = None,
         job_id: str | None = None,
+        bundle: WorkerAiBundle | None = None,
     ) -> dict[str, Any] | None:
         """
         Executes STT transcription for a coherent speech turn.
@@ -664,7 +806,8 @@ class PipelineWorker:
         end_ms = payload["end_ms"]
         sample_rate = payload.get("sample_rate", 16000)
         channels = payload.get("channels", 1)
-        language = payload.get("language", "ru")
+        default_lang = bundle.default_language if bundle else "ru"
+        language = payload.get("language") or default_lang
         segment_id = payload.get("segment_id", f"seg-{uuid.uuid4().hex[:8]}")
 
         inv = self.repo.get_interview(interview_id)
@@ -690,8 +833,10 @@ class PipelineWorker:
         wav_bytes = pcm_s16le_to_wav_bytes(pcm_bytes, sample_rate, channels)
         filename = f"turn_{track_id}_{start_ms}_{end_ms}.wav"
 
-        async with self._provider_semaphore:
-            res = await self.stt_adapter.transcribe_audio(
+        stt_adapter = bundle.stt_adapter if bundle else self.stt_adapter
+        stt_semaphore = bundle.stt_semaphore if bundle else self._stt_semaphore
+        async with stt_semaphore:
+            res = await stt_adapter.transcribe_audio(
                 wav_bytes,
                 filename=filename,
                 content_type="audio/wav",
@@ -703,8 +848,8 @@ class PipelineWorker:
         cleaned_text = res.text.strip()
         audio_duration_ms = max(0, end_ms - start_ms)
         call_duration_ms = int(getattr(res, "latency_seconds", 0) * 1000)
-        provider_id = getattr(getattr(self, "provider", None), "id", "system")
-        upstream_model_id = getattr(res, "model_id", "default")
+        provider_id = bundle.stt_provider.id if bundle else getattr(getattr(self, "provider", None), "id", "system")
+        upstream_model_id = getattr(res, "model_id", bundle.stt_profile.model_id if bundle else "default")
 
         skip_reason = transcript_skip_reason(cleaned_text, language, audio_duration_ms)
         if skip_reason:
@@ -749,6 +894,7 @@ class PipelineWorker:
         self,
         interview_id: str,
         payload: dict[str, Any],
+        bundle: WorkerAiBundle | None = None,
     ) -> None:
         """Legacy direct transcription fallback for pending jobs without sequence/epoch."""
         audio_bytes = bytes.fromhex(payload["audio_hex"])
@@ -758,7 +904,8 @@ class PipelineWorker:
         sample_rate = payload.get("sample_rate", 16000)
         channels = payload.get("channels", 1)
         format_val = payload.get("format", "pcm_s16le")
-        language = payload.get("language", "ru")
+        default_lang = bundle.default_language if bundle else "ru"
+        language = payload.get("language") or default_lang
 
         if format_val == "pcm_s16le" or not audio_bytes.startswith(b"RIFF"):
             wav_bytes = pcm_s16le_to_wav_bytes(audio_bytes, sample_rate, channels)
@@ -766,8 +913,10 @@ class PipelineWorker:
             wav_bytes = audio_bytes
 
         filename = f"chunk_{track_id}_{start_ms}_{end_ms}.wav"
-        async with self._provider_semaphore:
-            res = await self.stt_adapter.transcribe_audio(
+        stt_adapter = bundle.stt_adapter if bundle else self.stt_adapter
+        stt_semaphore = bundle.stt_semaphore if bundle else self._stt_semaphore
+        async with stt_semaphore:
+            res = await stt_adapter.transcribe_audio(
                 wav_bytes,
                 filename=filename,
                 content_type="audio/wav",
@@ -813,11 +962,16 @@ class PipelineWorker:
         payload: dict[str, Any],
         owner_token: str | None = None,
         job_id: str | None = None,
-    ) -> None:
+        bundle: WorkerAiBundle | None = None,
+    ) -> dict[str, Any] | None:
         inv = self.repo.get_interview(interview_id)
         if not inv:
             logger.warning("Interview %s was deleted before evaluation. Discarding.", interview_id)
             return
+
+        llm_adapter = bundle.llm_adapter if bundle else self.llm_adapter
+        llm_semaphore = bundle.llm_semaphore if bundle else self._provider_semaphore
+        llm_provider = bundle.llm_provider if bundle else getattr(self, "provider", None)
 
         def is_candidate_segment(s: dict[str, Any]) -> bool:
             role = str(s.get("speaker_role", "")).lower()
@@ -903,11 +1057,11 @@ class PipelineWorker:
                 for c in (criteria if criteria else [{"id": first_crit_id}])
             ]
             prop_id = f"prop-eval-{job_id}" if job_id else f"prop-{uuid.uuid4().hex[:8]}"
-            provider_val = getattr(self.provider, "id", None)
+            provider_val = getattr(llm_provider, "id", None)
             prov_id = provider_val if isinstance(provider_val, str) else "system"
-            model_val = getattr(getattr(self.llm_adapter, "model", None), "upstream_model_id", None)
+            model_val = getattr(getattr(llm_adapter, "model", None), "upstream_model_id", None)
             if not isinstance(model_val, str):
-                model_val = getattr(self.llm_adapter, "model_id", None)
+                model_val = getattr(llm_adapter, "model_id", None)
             mod_id = model_val if isinstance(model_val, str) else "default-evaluator"
             current_inv = self.repo.get_interview(interview_id)
             is_stale = False
@@ -948,30 +1102,45 @@ class PipelineWorker:
             }
 
 
-        # 3. Build candidate speech text with explicit individual segment IDs
+        # 3. Format prompt for LLM evaluation
         transcript_content = "\n".join(
-            f"[{s['id']}]: \"{s.get('text', '').strip()}\""
-            for s in candidate_segments_data
+            f"[{s['id']}] {s['text']}" for s in candidate_segments_data
         )
-        primary_seg_id = candidate_segments_data[0]["id"]
 
-        schema_desc = f"""
-Respond strictly with a JSON object conforming to:
-{{
-  "scores": [
-    {{
-      "criterion_id": "{first_crit_id}",
-      "score": 5.0,
-      "explanation": "...",
-      "evidence": [{{"segment_id": "{primary_seg_id}", "exact_quote": "..."}}]
-    }}
-  ],
-  "critical_errors": []
-}}
-"""
-        criteria_prompt = ""
+        schema_desc = (
+            "Верни ТОЛЬКО валидный JSON-объект строго по следующей схеме:\n"
+            "{\n"
+            '  "scores": [\n'
+            "    {\n"
+            '      "criterion_id": "идентификатор критерия (строка)",\n'
+            '      "score": число от 1.0 до 5.0 (или null, если кандидат вообще не ответил на этот критерий),\n'
+            '      "explanation": "подробное обоснование оценки",\n'
+            '      "evidence": [\n'
+            "        {\n"
+            '          "segment_id": "ID сегмента речи кандидата",\n'
+            '          "exact_quote": "точная дословная цитата из речи кандидата"\n'
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  ],\n"
+            '  "critical_errors": [\n'
+            "    {\n"
+            '      "severity": "CRITICAL" или "MAJOR",\n'
+            '      "title": "краткое описание ошибки",\n'
+            '      "description": "подробное описание ошибки",\n'
+            '      "evidence": [\n'
+            "        {\n"
+            '          "segment_id": "ID сегмента речи кандидата",\n'
+            '          "exact_quote": "точная дословная цитата из речи кандидата"\n'
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  ]\n"
+            "}\n"
+        )
+
         if criteria:
-            criteria_prompt = "Критерии рубрики:\n" + "\n".join(
+            criteria_prompt = "Критерии оценки:\n" + "\n".join(
                 f"- ID: '{c.get('id')}', Название: '{c.get('title')}', Вес: {c.get('weight', 1.0)}"
                 for c in criteria
             )
@@ -1000,9 +1169,9 @@ Respond strictly with a JSON object conforming to:
 
         # 4. Execute request through resilient LLM adapter
         t_eval0 = time.perf_counter()
-        async with self._provider_semaphore:
-            if isinstance(self.llm_adapter, ResilientLLMAdapter):
-                llm_res, actual_model_id = await self.llm_adapter.execute_request(
+        async with llm_semaphore:
+            if isinstance(llm_adapter, ResilientLLMAdapter):
+                llm_res, actual_model_id = await llm_adapter.execute_request(
                     messages=messages,
                     json_schema={
                         "type": "object",
@@ -1014,7 +1183,7 @@ Respond strictly with a JSON object conforming to:
                     },
                     schema_name="assessment_schema",
                 )
-                fallback_metadata = self.llm_adapter.last_fallback_event
+                fallback_metadata = llm_adapter.last_fallback_event
                 if fallback_metadata:
                     self.repo.record_audit_event(
                         event_id=f"audit-{uuid.uuid4().hex[:8]}",
@@ -1023,7 +1192,7 @@ Respond strictly with a JSON object conforming to:
                         payload=fallback_metadata,
                     )
             else:
-                raw_res = await self.llm_adapter.execute_request(
+                raw_res = await llm_adapter.execute_request(
                     messages=messages,
                     json_schema={
                         "type": "object",
@@ -1040,15 +1209,16 @@ Respond strictly with a JSON object conforming to:
                     llm_res, actual_model_id = raw_res
                 else:
                     llm_res = raw_res
-                    actual_model_id = getattr(getattr(self.llm_adapter, "model", None), "upstream_model_id", "mock-model")
+                    model_val = getattr(getattr(llm_adapter, "model", None), "upstream_model_id", None)
+                    actual_model_id = model_val if isinstance(model_val, str) else getattr(llm_adapter, "model_id", "default")
 
         call_duration_ms = int((time.perf_counter() - t_eval0) * 1000)
 
+        # 5. Programmatic Evidence Validation
         parsed_json = llm_res.get("data", llm_res) if isinstance(llm_res, dict) else {}
         scores = parsed_json.get("scores", [])
         critical_errors = parsed_json.get("critical_errors", [])
 
-        # 5. Programmatic Evidence Validation
         proposal_scores_objs: list[CriterionScoreProposal] = []
         for s in scores:
             ev_list = []
@@ -1125,7 +1295,7 @@ Respond strictly with a JSON object conforming to:
             stale_reason = f"Revisions changed during evaluation (eval: {rubric_rev}/{trans_rev}, current: {curr_rub}/{curr_trans})"
             logger.warning("Proposal %s is stale: %s", proposal.id, stale_reason)
 
-        provider_val = getattr(self.provider, "id", None)
+        provider_val = getattr(llm_provider, "id", None)
         prov_id = provider_val if isinstance(provider_val, str) else "system"
         mod_id = actual_model_id if isinstance(actual_model_id, str) else str(actual_model_id)
 
@@ -1163,11 +1333,17 @@ Respond strictly with a JSON object conforming to:
         payload: dict[str, Any],
         owner_token: str | None = None,
         job_id: str | None = None,
+        bundle: WorkerAiBundle | None = None,
     ) -> None:
         inv = self.repo.get_interview(interview_id)
         if not inv or inv.get("status") == "deleted":
             logger.warning("Interview %s was deleted before batch retranscribe.", interview_id)
             return
+
+        stt_adapter = bundle.stt_adapter if bundle else self.stt_adapter
+        stt_semaphore = bundle.stt_semaphore if bundle else self._stt_semaphore
+        default_lang = bundle.default_language if bundle else "ru"
+        language = payload.get("language") or default_lang
 
         old_rev_id = payload.get("old_revision_id") or inv.get("active_transcript_revision_id") or "trans-rev-1"
 
@@ -1296,6 +1472,7 @@ Respond strictly with a JSON object conforming to:
                         is_flush=is_last_window,
                         track_id=track_id,
                         capture_epoch=epoch,
+                        language=language,
                     )
                     turns_to_transcribe.extend(assembly_out.turns)
                     cursor = TurnAssemblyCursor(assembly_out.next_sequence, assembly_out.next_sample_offset)
@@ -1352,12 +1529,13 @@ Respond strictly with a JSON object conforming to:
                         continue
 
                     wav_bytes = pcm_s16le_to_wav_bytes(pcm_bytes, turn.sample_rate, turn.channels)
-                    async with self._provider_semaphore:
+                    async with stt_semaphore:
                         res = await asyncio.wait_for(
-                            self.stt_adapter.transcribe_audio(
+                            stt_adapter.transcribe_audio(
                                 wav_bytes,
                                 filename=f"batch_{track_id}_{turn.first_sequence}_{turn.last_sequence}.wav",
                                 content_type="audio/wav",
+                                language=language,
                             ),
                             timeout=60.0,
                         )
@@ -1547,12 +1725,16 @@ Respond strictly with a JSON object conforming to:
         payload: dict[str, Any],
         owner_token: str | None = None,
         job_id: str | None = None,
+        bundle: WorkerAiBundle | None = None,
     ) -> None:
         interview = self.repo.get_interview(interview_id)
         candidate_name = interview.get("candidate_name", "Кандидат") if interview else "Кандидат"
         role = interview.get("role", "Инженер") if interview else "Инженер"
         active_trans_rev = (interview.get("active_transcript_revision_id") or "trans-rev-1") if interview else "trans-rev-1"
         active_rub_rev = (interview.get("active_rubric_revision_id") or "rub-rev-1") if interview else "rub-rev-1"
+
+        llm_adapter = bundle.llm_adapter if bundle else self.llm_adapter
+        llm_semaphore = bundle.llm_semaphore if bundle else self._provider_semaphore
 
         # Capture decisions snapshot before generation
         snapshot_hash = self.repo.compute_decisions_snapshot_hash(interview_id)
@@ -1597,9 +1779,9 @@ Respond strictly with a JSON object conforming to:
                     limitations.append(f"Вопрос {q_id} не был оценен или пропущен.")
 
         summary_gen = ExecutiveSummaryGenerator(
-            llm_adapter=self.llm_adapter if isinstance(self.llm_adapter, ResilientLLMAdapter) else None
+            llm_adapter=llm_adapter if isinstance(llm_adapter, ResilientLLMAdapter) else None
         )
-        async with self._provider_semaphore:
+        async with llm_semaphore:
             summary_res = await summary_gen.generate_summary(
                 candidate_name=candidate_name,
                 role=role,
@@ -1645,11 +1827,15 @@ Respond strictly with a JSON object conforming to:
         payload: dict[str, Any],
         owner_token: str | None = None,
         job_id: str | None = None,
+        bundle: WorkerAiBundle | None = None,
     ) -> None:
         request_id = payload.get("request_id")
         if not request_id:
             logger.warning("Missing request_id in GENERATE_FOLLOWUPS payload: %s", payload)
             return
+
+        followup_adapter = bundle.followup_llm_adapter if bundle else self.followup_llm_adapter
+        llm_semaphore = bundle.llm_semaphore if bundle else self._provider_semaphore
 
         with self.repo.db.transaction() as conn:
             req_row = conn.execute(
@@ -1759,9 +1945,9 @@ Respond strictly with a JSON object conforming to:
         # 6. Call LLM with timeout and isolated adapter
         t0 = time.perf_counter()
         try:
-            async with self._provider_semaphore:
+            async with llm_semaphore:
                 response_envelope = await asyncio.wait_for(
-                    self.followup_llm_adapter.execute_request(
+                    followup_adapter.execute_request(
                         messages=messages,
                         json_schema=json_schema,
                         schema_name="followup_suggestions",

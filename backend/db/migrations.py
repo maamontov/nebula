@@ -31,10 +31,13 @@ def get_current_migration_version(conn: sqlite3.Connection) -> int:
     return row[0] if row and row[0] is not None else 0
 
 
+TARGET_VERSION = 13
+
+
 def run_migrations(db: Database) -> int:
     """
-    Applies all pending migrations transactionally with pre-migration backup.
-    Применяет все незавершенные миграции в транзакции с предварительным бэкапом.
+    Applies incremental migrations to the database.
+    Returns the new schema version after all pending migrations are applied.
     """
     conn = db.get_connection()
     try:
@@ -42,7 +45,6 @@ def run_migrations(db: Database) -> int:
     finally:
         conn.close()
 
-    TARGET_VERSION = 12
     if current_version < TARGET_VERSION and db.db_path != ":memory:" and Path(db.db_path).exists():
         # Make verified pre-migration backup if not in-memory
         backup_dir = Path(os.getenv("NEBULA_BACKUP_DIR", "data/backups")).resolve()
@@ -767,6 +769,30 @@ def run_migrations(db: Database) -> int:
         if not db.verify_integrity():
             raise RuntimeError("Database integrity check failed after running migration 012!")
         current_version = 12
+
+    if current_version < 13:
+        with db.transaction() as tx_conn:
+            tx_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ai_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    revision INTEGER NOT NULL CHECK (revision >= 1),
+                    transcription_config_json TEXT NOT NULL,
+                    text_analysis_config_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            now_iso = datetime.now(UTC).isoformat()
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (13, '013_ai_settings', ?)",
+                (now_iso,),
+            )
+
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 013!")
+        current_version = 13
 
     logger.info("Successfully ensured database schema up to version %d", current_version)
     return current_version

@@ -20,6 +20,7 @@ Nebula — кроссплатформенный AI-помощник для пр�
 3. **Программная валидация цитат (Evidence)**: любая оценка требует верифицируемой ссылки на транскрипт. Галлюцинации, фейковые цитаты и попытки prompt injection отсекаются валидатором.
 4. **Изоляция авторства речи**: в режиме `single_source` неразмеченная общая речь (`unknown`) или реплики интервьюера категорически исключены из контекста оценки ответов кандидата.
 5. **Защита от дискриминации**: любые суждения по нерелевантным личным признакам (акцент, пол, тембр речи, возраст) блокируют утверждение оценки.
+6. **Независимая настройка AI-провайдеров и горячая перезагрузка**: независимое конфигурирование STT и LLM через экран Desktop и REST API. Секреты хранятся изолированно от БД в версионированных защищённых файлах, ключи write-only и никогда не возвращаются в API. Обновление конфигурации воркера происходит на лету без перезапуска приложения с транзакционной защитой от конфликтов (OCC).
 
 ### Структура репозитория
 ```text
@@ -95,6 +96,7 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 - [Спецификация контрактов и доменной модели](docs/contracts-spec.md)
 - [Спецификация аудиозахвата и spooling](docs/audio-capture-spec.md)
 - [Спецификация интеграции STT и LLM](docs/stt-llm-provider-spec.md)
+- [Спецификация и план настроек AI-провайдеров](docs/ai-provider-settings-implementation-plan.md)
 - [Спецификация управления сервисами](docs/service-management-spec.md)
 - [Спецификация надёжности и пилотной готовности](docs/stage7-reliability-and-pilot-spec.md)
 
@@ -117,6 +119,7 @@ Core product principle: **Nebula is a decision-support system, not an autonomous
 3. **Programmatic Evidence Verification**: every score proposal requires verifiable verbatim quotes from the candidate transcript. Hallucinated quotes and prompt injection attempts are blocked.
 4. **Speaker Attribution Isolation**: in `single_source` mode, unassigned speech (`unknown`) or interviewer speech is strictly excluded from candidate answer evaluation.
 5. **Bias Protection**: any scoring justifications referencing non-professional personal attributes (accent, vocal timbre, speech rate, gender, age) strictly block approval.
+6. **Independent AI Provider Configuration & Hot Reload**: independent configuration of STT and LLM providers via Desktop UI and REST API. Secrets are stored in versioned protected files outside SQLite, write-only and never exposed via API. Background worker reloads configuration on the fly without application restart, guarded by transactional OCC.
 
 ### Repository Layout
 ```text
@@ -192,6 +195,7 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 - [Contracts & Domain Model Specification](docs/contracts-spec.md)
 - [Audio Capture & Spooling Specification](docs/audio-capture-spec.md)
 - [STT & LLM Integration Specification](docs/stt-llm-provider-spec.md)
+- [AI Provider Settings Specification & Implementation Plan](docs/ai-provider-settings-implementation-plan.md)
 - [Service Management Specification](docs/service-management-spec.md)
 - [Reliability & Pilot Readiness Specification](docs/stage7-reliability-and-pilot-spec.md)
 

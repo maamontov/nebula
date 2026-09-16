@@ -1,5 +1,5 @@
 import { isTauri, invoke } from '@tauri-apps/api/core';
-import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus, SpeakerRole, CaptureMode, TrackManifest, JobTemplate, PaginatedInterviews, ReportRevisionSummary, FollowUpSuggestion, FollowUpsStateResponse, GenerateFollowUpsRequest, PatchFollowUpSuggestionRequest, FollowUpMode, JobStatusResponse } from '../types';
+import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus, SpeakerRole, CaptureMode, TrackManifest, JobTemplate, PaginatedInterviews, ReportRevisionSummary, FollowUpSuggestion, FollowUpsStateResponse, GenerateFollowUpsRequest, PatchFollowUpSuggestionRequest, FollowUpMode, JobStatusResponse, AiSettingsResponse, UpdateAiSettingsRequest, TestAiSettingsRequest, TestAiSettingsResponse } from '../types';
 
 const API_BASE = 'http://127.0.0.1:8000/api/v1';
 
@@ -1215,6 +1215,53 @@ export async function retryFollowUpRequest(
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(errBody.detail || `Retry follow-up request error: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+// -------------------------------------------------------------
+// AI Provider & Model Settings API
+// -------------------------------------------------------------
+
+export async function getAiSettings(): Promise<AiSettingsResponse> {
+  const res = await fetch(`${API_BASE}/settings/ai`);
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(errBody.detail || `Get AI settings error: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function updateAiSettings(data: UpdateAiSettingsRequest): Promise<AiSettingsResponse> {
+  const res = await fetch(`${API_BASE}/settings/ai`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = typeof errBody.detail === 'string' ? errBody.detail : JSON.stringify(errBody.detail);
+    if (res.status === 409) {
+      throw new Error(`409: ${detail || 'Конфликт ревизии или активный пайплайн'}`);
+    }
+    if (res.status === 422) {
+      throw new Error(`422: ${detail || 'Ошибка валидации параметров'}`);
+    }
+    throw new Error(detail || `Update AI settings error: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function testAiSettings(data: TestAiSettingsRequest): Promise<TestAiSettingsResponse> {
+  const res = await fetch(`${API_BASE}/settings/ai/test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = typeof errBody.detail === 'string' ? errBody.detail : JSON.stringify(errBody.detail);
+    throw new Error(detail || `Test AI settings error: ${res.statusText}`);
   }
   return res.json();
 }

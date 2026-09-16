@@ -156,3 +156,63 @@ med 1.34s. Обе укладываются в бюджет попытки `STT_T
 
 Замеры сделаны на синтетической речи и шуме, не на записях интервью. На реальной тихой речи
 с артефактами цифры могут отличаться.
+
+---
+
+## 6. Управление настройками AI-провайдеров через Desktop UI и API / Provider Settings Management via Desktop UI & API
+
+### Русский
+Nebula поддерживает динамическую независимую настройку STT и LLM провайдеров прямо из десктопного интерфейса (экран «Настройки») и через REST API без необходимости перезапуска сервисов.
+
+#### 6.1. Архитектура разделения конфигурации и секретов
+- **Не секретная конфигурация**: хранится в таблице SQLite `ai_settings` (singleton строка `id=1`) в виде JSON-конфигураций `transcription_config_json` и `text_analysis_config_json`. Включает URL, имена провайдеров, model ID, параметры reasoning, температуру, лимиты токенов, таймауты и concurrency.
+- **Секреты (API-ключи)**: API-ключи **никогда не сохраняются в БД, не логируются и не возвращаются клиенту** (write-only). При сохранении настроек через UI/API ключи записываются в версионированный защищённый файл `data/provider-secrets-v<revision>.env` с правами доступа `0600` на Unix.
+- **Приоритет окружения**: если ключ задан через системные переменные окружения (`NEBULA_STT_API_KEY`, `NEBULA_LLM_API_KEY`, `ROUTERAI_API_KEY`, `PLUSVIBE_API_KEY`), он имеет высший приоритет, помечается источником `process_environment` и блокируется для редактирования через UI (`editable=false`).
+- **Действия с ключами (ApiKeyAction)**: поддерживаются `preserve` (сохранить текущий активный ключ), `replace` (записать новое переданное значение) и `clear` (удалить ключ из хранилища).
+
+#### 6.2. OCC и транзакционные блокировки
+- Запросы на обновление настроек (`PUT /api/v1/settings/ai`) передают `expected_revision`. При несовпадении ревизии возвращается `409 Conflict` (Optimistic Concurrency Control).
+- Обновление настроек **строго блокируется (409 Conflict)**, если:
+  1. В системе есть активное интервью в статусе `recording` или `paused`;
+  2. В очереди задач есть задания в статусе `PENDING` или `PROCESSING`.
+- Запись снапшота секретов и коммит ревизии в БД согласованы: при отказе транзакции БД подготовленный файл секрета немедленно удаляется.
+
+#### 6.3. Горячая перезагрузка воркера (PipelineWorker Reload)
+- `PipelineWorker` использует иммутабельный бандл `WorkerAiBundle` (`revision`, адаптеры STT/LLM, семафоры).
+- Перед взятием каждой задачи из очереди воркер под блокировкой проверяет актуальную ревизию настроек. При изменении ревизии воркер мгновенно пересобирает бандл без перезапуска процесса.
+- Семафоры STT и LLM разделены: фоновые обращения к STT не блокируют и не конкурируют с лимитами запросов к LLM.
+
+#### 6.4. Эндпоинты API
+- `GET /api/v1/settings/ai`: возвращает текущую эффективную конфигурацию, ревизию, источник (`environment` или `database`), статус ключей (`configured`, `source`, `editable`) и признак `can_update` / `update_blocker`. Значения ключей никогда не возвращаются.
+- `PUT /api/v1/settings/ai`: выполняет атомарное обновление конфигурации с OCC-контролем и snapshotting секретов.
+- `POST /api/v1/settings/ai/test`: проверяет подключение к STT (синтетический WAV без речи) или LLM (минимальный JSON probe) с возвратом латентности и статуса без сохранения настроек.
+- `GET /api/v1/system/models`: возвращает активные провайдеры и модели из резолвера настроек с текущей `settings_revision`.
+
+---
+
+### English
+Nebula supports dynamic, independent configuration of STT and LLM providers directly from the Desktop UI ("Settings" screen) and via REST API without requiring a service restart.
+
+#### 6.1. Configuration and Secret Separation Architecture
+- **Non-Secret Configuration**: Persisted in the SQLite `ai_settings` table (singleton row `id=1`) as JSON documents `transcription_config_json` and `text_analysis_config_json`. Holds URLs, provider identifiers, model IDs, reasoning policies, temperature, token bounds, timeouts, and concurrency caps.
+- **Secrets (API Keys)**: API keys are **never stored in the database, never logged, and never returned to clients** (write-only). When saved via UI/API, secrets are committed to a versioned, restricted file `data/provider-secrets-v<revision>.env` with `0600` permissions on Unix.
+- **Environment Precedence**: If credentials are provided via process environment variables (`NEBULA_STT_API_KEY`, `NEBULA_LLM_API_KEY`, `ROUTERAI_API_KEY`, `PLUSVIBE_API_KEY`), they take top precedence, are marked as `process_environment`, and cannot be modified via UI (`editable=false`).
+- **Key Actions (ApiKeyAction)**: Supported actions are `preserve` (retain current active secret), `replace` (commit newly supplied secret), and `clear` (remove key from runtime store).
+
+#### 6.2. OCC and Transactional Blockers
+- Update requests (`PUT /api/v1/settings/ai`) submit `expected_revision`. A mismatch returns `409 Conflict` (Optimistic Concurrency Control).
+- Settings updates are **strictly blocked (409 Conflict)** if:
+  1. An interview is currently `recording` or `paused`;
+  2. Any queue jobs are in `PENDING` or `PROCESSING` state.
+- Secret file preparation and database commit are synchronized: if the DB transaction fails or a blocker is detected, the uncommitted secret snapshot is immediately cleaned up.
+
+#### 6.3. Dynamic Worker Reload (PipelineWorker Reload)
+- `PipelineWorker` maintains an immutable `WorkerAiBundle` containing revision, STT/LLM adapters, and concurrency semaphores.
+- Before executing claimed jobs, the worker checks the active settings revision under a refresh lock. If the revision has bumped, the worker instantiates a new bundle seamlessly without application restart.
+- STT and LLM semaphores are decoupled: STT streaming does not consume LLM rate limits or concurrency slots.
+
+#### 6.4. API Endpoints
+- `GET /api/v1/settings/ai`: Returns effective configuration, revision, source (`environment` or `database`), credential statuses (`configured`, `source`, `editable`), and `can_update` / `update_blocker`. Key values are never included.
+- `PUT /api/v1/settings/ai`: Atomically commits configuration with OCC verification and secret snapshotting.
+- `POST /api/v1/settings/ai/test`: Tests candidate STT (synthetic speech-free WAV) or LLM (minimal JSON probe) configurations and returns latency and acceptance status without persisting changes.
+- `GET /api/v1/system/models`: Returns active STT/LLM models and fallback lists resolved from current settings along with `settings_revision`.

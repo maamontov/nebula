@@ -6,6 +6,7 @@ import {
   Briefcase,
   FileSpreadsheet,
   Moon,
+  Settings,
   ShieldCheck,
   Sparkles,
   Sun,
@@ -19,8 +20,8 @@ interface HeaderProps {
   role?: string;
   isCapturing?: boolean;
   captureMode?: CaptureMode;
-  currentScreen?: 'home' | 'templates' | 'setup' | 'live' | 'review';
-  onNavigate?: (screen: 'home' | 'templates' | 'live') => void;
+  currentScreen?: 'home' | 'templates' | 'setup' | 'live' | 'review' | 'settings';
+  onNavigate?: (screen: 'home' | 'templates' | 'live' | 'settings') => void;
   activeRecordingSession?: {
     interviewId: string;
     candidateName: string;
@@ -113,6 +114,13 @@ export const Header: React.FC<HeaderProps> = ({
             onClick={() => onNavigate?.('templates')}
           >
             <Briefcase className="sidebar-nav-icon" />
+          </NavButton>
+          <NavButton
+            label="Настройки"
+            active={currentScreen === 'settings'}
+            onClick={() => onNavigate?.('settings')}
+          >
+            <Settings className="sidebar-nav-icon" />
           </NavButton>
         </nav>
 

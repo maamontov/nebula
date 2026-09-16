@@ -327,3 +327,95 @@ export interface JobStatusResponse {
   oldest_pending_age_sec?: number | null;
   active_jobs?: JobDetail[];
 }
+
+// -------------------------------------------------------------
+// AI Settings & Provider Types
+// -------------------------------------------------------------
+
+export type ProviderPreset = 'routerai' | 'plusvibe' | 'custom';
+export type AuthMode = 'bearer' | 'none';
+export type StructuredOutputMode = 'json_object' | 'json_schema';
+export type ReasoningPolicy = 'provider_default' | 'disable_enable_thinking' | 'disable_reasoning_effort';
+export type ApiKeyAction = 'preserve' | 'replace' | 'clear';
+export type TestTarget = 'stt' | 'llm';
+
+export interface TranscriptionSettings {
+  preset: ProviderPreset;
+  provider_id: string;
+  provider_name: string;
+  endpoint_url: string;
+  model_id: string;
+  auth_mode: AuthMode;
+  language: string;
+  timeout_seconds: number;
+  max_concurrency: number;
+}
+
+export interface AnalysisModelSettings {
+  model_id: string;
+  structured_output_mode: StructuredOutputMode;
+  reasoning_policy: ReasoningPolicy;
+  supports_temperature: boolean;
+  temperature: number;
+  max_output_tokens: number;
+  context_window_tokens: number;
+}
+
+export interface TextAnalysisSettings {
+  preset: ProviderPreset;
+  provider_id: string;
+  provider_name: string;
+  base_url: string;
+  auth_mode: AuthMode;
+  timeout_seconds: number;
+  max_concurrency: number;
+  primary_model: AnalysisModelSettings;
+  fallback_models: AnalysisModelSettings[];
+}
+
+export interface CredentialStatus {
+  configured: boolean;
+  source: 'process_environment' | 'runtime_file' | 'legacy_environment' | 'none';
+  editable: boolean;
+}
+
+export interface AiSettingsResponse {
+  revision: number;
+  source: 'environment' | 'database';
+  transcription: TranscriptionSettings;
+  text_analysis: TextAnalysisSettings;
+  stt_credentials: CredentialStatus;
+  llm_credentials: CredentialStatus;
+  can_update: boolean;
+  update_blocker: string | null;
+}
+
+export interface ApiKeyUpdate {
+  action: ApiKeyAction;
+  value?: string | null;
+}
+
+export interface UpdateAiSettingsRequest {
+  expected_revision: number;
+  transcription: TranscriptionSettings;
+  text_analysis: TextAnalysisSettings;
+  stt_api_key?: ApiKeyUpdate;
+  llm_api_key?: ApiKeyUpdate;
+}
+
+export interface TestAiSettingsRequest {
+  target: TestTarget;
+  transcription?: TranscriptionSettings;
+  text_analysis?: TextAnalysisSettings;
+  api_key?: string | null;
+}
+
+export interface TestAiSettingsResponse {
+  success: boolean;
+  target: TestTarget;
+  provider_id: string;
+  model_id: string;
+  latency_ms: number;
+  message: string;
+  error_code?: string | null;
+}

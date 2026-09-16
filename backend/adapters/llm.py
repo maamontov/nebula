@@ -21,6 +21,7 @@ from contracts.provider import (
     ProviderProfile,
     StructuredOutputMode,
 )
+from contracts.settings import AuthMode
 
 logger = logging.getLogger(__name__)
 
@@ -70,26 +71,29 @@ class OpenAICompatibleAdapter:
         self,
         provider: ProviderProfile,
         model: ModelProfile,
+        api_key: str | None = None,
+        auth_mode: AuthMode = AuthMode.BEARER,
         http_client: httpx.AsyncClient | None = None,
     ):
         self.provider = provider
         self.model = model
+        self._api_key = api_key
+        self.auth_mode = auth_mode
         self._external_client = http_client
 
     def _get_api_key(self) -> str:
-        api_key = os.getenv(self.provider.api_key_env, "")
+        if self._api_key:
+            return self._api_key
+        api_key = os.getenv("NEBULA_LLM_API_KEY", "")
+        if not api_key:
+            api_key = os.getenv(self.provider.api_key_env, "")
         if not api_key:
             try:
                 from dotenv import load_dotenv
                 load_dotenv()
-                api_key = os.getenv(self.provider.api_key_env, "")
+                api_key = os.getenv("NEBULA_LLM_API_KEY", "") or os.getenv(self.provider.api_key_env, "")
             except Exception:
                 pass
-        if not api_key:
-            for fallback_env in ("ROUTERAI_API_KEY", "PLUSVIBE_API_KEY", "OPENAI_API_KEY", "NEBULA_API_KEY"):
-                api_key = os.getenv(fallback_env, "")
-                if api_key:
-                    break
         return api_key
 
     def _build_url(self, endpoint: str) -> str:
@@ -186,16 +190,17 @@ class OpenAICompatibleAdapter:
         Executes request with retries, backoff, and JSON response verification.
         Returns parsed JSON dict if schema requested, or dict with 'content'.
         """
-        api_key = self._get_api_key()
         headers = {
             "Content-Type": "application/json",
         }
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        elif self._external_client is None:
-            raise LLMAuthenticationError(
-                f"Missing API key: environment variable '{self.provider.api_key_env}' is not set or empty."
-            )
+        if self.auth_mode == AuthMode.BEARER:
+            api_key = self._get_api_key()
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            elif self._external_client is None:
+                raise LLMAuthenticationError(
+                    f"Missing API key: provider '{self.provider.name}' requires Bearer authentication."
+                )
 
         url = self._build_url("/chat/completions")
         payload = self.build_payload(messages, json_schema=json_schema, schema_name=schema_name)

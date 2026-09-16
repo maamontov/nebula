@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import logging
 import re
+import time
 from pathlib import Path
 
 logger = logging.getLogger("nebula.api")
@@ -24,7 +25,12 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from backend.adapters.llm import OpenAICompatibleAdapter
+from backend.adapters.stt import OpenAICompatibleSTTAdapter
+from backend.core.ai_settings import resolve_ai_settings
 from backend.core.audio_health import AudioHealthMonitor, ChannelMetrics
+from backend.core.audio_utils import pcm_s16le_to_wav_bytes
+from backend.core.credential_store import CredentialStore
 from backend.core.evidence_validator import (
     validate_proposal,
 )
@@ -34,11 +40,6 @@ from backend.core.followup_generator import (
     is_candidate_segment,
 )
 from backend.core.matcher import QuestionMatcher
-from backend.core.profiles import (
-    get_default_llm_model,
-    get_default_provider,
-    get_default_stt_profile,
-)
 from backend.core.revisions import TranscriptDiffEngine
 from backend.core.scoring import (
     ScoringError,
@@ -68,6 +69,14 @@ from contracts.followups import (
     FollowUpTrigger,
     GenerateFollowUpsRequest,
     PatchFollowUpSuggestionRequest,
+)
+from contracts.provider import ModelProfile, ProviderProfile, STTProfile, STTProtocol
+from contracts.settings import (
+    AiSettingsResponse,
+    TestAiSettingsRequest,
+    TestAiSettingsResponse,
+    TestTarget,
+    UpdateAiSettingsRequest,
 )
 
 app = FastAPI(
@@ -2393,30 +2402,263 @@ async def get_system_config_endpoint(
 
 
 @app.get("/api/v1/system/models")
-async def get_system_models_endpoint():
+async def get_system_models_endpoint(
+    repo: Repository = Depends(get_repository),
+):
     """
     Returns the provider and model profiles that live work actually uses.
-    UI must display these instead of a hard-coded model name: provider_id is kept separate from
-    the exact upstream model_id, and nothing here may claim a capability the profile lacks.
-
-    Возвращает фактически используемые профили провайдера и модели, чтобы интерфейс не показывал
-    выдуманное название модели.
+    Uses the effective AI settings resolver.
     """
-    provider = get_default_provider()
-    llm_model = get_default_llm_model()
-    stt_profile = get_default_stt_profile()
+    cred_store = CredentialStore()
+    settings_resp, runtime_config = resolve_ai_settings(repo, cred_store)
     return {
         "llm": {
-            "provider_id": provider.id,
-            "provider_name": provider.name,
-            "model_profile_id": llm_model.id,
-            "upstream_model_id": llm_model.upstream_model_id,
+            "provider_id": runtime_config.llm_provider.id,
+            "provider_name": runtime_config.llm_provider.name,
+            "model_profile_id": runtime_config.llm_primary.id,
+            "upstream_model_id": runtime_config.llm_primary.upstream_model_id,
+            "fallback_models": [m.upstream_model_id for m in runtime_config.llm_fallbacks],
         },
         "stt": {
-            "provider_id": provider.id,
-            "provider_name": provider.name,
-            "model_profile_id": stt_profile.id,
-            "upstream_model_id": stt_profile.model_id,
+            "provider_id": runtime_config.stt_provider.id,
+            "provider_name": runtime_config.stt_provider.name,
+            "model_profile_id": runtime_config.stt_profile.id,
+            "upstream_model_id": runtime_config.stt_profile.model_id,
         },
+        "settings_revision": runtime_config.revision,
+        "settings_source": settings_resp.source,
     }
+
+
+# -------------------------------------------------------------
+# AI Provider & Model Settings Endpoints
+# -------------------------------------------------------------
+
+@app.get("/api/v1/settings/ai", response_model=AiSettingsResponse)
+async def get_ai_settings_endpoint(
+    repo: Repository = Depends(get_repository),
+) -> AiSettingsResponse:
+    """
+    Returns the effective AI settings for STT and LLM.
+    Secrets are NEVER returned in the response.
+    """
+    cred_store = CredentialStore()
+    response, _ = resolve_ai_settings(repo, cred_store)
+    return response
+
+
+@app.put("/api/v1/settings/ai", response_model=AiSettingsResponse)
+async def update_ai_settings_endpoint(
+    req: UpdateAiSettingsRequest,
+    repo: Repository = Depends(get_repository),
+) -> AiSettingsResponse:
+    """
+    Updates the AI settings with OCC revision check and blockers validation.
+    Stores non-secret configs in SQLite and writes versioned credentials snapshot to disk.
+    """
+    blocker = repo.get_ai_settings_update_blocker()
+    if blocker:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot update AI settings: active work present ({blocker})",
+        )
+
+    cred_store = CredentialStore()
+    next_revision = req.expected_revision + 1
+
+    # Prepare credentials snapshot
+    try:
+        stt_val = req.stt_api_key.value.get_secret_value() if req.stt_api_key.value else None
+        llm_val = req.llm_api_key.value.get_secret_value() if req.llm_api_key.value else None
+        cred_store.prepare_snapshot(
+            expected_revision=req.expected_revision,
+            stt_action=req.stt_api_key.action,
+            stt_value=stt_val,
+            llm_action=req.llm_api_key.action,
+            llm_value=llm_val,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Commit settings update into DB with atomic OCC & blocker re-check
+    try:
+        repo.update_ai_settings(
+            expected_revision=req.expected_revision,
+            transcription_config=req.transcription.model_dump(mode="json"),
+            text_analysis_config=req.text_analysis.model_dump(mode="json"),
+        )
+    except RepositoryConflictError as exc:
+        cred_store.cleanup_snapshot(next_revision)
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception:
+        cred_store.cleanup_snapshot(next_revision)
+        logger.exception("Failed to update AI settings in DB")
+        raise HTTPException(status_code=500, detail="Failed to persist AI settings")
+
+    # Prune old snapshot files (keeps current and previous)
+    cred_store.prune_old_snapshots(next_revision)
+
+    response, _ = resolve_ai_settings(repo, cred_store)
+    return response
+
+
+@app.post("/api/v1/settings/ai/test", response_model=TestAiSettingsResponse)
+async def test_ai_settings_endpoint(
+    req: TestAiSettingsRequest,
+    repo: Repository = Depends(get_repository),
+) -> TestAiSettingsResponse:
+    """
+    Tests connectivity and configuration for STT or LLM without persisting settings.
+    Uses candidate config and optional candidate API key.
+    """
+    cred_store = CredentialStore()
+    t0 = time.perf_counter()
+
+    if req.target == TestTarget.STT:
+        if not req.transcription:
+            raise HTTPException(
+                status_code=422,
+                detail="transcription settings must be provided when target is 'stt'",
+            )
+        t_cfg = req.transcription
+        # Resolve test key
+        if req.api_key and req.api_key.get_secret_value():
+            api_key = req.api_key.get_secret_value()
+        else:
+            _, runtime_config = resolve_ai_settings(repo, cred_store)
+            api_key = runtime_config.stt_credentials.api_key
+
+        stt_profile = STTProfile(
+            id=f"test-stt-{t_cfg.provider_id}",
+            name=t_cfg.provider_name,
+            endpoint_url=t_cfg.endpoint_url,
+            protocol=STTProtocol.BATCH,
+            model_id=t_cfg.model_id,
+            timeout_seconds=t_cfg.timeout_seconds,
+        )
+        # Synthetic WAV: 1 second of 16kHz mono 16-bit PCM silence (32000 bytes)
+        silence_pcm = b"\x00" * 32000
+        wav_bytes = pcm_s16le_to_wav_bytes(silence_pcm, sample_rate=16000, channels=1)
+
+        adapter = OpenAICompatibleSTTAdapter(
+            profile=stt_profile,
+            api_key=api_key,
+            auth_mode=t_cfg.auth_mode,
+        )
+
+        try:
+            res = await adapter.transcribe_audio(
+                wav_bytes,
+                filename="test_probe.wav",
+                content_type="audio/wav",
+                language=t_cfg.language,
+                max_retries=0,
+                timeout_seconds=min(15.0, t_cfg.timeout_seconds),
+            )
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            actual_model = getattr(res, "model_id", t_cfg.model_id)
+            return TestAiSettingsResponse(
+                success=True,
+                target=TestTarget.STT,
+                provider_id=t_cfg.provider_id,
+                model_id=actual_model,
+                latency_ms=latency_ms,
+                message="STT probe successful (synthetic audio accepted; microphone/quality not verified)",
+            )
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            err_code = exc.__class__.__name__
+            clean_msg = str(exc).strip() or err_code
+            return TestAiSettingsResponse(
+                success=False,
+                target=TestTarget.STT,
+                provider_id=t_cfg.provider_id,
+                model_id=t_cfg.model_id,
+                latency_ms=latency_ms,
+                error_code=err_code,
+                message=f"STT probe failed: {clean_msg}",
+            )
+
+    elif req.target == TestTarget.LLM:
+        if not req.text_analysis:
+            raise HTTPException(
+                status_code=422,
+                detail="text_analysis settings must be provided when target is 'llm'",
+            )
+        llm_cfg = req.text_analysis
+        # Resolve test key
+        if req.api_key and req.api_key.get_secret_value():
+            api_key = req.api_key.get_secret_value()
+        else:
+            _, runtime_config = resolve_ai_settings(repo, cred_store)
+            api_key = runtime_config.llm_credentials.api_key
+
+        provider = ProviderProfile(
+            id=llm_cfg.provider_id,
+            name=llm_cfg.provider_name,
+            base_url=llm_cfg.base_url,
+            models=(llm_cfg.primary_model.model_id,),
+            api_key_env="NEBULA_LLM_API_KEY",
+            max_concurrency=llm_cfg.max_concurrency,
+        )
+        model = ModelProfile(
+            id=f"test-model-{llm_cfg.primary_model.model_id}",
+            provider_id=llm_cfg.provider_id,
+            upstream_model_id=llm_cfg.primary_model.model_id,
+            structured_output_mode=llm_cfg.primary_model.structured_output_mode.value,
+            context_window_tokens=llm_cfg.primary_model.context_window_tokens,
+            max_output_tokens=llm_cfg.primary_model.max_output_tokens,
+            supports_temperature=llm_cfg.primary_model.supports_temperature,
+        )
+
+        adapter = OpenAICompatibleAdapter(
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            auth_mode=llm_cfg.auth_mode,
+        )
+
+        messages = [
+            {"role": "system", "content": "Respond with a JSON object: {\"status\": \"ok\"}"},
+            {"role": "user", "content": "Test connectivity."},
+        ]
+        json_schema = {
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+        }
+
+        try:
+            await adapter.execute_request(
+                messages=messages,
+                json_schema=json_schema,
+                schema_name="probe_test",
+                max_retries=0,
+                timeout_seconds=min(15.0, llm_cfg.timeout_seconds),
+            )
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            actual_model = getattr(adapter.model, "upstream_model_id", llm_cfg.primary_model.model_id)
+            return TestAiSettingsResponse(
+                success=True,
+                target=TestTarget.LLM,
+                provider_id=llm_cfg.provider_id,
+                model_id=actual_model,
+                latency_ms=latency_ms,
+                message="LLM probe successful (connectivity and structured output verified)",
+            )
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            err_code = exc.__class__.__name__
+            clean_msg = str(exc).strip() or err_code
+            return TestAiSettingsResponse(
+                success=False,
+                target=TestTarget.LLM,
+                provider_id=llm_cfg.provider_id,
+                model_id=llm_cfg.primary_model.model_id,
+                latency_ms=latency_ms,
+                error_code=err_code,
+                message=f"LLM probe failed: {clean_msg}",
+            )
+    else:
+        raise HTTPException(status_code=422, detail=f"Unsupported target: {req.target}")
 

@@ -5,11 +5,12 @@ import { JobTemplatesScreen } from './screens/JobTemplatesScreen';
 import { SetupScreen } from './screens/SetupScreen';
 import { LiveSessionScreen } from './screens/LiveSessionScreen';
 import { ReviewScreen } from './screens/ReviewScreen';
+import { SettingsScreen } from './screens/SettingsScreen';
 import { InterviewPlan, InterviewStatus, CaptureMode } from './types';
 import { getActiveSession, getInterview } from './services/api';
 import { AlertCircle, X } from 'lucide-react';
 
-type Screen = 'home' | 'templates' | 'setup' | 'live' | 'review';
+type Screen = 'home' | 'templates' | 'setup' | 'live' | 'review' | 'settings';
 type Theme = 'light' | 'dark';
 
 export const App: React.FC = () => {
@@ -111,7 +112,7 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleNavigate = (targetScreen: 'home' | 'templates' | 'live') => {
+  const handleNavigate = (targetScreen: 'home' | 'templates' | 'live' | 'settings') => {
     if (targetScreen === 'live') {
       if (activeRecordingSession) {
         setInterviewId(activeRecordingSession.interviewId);
@@ -317,6 +318,9 @@ export const App: React.FC = () => {
             onBackToHome={handleBackToHome}
           />
         )}
+
+        {/* Screen: Settings */}
+        {screen === 'settings' && <SettingsScreen />}
       </main>
 
       {/* Warning Modal */}

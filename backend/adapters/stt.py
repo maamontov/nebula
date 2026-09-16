@@ -12,6 +12,7 @@ from typing import BinaryIO
 import httpx
 
 from contracts.provider import STTProfile
+from contracts.settings import AuthMode
 
 logger = logging.getLogger(__name__)
 
@@ -48,26 +49,29 @@ class OpenAICompatibleSTTAdapter:
         self,
         profile: STTProfile,
         api_key_env: str = "ROUTERAI_API_KEY",
+        api_key: str | None = None,
+        auth_mode: AuthMode = AuthMode.BEARER,
         http_client: httpx.AsyncClient | None = None,
     ):
         self.profile = profile
         self.api_key_env = api_key_env
+        self._api_key = api_key
+        self.auth_mode = auth_mode
         self._external_client = http_client
 
     def _get_api_key(self) -> str:
-        key = os.getenv(self.api_key_env, "")
+        if self._api_key:
+            return self._api_key
+        key = os.getenv("NEBULA_STT_API_KEY", "")
+        if not key:
+            key = os.getenv(self.api_key_env, "")
         if not key:
             try:
                 from dotenv import load_dotenv
                 load_dotenv()
-                key = os.getenv(self.api_key_env, "")
+                key = os.getenv("NEBULA_STT_API_KEY", "") or os.getenv(self.api_key_env, "")
             except Exception:
                 pass
-        if not key:
-            for fallback_env in ("ROUTERAI_API_KEY", "PLUSVIBE_API_KEY", "OPENAI_API_KEY", "NEBULA_API_KEY"):
-                key = os.getenv(fallback_env, "")
-                if key:
-                    break
         return key
 
     async def transcribe_audio(
@@ -92,14 +96,15 @@ class OpenAICompatibleSTTAdapter:
         для этого вызова. Если снаружи есть дедлайн задания, таймаут попытки обязан быть меньше
         дедлайна, иначе внешняя отмена сработает раньше и ретраи этого метода не выполнятся.
         """
-        api_key = self._get_api_key()
         headers = {}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        elif self._external_client is None:
-            raise STTAuthenticationError(
-                f"Missing API key: environment variable '{self.api_key_env}' is not set or empty."
-            )
+        if self.auth_mode == AuthMode.BEARER:
+            api_key = self._get_api_key()
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            elif self._external_client is None:
+                raise STTAuthenticationError(
+                    f"Missing STT API key: provider '{self.profile.name}' requires Bearer authentication."
+                )
 
         request_timeout = timeout_seconds if timeout_seconds is not None else self.profile.timeout_seconds
         client = self._external_client or httpx.AsyncClient(timeout=request_timeout)

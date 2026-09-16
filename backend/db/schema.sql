@@ -271,3 +271,12 @@ CREATE TABLE IF NOT EXISTS followup_suggestions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_followup_suggestions_interview_q ON followup_suggestions(interview_id, question_id, status);
+
+CREATE TABLE IF NOT EXISTS ai_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    transcription_config_json TEXT NOT NULL,
+    text_analysis_config_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);

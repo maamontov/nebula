@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 
 from backend.db.database import Database
-from backend.db.migrations import run_migrations
+from backend.db.migrations import TARGET_VERSION, run_migrations
 from backend.db.repository import Repository
 
 
@@ -154,7 +154,7 @@ def test_migration_recovers_missing_revisions_from_legacy_db(tmp_path):
     # Run migration
     db = Database(db_path)
     new_ver = run_migrations(db)
-    assert new_ver == 12
+    assert new_ver == TARGET_VERSION
 
     # Verify integrity
     assert db.verify_integrity() is True
@@ -172,5 +172,5 @@ def test_migration_recovers_missing_revisions_from_legacy_db(tmp_path):
 
     # Re-running migrations is idempotent
     new_ver_2 = run_migrations(db)
-    assert new_ver_2 == 12
+    assert new_ver_2 == TARGET_VERSION
     assert db.verify_integrity() is True
