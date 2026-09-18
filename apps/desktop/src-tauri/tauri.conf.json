@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.nebula.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run build:sidecar && npm run dev",
+    "beforeBuildCommand": "npm run build:bundle",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
   },
@@ -27,7 +27,13 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": [
+      "app"
+    ],
+    "externalBin": [
+      "binaries/nebula-python"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

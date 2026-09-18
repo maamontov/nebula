@@ -52,6 +52,7 @@ recordings/
 # Desktop / Tauri / Rust
 target/
 apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/binaries/
 node_modules/
 apps/desktop/node_modules/
 apps/desktop/dist/
@@ -66,5 +67,4 @@ data/
 .run/
 logs/
 *.log
-
 

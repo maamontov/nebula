@@ -57,7 +57,18 @@ cargo run --release -p audio-spike -- synthetic-test --simulated-duration-sec 36
 
 # 5. Запуск диагностического пробника LLM-провайдера
 uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --model qwen2.5:7b
+
+# 6. Сборка цельного Desktop-приложения (FastAPI и worker встраиваются внутрь .app)
+npm --prefix apps/desktop ci
+npm --prefix apps/desktop run tauri -- build --no-sign
 ```
+
+После запуска собранного приложения FastAPI и pipeline worker поднимаются автоматически;
+отдельный запуск `scripts/start.sh backend` или `scripts/start.sh worker` не требуется.
+
+На Windows та же команда создаёт `target/release/bundle/nsis/*-setup.exe` и MSI,
+на Linux — AppImage и DEB. Python sidecar должен собираться на целевой ОС:
+кросс-сборка одного и того же sidecar между macOS, Windows и Linux не поддерживается.
 
 ### Управление сервисами (CLI)
 ```bash
@@ -156,7 +167,18 @@ cargo run --release -p audio-spike -- synthetic-test --simulated-duration-sec 36
 
 # 5. Run LLM provider compatibility probe
 uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --model qwen2.5:7b
+
+# 6. Build the self-contained Desktop app (FastAPI and worker are embedded in .app)
+npm --prefix apps/desktop ci
+npm --prefix apps/desktop run tauri -- build --no-sign
 ```
+
+When the packaged application starts, it launches FastAPI and the pipeline worker automatically;
+running `scripts/start.sh backend` or `scripts/start.sh worker` separately is not required.
+
+On Windows the same command produces `target/release/bundle/nsis/*-setup.exe` and MSI;
+on Linux it produces AppImage and DEB. The Python sidecar must be built on its target OS:
+cross-building the same sidecar between macOS, Windows, and Linux is not supported.
 
 ### Service Management (CLI)
 ```bash
@@ -198,4 +220,3 @@ uv run python evals/provider_probe.py --base-url http://localhost:11434/v1 --mod
 - [AI Provider Settings Specification & Implementation Plan](docs/ai-provider-settings-implementation-plan.md)
 - [Service Management Specification](docs/service-management-spec.md)
 - [Reliability & Pilot Readiness Specification](docs/stage7-reliability-and-pilot-spec.md)
-

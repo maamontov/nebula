@@ -254,6 +254,8 @@ print_status() {
         else
             echo -e "  Backend API:     ${YELLOW}● HANGING / UNRESPONSIVE${NC} (PID: $b_pid)"
         fi
+    elif curl -s -f -o /dev/null "http://127.0.0.1:8000/healthz" 2>/dev/null; then
+        echo -e "  Backend API:     ${GREEN}● EMBEDDED${NC} (managed by Tauri, port: 8000)"
     else
         echo -e "  Backend API:     ${RED}○ STOPPED${NC}"
     fi
@@ -264,6 +266,8 @@ print_status() {
         local w_pid
         w_pid=$(cat "$worker_pid_file")
         echo -e "  Pipeline Worker: ${GREEN}● RUNNING${NC} (PID: $w_pid, active queue processing)"
+    elif is_running "$desktop_pid_file" && curl -s -f -o /dev/null "http://127.0.0.1:8000/healthz" 2>/dev/null; then
+        echo -e "  Pipeline Worker: ${GREEN}● EMBEDDED${NC} (managed by Tauri)"
     else
         echo -e "  Pipeline Worker: ${RED}○ STOPPED${NC}"
     fi
@@ -342,8 +346,6 @@ case "$CMD" in
         elif [[ "$TARGET" == "desktop" ]]; then
             start_desktop
         elif [[ "$TARGET" == "all" || -z "$TARGET" ]]; then
-            start_backend
-            start_worker
             start_desktop
         else
             echo -e "${RED}Unknown start target: $TARGET. Choose: all, backend, worker, desktop${NC}"
