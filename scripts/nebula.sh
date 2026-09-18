@@ -156,7 +156,8 @@ start_desktop() {
 
     echo -ne "  Starting Desktop Shell (Tauri 2 + React)... "
     cd "$ROOT_DIR"
-    nohup npm --prefix apps/desktop run tauri dev > "$log_file" 2>&1 &
+    nohup env NEBULA_EXTERNAL_BACKEND="${NEBULA_EXTERNAL_BACKEND:-0}" \
+        npm --prefix apps/desktop run tauri dev > "$log_file" 2>&1 &
     local new_pid=$!
     echo "$new_pid" > "$pid_file"
     sleep 2.0
@@ -346,7 +347,11 @@ case "$CMD" in
         elif [[ "$TARGET" == "desktop" ]]; then
             start_desktop
         elif [[ "$TARGET" == "all" || -z "$TARGET" ]]; then
-            start_desktop
+            # Development compatibility mode: keep the historical separate
+            # backend/worker processes. Packaged apps use embedded services.
+            start_backend
+            start_worker
+            NEBULA_EXTERNAL_BACKEND=1 start_desktop
         else
             echo -e "${RED}Unknown start target: $TARGET. Choose: all, backend, worker, desktop${NC}"
             exit 1

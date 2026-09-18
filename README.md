@@ -72,7 +72,7 @@ npm --prefix apps/desktop run tauri -- build --no-sign
 
 ### Управление сервисами (CLI)
 ```bash
-./scripts/start.sh                    # Запуск всех компонентов (Backend + Worker + Desktop)
+./scripts/start.sh                    # Dev: Backend + Worker + Desktop отдельными процессами
 ./scripts/start.sh backend            # Запуск только API сервера
 ./scripts/status.sh                   # Мониторинг PID, здоровья API и целостности SQLite WAL
 ./scripts/stop.sh                     # Корректная остановка всех сервисов
@@ -182,7 +182,7 @@ cross-building the same sidecar between macOS, Windows, and Linux is not support
 
 ### Service Management (CLI)
 ```bash
-./scripts/start.sh                    # Start all components (Backend + Worker + Desktop)
+./scripts/start.sh                    # Dev: Backend + Worker + Desktop as separate processes
 ./scripts/start.sh backend            # Start API server only
 ./scripts/status.sh                   # Check PIDs, API health & SQLite WAL integrity
 ./scripts/stop.sh                     # Gracefully stop all services

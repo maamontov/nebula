@@ -59,6 +59,10 @@ impl RuntimeDirs {
 
 impl PythonServices {
     pub fn start(&self, app: &tauri::AppHandle) -> Result<(), String> {
+        if external_backend_enabled() {
+            return Ok(());
+        }
+
         if backend_is_reachable() {
             return Err(format!(
                 "Порт {BACKEND_PORT} уже занят. Остановите другой экземпляр Nebula/backend перед запуском приложения."
@@ -212,6 +216,13 @@ fn backend_is_reachable() -> bool {
         Err(_) => return false,
     };
     TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+}
+
+fn external_backend_enabled() -> bool {
+    matches!(
+        std::env::var("NEBULA_EXTERNAL_BACKEND").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
 }
 
 fn resolve_sidecar_binary(app: &tauri::AppHandle) -> Result<PathBuf, String> {
