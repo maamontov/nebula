@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.venv/
+
+# Environment and secrets
+.env
+*.local
+*.secret
+secrets/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Audio and temporary spools
+*.wav
+*.pcm
+*.raw
+spool/
+recordings/
+
+# Desktop / Tauri / Rust
+target/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/binaries/
+node_modules/
+apps/desktop/node_modules/
+apps/desktop/dist/
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Runtime and process logs
+.run/
+logs/
+*.log
+
+# Ai
+AGENTS.md

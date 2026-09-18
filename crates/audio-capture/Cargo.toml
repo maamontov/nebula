@@ -1,0 +1,18 @@
+[package]
+name = "audio-capture"
+version = "1.0.0"
+edition = "2021"
+description = "Core native audio capture, synchronization, and spooling library for Nebula"
+
+[dependencies]
+cpal = "0.15"
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+ringbuf = "0.4"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.10"

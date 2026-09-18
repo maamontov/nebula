@@ -1,0 +1,23 @@
+[package]
+name = "nebula-desktop"
+version = "1.0.0"
+description = "Nebula AI Interview Decision Support Desktop Shell"
+authors = ["Nebula Team"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+audio-capture = { path = "../../../crates/audio-capture" }
+cpal = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hex = "0.4"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

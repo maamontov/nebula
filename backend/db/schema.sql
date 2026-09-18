@@ -1,0 +1,282 @@
+-- Nebula SQLite Schema with WAL mode support
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS job_templates (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    role TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'Middle',
+    description TEXT NOT NULL DEFAULT '',
+    questions_json TEXT NOT NULL DEFAULT '[]',
+    version INTEGER NOT NULL DEFAULT 1,
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS interviews (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    candidate_name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    consent_confirmed_at TEXT,
+    consent_version TEXT,
+    capture_mode TEXT NOT NULL DEFAULT 'dual_source',
+    expected_tracks_json TEXT NOT NULL DEFAULT '["interviewer", "candidate"]',
+    active_rubric_revision_id TEXT DEFAULT 'rub-rev-1',
+    active_transcript_revision_id TEXT DEFAULT 'trans-rev-1',
+    template_id TEXT REFERENCES job_templates(id) ON DELETE SET NULL,
+    template_version INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS interview_plans (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL DEFAULT 1,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transcript_segments (
+    id TEXT NOT NULL,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL,
+    start_time_ms INTEGER NOT NULL,
+    end_time_ms INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    is_final INTEGER NOT NULL DEFAULT 1,
+    revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (interview_id, revision_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS transcript_revisions (
+    id TEXT NOT NULL,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    revision_number INTEGER NOT NULL DEFAULT 1,
+    is_batch_final INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (interview_id, id),
+    UNIQUE (interview_id, revision_number)
+);
+
+CREATE TABLE IF NOT EXISTS assessment_proposals (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    rubric_revision_id TEXT NOT NULL DEFAULT 'rub-rev-1',
+    transcript_revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
+    model_profile_id TEXT NOT NULL,
+    scores_json TEXT NOT NULL,
+    critical_errors_json TEXT NOT NULL DEFAULT '[]',
+    is_rejected INTEGER NOT NULL DEFAULT 0,
+    validation_errors_json TEXT NOT NULL DEFAULT '[]',
+    provider_id TEXT,
+    fallback_metadata_json TEXT,
+    is_approved INTEGER NOT NULL DEFAULT 0,
+    is_stale INTEGER NOT NULL DEFAULT 0,
+    stale_reason TEXT,
+    is_manually_adjusted INTEGER NOT NULL DEFAULT 0,
+    reviewed_scores_json TEXT,
+    reviewer_notes TEXT,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS human_assessments (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    rubric_revision_id TEXT NOT NULL,
+    transcript_revision_id TEXT NOT NULL,
+    reviewer_id TEXT,
+    scores_json TEXT NOT NULL,
+    reviewer_notes TEXT,
+    is_manually_adjusted INTEGER NOT NULL DEFAULT 0,
+    is_stale INTEGER NOT NULL DEFAULT 0,
+    stale_reason TEXT,
+    is_excluded INTEGER NOT NULL DEFAULT 0,
+    exclusion_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (interview_id, question_id)
+);
+
+CREATE TABLE IF NOT EXISTS summary_proposals (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    transcript_revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
+    rubric_revision_id TEXT NOT NULL DEFAULT 'rub-rev-1',
+    model_profile_id TEXT NOT NULL,
+    summary_data_json TEXT NOT NULL,
+    decisions_snapshot_hash TEXT,
+    is_confirmed INTEGER NOT NULL DEFAULT 0,
+    confirmed_by TEXT,
+    confirmed_markdown TEXT,
+    confirmed_recommendation TEXT,
+    is_stale INTEGER NOT NULL DEFAULT 0,
+    stale_reason TEXT,
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS report_revisions (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    revision_number INTEGER NOT NULL DEFAULT 1,
+    final_score_100 REAL,
+    coverage_percentage REAL NOT NULL,
+    question_scores_json TEXT NOT NULL,
+    summary_markdown TEXT NOT NULL,
+    hiring_recommendation TEXT,
+    confirmed_by TEXT,
+    sha256_checksum TEXT NOT NULL,
+    canonical_snapshot_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (interview_id, revision_number)
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    interview_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    locked_until TEXT,
+    locked_by TEXT,
+    error_message TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS question_associations (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    revision_id TEXT NOT NULL DEFAULT 'trans-rev-1',
+    question_id TEXT NOT NULL,
+    segment_id TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    is_ambiguous INTEGER NOT NULL DEFAULT 0,
+    is_manually_adjusted INTEGER NOT NULL DEFAULT 0,
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (interview_id, revision_id, segment_id)
+        REFERENCES transcript_segments(interview_id, revision_id, id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_transcript_interview ON transcript_segments(interview_id, start_time_ms);
+CREATE INDEX IF NOT EXISTS idx_transcript_rev ON transcript_segments(interview_id, revision_id);
+CREATE INDEX IF NOT EXISTS idx_assessment_interview ON assessment_proposals(interview_id, question_id);
+CREATE INDEX IF NOT EXISTS idx_human_assessment ON human_assessments(interview_id, question_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_status_locked ON jobs(status, locked_until);
+CREATE INDEX IF NOT EXISTS idx_audit_interview ON audit_events(interview_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_assoc_interview_question ON question_associations(interview_id, question_id);
+
+CREATE INDEX IF NOT EXISTS idx_report_revisions ON report_revisions(interview_id, revision_number);
+CREATE INDEX IF NOT EXISTS idx_job_templates_archived ON job_templates(is_archived);
+
+CREATE TABLE IF NOT EXISTS audio_chunks (
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL,
+    capture_epoch INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    start_time_ms INTEGER NOT NULL,
+    end_time_ms INTEGER NOT NULL,
+    sample_rate INTEGER NOT NULL,
+    channels INTEGER NOT NULL,
+    sample_count INTEGER NOT NULL,
+    format TEXT NOT NULL,
+    checksum_sha256 TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (interview_id, track_id, capture_epoch, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_audio_chunks_interview ON audio_chunks(interview_id, track_id, sequence);
+
+CREATE TABLE IF NOT EXISTS transcript_assembly_state (
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL,
+    capture_epoch INTEGER NOT NULL,
+    next_sequence INTEGER NOT NULL DEFAULT 0,
+    next_sample_offset INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (interview_id, track_id, capture_epoch)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transcript_assembly ON transcript_assembly_state(interview_id, track_id, capture_epoch);
+
+CREATE TABLE IF NOT EXISTS followup_requests (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    rubric_revision_id TEXT NOT NULL,
+    transcript_revision_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    candidate_fingerprint TEXT,
+    context_hash TEXT NOT NULL,
+    context_json TEXT NOT NULL,
+    job_id TEXT UNIQUE REFERENCES jobs(id) ON DELETE SET NULL,
+    outcome TEXT,
+    model_profile_id TEXT,
+    provider_id TEXT,
+    prompt_version TEXT NOT NULL DEFAULT 'v1',
+    schema_version TEXT NOT NULL DEFAULT 'v1',
+    usage_tokens INTEGER,
+    latency_ms INTEGER,
+    error_code TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE (interview_id, question_id, mode, context_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_followup_requests_interview_q ON followup_requests(interview_id, question_id, created_at);
+
+CREATE TABLE IF NOT EXISTS followup_suggestions (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL REFERENCES followup_requests(id) ON DELETE CASCADE,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    rubric_revision_id TEXT NOT NULL,
+    transcript_revision_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    question_text TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    criterion_ids_json TEXT NOT NULL,
+    source_refs_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'suggested',
+    asked_text TEXT,
+    ordinal INTEGER NOT NULL DEFAULT 0,
+    decision_version INTEGER NOT NULL DEFAULT 1,
+    decided_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (request_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_followup_suggestions_interview_q ON followup_suggestions(interview_id, question_id, status);
+
+CREATE TABLE IF NOT EXISTS ai_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    transcription_config_json TEXT NOT NULL,
+    text_analysis_config_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
