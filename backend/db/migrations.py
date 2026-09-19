@@ -31,7 +31,7 @@ def get_current_migration_version(conn: sqlite3.Connection) -> int:
     return row[0] if row and row[0] is not None else 0
 
 
-TARGET_VERSION = 13
+TARGET_VERSION = 14
 
 
 def run_migrations(db: Database) -> int:
@@ -793,6 +793,166 @@ def run_migrations(db: Database) -> int:
         if not db.verify_integrity():
             raise RuntimeError("Database integrity check failed after running migration 013!")
         current_version = 13
+
+    if current_version < 14:
+        # Migration 14: Seed default "Junior Python Developer" interview template
+        with db.transaction() as tx_conn:
+            templates_table_exists = bool(
+                tx_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='job_templates'"
+                ).fetchone()
+            )
+            existing = None
+            if templates_table_exists:
+                existing = tx_conn.execute(
+                    "SELECT id FROM job_templates WHERE id = ?", ("tpl-python-junior",)
+                ).fetchone()
+            if templates_table_exists and not existing:
+                now_iso = datetime.now(UTC).isoformat()
+                junior_python_questions = [
+                    {
+                        "id": "q-python-basics",
+                        "title": "Типы данных и изменяемость",
+                        "prompt": "Чем отличаются изменяемые и неизменяемые типы в Python? Приведите примеры. Почему после `a = [1, 2]; b = a; b.append(3)` меняется и список `a` и как безопасно скопировать список?",
+                        "text": "Чем отличаются изменяемые и неизменяемые типы в Python? Приведите примеры. Почему после `a = [1, 2]; b = a; b.append(3)` меняется и список `a` и как безопасно скопировать список?",
+                        "order_index": 0,
+                        "weight": 1.0,
+                        "criteria": [
+                            {
+                                "id": "crit-python-types",
+                                "title": "Понимание модели данных и ссылок",
+                                "description": "Ссылки на объекты, изменяемые и неизменяемые типы, поверхностное и глубокое копирование, срезы",
+                                "min_score": 1.0,
+                                "max_score": 5.0,
+                                "weight": 1.0,
+                                "levels_description": {
+                                    1: "Не различает изменяемые и неизменяемые типы",
+                                    3: "Объясняет ссылки и копирование списка через срез или list()",
+                                    5: "Уверенно говорит о shallow/deep copy, хешируемости и стоимости операций со списком и dict"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "id": "q-python-functions",
+                        "title": "Функции и аргументы",
+                        "prompt": "Что означают `*args` и `**kwargs`? В чём разница между позиционными и именованными аргументами? Чем опасен изменяемый аргумент по умолчанию, например `def add(item, acc=[])`?",
+                        "text": "Что означают `*args` и `**kwargs`? В чём разница между позиционными и именованными аргументами? Чем опасен изменяемый аргумент по умолчанию, например `def add(item, acc=[])`?",
+                        "order_index": 1,
+                        "weight": 1.0,
+                        "criteria": [
+                            {
+                                "id": "crit-python-func-args",
+                                "title": "Сигнатуры функций и области видимости",
+                                "description": "Виды аргументов, значения по умолчанию, локальные и глобальные переменные, замыкания",
+                                "min_score": 1.0,
+                                "max_score": 5.0,
+                                "weight": 1.0,
+                                "levels_description": {
+                                    1: "Путается в способах передачи аргументов",
+                                    3: "Объясняет *args/**kwargs и опасность изменяемого значения по умолчанию",
+                                    5: "Понимает late binding, правило LEGB, замыкания и паттерн `None` вместо изменяемого default"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "id": "q-python-oop",
+                        "title": "ООП: классы и магические методы",
+                        "prompt": "Расскажите про классы в Python: атрибуты класса против атрибутов экземпляра, наследование и MRO. Какой магический метод вы использовали и зачем?",
+                        "text": "Расскажите про классы в Python: атрибуты класса против атрибутов экземпляра, наследование и MRO. Какой магический метод вы использовали и зачем?",
+                        "order_index": 2,
+                        "weight": 1.5,
+                        "criteria": [
+                            {
+                                "id": "crit-python-oop",
+                                "title": "Основы ООП и магические методы",
+                                "description": "Классы и экземпляры, self, наследование, super(), __init__/__str__/__repr__, property",
+                                "min_score": 1.0,
+                                "max_score": 5.0,
+                                "weight": 1.0,
+                                "levels_description": {
+                                    1: "Не отличает класс от экземпляра и не понимает self",
+                                    3: "Пишет класс с __init__ и простым наследованием",
+                                    5: "Объясняет MRO и super(), использует магические методы и property, различает наследование и композицию"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "id": "q-python-errors",
+                        "title": "Исключения и работа с файлами",
+                        "prompt": "Как работает `try/except/else/finally`? Зачем нужен контекстный менеджер `with` при работе с файлами? Чем плох `except Exception: pass`?",
+                        "text": "Как работает `try/except/else/finally`? Зачем нужен контекстный менеджер `with` при работе с файлами? Чем плох `except Exception: pass`?",
+                        "order_index": 3,
+                        "weight": 1.0,
+                        "criteria": [
+                            {
+                                "id": "crit-python-errors",
+                                "title": "Обработка ошибок и контекстные менеджеры",
+                                "description": "Порядок ветвей try, типы исключений, закрытие ресурсов, собственные исключения",
+                                "min_score": 1.0,
+                                "max_score": 5.0,
+                                "weight": 1.0,
+                                "levels_description": {
+                                    1: "Не знает, в каком порядке выполняются ветви и finally",
+                                    3: "Использует try/except и with для файлов",
+                                    5: "Понимает порядок ветвей, ловит конкретные исключения, объясняет, как устроен контекстный менеджер"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "id": "q-python-testing",
+                        "title": "Тестирование, окружение и отладка",
+                        "prompt": "Как вы запускаете проект и его зависимости (venv, pip/poetry)? Как пишете тесты на pytest и что делаете, когда тест падает — как читаете traceback и чем отлаживаете?",
+                        "text": "Как вы запускаете проект и его зависимости (venv, pip/poetry)? Как пишете тесты на pytest и что делаете, когда тест падает — как читаете traceback и чем отлаживаете?",
+                        "order_index": 4,
+                        "weight": 1.0,
+                        "criteria": [
+                            {
+                                "id": "crit-python-testing",
+                                "title": "Практические инженерные навыки",
+                                "description": "Виртуальные окружения и зависимости, тесты на pytest, чтение traceback, отладка",
+                                "min_score": 1.0,
+                                "max_score": 5.0,
+                                "weight": 1.0,
+                                "levels_description": {
+                                    1: "Не писал тесты и запускает код только через IDE",
+                                    3: "Пишет простые assert-тесты на pytest, использует venv",
+                                    5: "Организует фикстуры, уверенно читает traceback, отлаживает через pdb или логи, следит за зависимостями"
+                                }
+                            }
+                        ]
+                    }
+                ]
+                tx_conn.execute(
+                    """
+                    INSERT INTO job_templates (
+                        id, title, role, level, description, questions_json, version, is_archived, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                    """,
+                    (
+                        "tpl-python-junior",
+                        "Junior Python Developer",
+                        "Junior Python Developer",
+                        "Junior",
+                        "Базовый найм Python-разработчика: типы и модель данных, функции, ООП, обработка исключений, тестирование и отладка.",
+                        json.dumps(junior_python_questions, ensure_ascii=False),
+                        now_iso,
+                        now_iso,
+                    )
+                )
+
+            now_iso = datetime.now(UTC).isoformat()
+            tx_conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (14, '014_seed_junior_python_template', ?)",
+                (now_iso,),
+            )
+
+        if not db.verify_integrity():
+            raise RuntimeError("Database integrity check failed after running migration 014!")
+        current_version = 14
 
     logger.info("Successfully ensured database schema up to version %d", current_version)
     return current_version

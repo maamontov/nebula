@@ -27,6 +27,27 @@ def workspace_client(tmp_path):
     app.dependency_overrides.clear()
 
 
+def test_default_junior_python_template_seeded(workspace_client):
+    """Migration 014 seeds a ready-to-use Junior Python Developer template with 5 questions."""
+    res = workspace_client.get("/api/v1/job-templates")
+    assert res.status_code == 200
+    templates = {t["id"]: t for t in res.json()}
+    assert "tpl-python-junior" in templates
+
+    tpl = templates["tpl-python-junior"]
+    assert tpl["title"] == "Junior Python Developer"
+    assert tpl["level"] == "Junior"
+    assert tpl["is_archived"] == 0
+    assert len(tpl["questions"]) == 5
+    assert [q["order_index"] for q in tpl["questions"]] == [0, 1, 2, 3, 4]
+    assert all(q["criteria"] for q in tpl["questions"])
+
+    # Seeded template must pass the same validation as user-created ones
+    detail = workspace_client.get("/api/v1/job-templates/tpl-python-junior")
+    assert detail.status_code == 200
+    assert len(detail.json()["questions"]) == 5
+
+
 def test_job_templates_lifecycle(workspace_client):
     # 1. Default seeded template exists
     res = workspace_client.get("/api/v1/job-templates")
