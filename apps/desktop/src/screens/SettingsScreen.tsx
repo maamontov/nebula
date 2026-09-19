@@ -539,7 +539,7 @@ export const SettingsScreen: React.FC = () => {
   };
 
   return (
-    <div className="h-full flex flex-col overflow-hidden bg-[var(--app-bg)]">
+    <div className="h-[calc(100vh-4rem)] flex flex-col overflow-hidden bg-[var(--app-bg)]">
       {/* Header */}
       <div className="p-6 border-b border-[var(--border)] shrink-0 bg-[var(--surface)]">
         <div className="max-w-5xl mx-auto flex items-start justify-between gap-4">
