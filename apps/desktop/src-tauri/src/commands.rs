@@ -1,3 +1,4 @@
+use crate::backend_runtime::default_data_dir;
 use crate::uploader::{SessionUploader, UploadProgress};
 use audio_capture::{
     start_device_capture, AudioSpoolManager, CaptureHandle, CaptureStats, MonotonicInterviewClock,
@@ -110,25 +111,50 @@ pub struct SystemConfigInfo {
     pub backend_url: String,
 }
 
-pub fn resolve_capture_spool_dir(spool_dir_arg: &str) -> PathBuf {
+/// Приоритет: явный аргумент → переменные окружения → каталог данных приложения.
+///
+/// Относительный путь здесь недопустим: у приложения, запущенного из Finder,
+/// cwd = "/" (только для чтения), и `./data/spool_capture` давал
+/// «Read-only file system (os error 30)». Поэтому любой относительный путь
+/// приводится к абсолютному от корня данных приложения.
+fn resolve_capture_spool_dir_with(
+    app_data_root: Option<PathBuf>,
+    spool_dir_arg: &str,
+    capture_env: Option<String>,
+    data_env: Option<String>,
+) -> PathBuf {
+    let root = || {
+        app_data_root
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("nebula"))
+    };
+
+    let absolutize = |path: PathBuf| -> PathBuf {
+        if path.is_absolute() {
+            return path;
+        }
+        root().join(path)
+    };
+
     if !spool_dir_arg.trim().is_empty() && spool_dir_arg != "./spool" {
-        return PathBuf::from(spool_dir_arg);
+        return absolutize(PathBuf::from(spool_dir_arg));
     }
-    if let Ok(val) = std::env::var("NEBULA_CAPTURE_SPOOL_DIR") {
-        if !val.trim().is_empty() {
-            return PathBuf::from(val);
-        }
+    if let Some(val) = capture_env.filter(|val| !val.trim().is_empty()) {
+        return absolutize(PathBuf::from(val));
     }
-    if let Ok(val) = std::env::var("NEBULA_DATA_DIR") {
-        if !val.trim().is_empty() {
-            return PathBuf::from(val).join("spool_capture");
-        }
+    if let Some(val) = data_env.filter(|val| !val.trim().is_empty()) {
+        return absolutize(PathBuf::from(val).join("spool_capture"));
     }
-    let repo_data = PathBuf::from("../../../data/spool_capture");
-    if repo_data.parent().map(|p| p.exists()).unwrap_or(false) {
-        return repo_data;
-    }
-    PathBuf::from("./data/spool_capture")
+    root().join("spool_capture")
+}
+
+pub fn resolve_capture_spool_dir(app: &tauri::AppHandle, spool_dir_arg: &str) -> PathBuf {
+    resolve_capture_spool_dir_with(
+        default_data_dir(app),
+        spool_dir_arg,
+        std::env::var("NEBULA_CAPTURE_SPOOL_DIR").ok(),
+        std::env::var("NEBULA_DATA_DIR").ok(),
+    )
 }
 
 pub fn get_backend_url() -> String {
@@ -136,8 +162,8 @@ pub fn get_backend_url() -> String {
 }
 
 #[tauri::command]
-pub fn get_system_config() -> Result<SystemConfigInfo, String> {
-    let spool_dir = resolve_capture_spool_dir("");
+pub fn get_system_config(app: tauri::AppHandle) -> Result<SystemConfigInfo, String> {
+    let spool_dir = resolve_capture_spool_dir(&app, "");
     Ok(SystemConfigInfo {
         capture_spool_dir: spool_dir.to_string_lossy().to_string(),
         backend_url: get_backend_url(),
@@ -175,6 +201,7 @@ pub fn list_audio_devices() -> Result<Vec<DeviceInfo>, String> {
 
 #[tauri::command]
 pub async fn start_capture(
+    app: tauri::AppHandle,
     session_id: String,
     interviewer_dev_id: Option<String>,
     candidate_dev_id: Option<String>,
@@ -194,7 +221,7 @@ pub async fn start_capture(
 
     let mode = capture_mode.unwrap_or_else(|| "dual_source".to_string());
     let spool_dir_val = spool_dir.unwrap_or_default();
-    let spool_path = resolve_capture_spool_dir(&spool_dir_val);
+    let spool_path = resolve_capture_spool_dir(&app, &spool_dir_val);
     std::fs::create_dir_all(&spool_path).map_err(|e| {
         format!(
             "Не удалось создать директорию capture spool {:?}: {}",
@@ -596,6 +623,7 @@ pub fn get_audio_levels(state: tauri::State<AppState>) -> Result<AudioLevels, St
 
 #[tauri::command]
 pub async fn get_upload_progress(
+    app: tauri::AppHandle,
     session_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<UploadProgress, String> {
@@ -629,7 +657,7 @@ pub async fn get_upload_progress(
     }
 
     // If not actively recording, count files on disk in capture spool
-    let spool_dir = resolve_capture_spool_dir("");
+    let spool_dir = resolve_capture_spool_dir(&app, "");
     let session_dir = spool_dir.join(&session_id);
     let mut total_discovered = 0u64;
     let mut total_acked = 0u64;
@@ -678,11 +706,12 @@ pub async fn get_upload_progress(
 
 #[tauri::command]
 pub async fn resume_spool_upload(
+    app: tauri::AppHandle,
     session_id: String,
     spool_dir: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<UploadProgress, String> {
-    let spool_path = resolve_capture_spool_dir(spool_dir.as_deref().unwrap_or(""));
+    let spool_path = resolve_capture_spool_dir(&app, spool_dir.as_deref().unwrap_or(""));
     let backend_url = get_backend_url();
 
     let mut bg = state.background_uploaders.lock().await;
@@ -699,6 +728,7 @@ pub async fn resume_spool_upload(
 
 #[tauri::command]
 pub fn get_session_manifests(
+    app: tauri::AppHandle,
     session_id: String,
     spool_dir: Option<String>,
     state: tauri::State<'_, AppState>,
@@ -711,7 +741,7 @@ pub fn get_session_manifests(
         }
     }
 
-    let spool_path = resolve_capture_spool_dir(spool_dir.as_deref().unwrap_or(""));
+    let spool_path = resolve_capture_spool_dir(&app, spool_dir.as_deref().unwrap_or(""));
     let spool_mgr = AudioSpoolManager::new(&spool_path);
     let mut manifests = Vec::new();
     for track in [
@@ -757,6 +787,7 @@ pub fn get_active_session(state: tauri::State<AppState>) -> Result<ActiveSession
 
 #[tauri::command]
 pub fn verify_spool(
+    app: tauri::AppHandle,
     spool_dir: String,
     interview_id: String,
     track: String,
@@ -769,7 +800,7 @@ pub fn verify_spool(
         TrackType::Interviewer
     };
 
-    let spool_path = resolve_capture_spool_dir(&spool_dir);
+    let spool_path = resolve_capture_spool_dir(&app, &spool_dir);
     let spool = AudioSpoolManager::new(&spool_path);
     let report = spool
         .verify_track_spool(&interview_id, track_type)
@@ -876,6 +907,81 @@ pub fn resume_capture(state: tauri::State<AppState>) -> Result<ResumeResult, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Регрессия: `./data/spool_capture` резолвился от cwd, а у приложения,
+    /// запущенного из Finder, cwd = "/" (только для чтения) — запись падала с
+    /// «Read-only file system (os error 30)». Относительный путь недопустим.
+    #[test]
+    fn test_capture_spool_dir_is_never_relative() {
+        let root = PathBuf::from("/app/data");
+        let spool = PathBuf::from("/app/data/spool_capture");
+
+        // Ни аргумента, ни окружения — берём каталог данных приложения.
+        assert_eq!(
+            resolve_capture_spool_dir_with(Some(root.clone()), "", None, None),
+            spool
+        );
+
+        // Относительный аргумент приводится к абсолютному, а не резолвится от cwd.
+        let resolved = resolve_capture_spool_dir_with(
+            Some(root.clone()),
+            "./data/spool_capture",
+            None,
+            None,
+        );
+        assert!(resolved.is_absolute(), "ожидался абсолютный путь: {resolved:?}");
+        assert_eq!(resolved, PathBuf::from("/app/data/data/spool_capture"));
+
+        // Относительное значение из окружения ведёт себя так же.
+        for resolved in [
+            resolve_capture_spool_dir_with(Some(root.clone()), "", Some("./rel".into()), None),
+            resolve_capture_spool_dir_with(Some(root.clone()), "", None, Some("./rel".into())),
+            resolve_capture_spool_dir_with(None, "", None, Some("./rel".into())),
+            resolve_capture_spool_dir_with(None, "", Some("./rel".into()), None),
+        ] {
+            assert!(
+                resolved.is_absolute(),
+                "ожидался абсолютный путь: {resolved:?}"
+            );
+        }
+
+        // Абсолютный аргумент уважается как есть.
+        assert_eq!(
+            resolve_capture_spool_dir_with(Some(root), "/tmp/custom", None, None),
+            PathBuf::from("/tmp/custom")
+        );
+    }
+
+    #[test]
+    fn test_capture_spool_dir_env_precedence() {
+        let root = PathBuf::from("/app/data");
+        let spool = PathBuf::from("/app/data/spool_capture");
+        // NEBULA_CAPTURE_SPOOL_DIR важнее NEBULA_DATA_DIR.
+        assert_eq!(
+            resolve_capture_spool_dir_with(
+                Some(root.clone()),
+                "",
+                Some("/spool/direct".into()),
+                Some("/data/dir".into()),
+            ),
+            PathBuf::from("/spool/direct")
+        );
+        // NEBULA_DATA_DIR даёт подкаталог spool_capture.
+        assert_eq!(
+            resolve_capture_spool_dir_with(Some(root.clone()), "", None, Some("/data/dir".into())),
+            PathBuf::from("/data/dir/spool_capture")
+        );
+        // Пустые значения игнорируются.
+        assert_eq!(
+            resolve_capture_spool_dir_with(Some(root.clone()), "", Some("  ".into()), None),
+            spool
+        );
+        // Прежний sentinel "./spool" по-прежнему означает «не задано».
+        assert_eq!(
+            resolve_capture_spool_dir_with(Some(root), "./spool", None, None),
+            spool
+        );
+    }
 
     #[test]
     fn test_start_capture_result_serialization() {

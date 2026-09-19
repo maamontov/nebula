@@ -17,6 +17,13 @@ fn main() {
         .manage(AppState::default())
         .manage(PythonServices::default())
         .setup(|app| {
+            // Канонические каталоги данных нужны и самому процессу Tauri: команды
+            // читают NEBULA_CAPTURE_SPOOL_DIR. Без этого путь резолвился
+            // относительно cwd, а у запущенного из Finder приложения cwd = "/"
+            // (только для чтения) — запись падала с EROFS (os error 30).
+            if let Err(error) = backend_runtime::apply_runtime_environment(app.handle()) {
+                eprintln!("Не удалось подготовить каталоги данных приложения: {error}");
+            }
             // Ошибка старта backend не должна валить приложение: паника внутри
             // setup приводит к abort() через ObjC-границу и SIGABRT без диагностики.
             // Состояние публикуется в PythonServices и показывается в UI.

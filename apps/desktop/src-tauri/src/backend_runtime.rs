@@ -120,6 +120,30 @@ impl RuntimeDirs {
     }
 }
 
+/// Корень данных приложения (`<app_data>/data`).
+///
+/// Именно он должен быть базой для путей, которые строит сам процесс Tauri, а не
+/// текущая директория: у приложения, запущенного из Finder (или из смонтированного
+/// DMG), cwd равен `/`, который в macOS только для чтения, поэтому относительный
+/// путь давал «Read-only file system (os error 30)».
+pub fn default_data_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path().app_data_dir().ok().map(|dir| dir.join("data"))
+}
+
+/// Прокидывает канонические каталоги данных и в сам процесс Tauri, а не только в
+/// дочерние процессы backend: команды (`start_capture`, `get_system_config` и др.)
+/// читают эти переменные напрямую. Уже заданные значения не перезаписываются,
+/// чтобы не ломать запуск через `scripts/nebula.sh` со своим `NEBULA_DATA_DIR`.
+pub fn apply_runtime_environment(app: &tauri::AppHandle) -> Result<(), String> {
+    let dirs = RuntimeDirs::from_app(app)?;
+    for (key, value) in data_environment(&dirs) {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+    Ok(())
+}
+
 impl PythonServices {
     /// Текущее состояние backend для UI.
     pub fn status(&self) -> BackendStatusInfo {
@@ -299,7 +323,8 @@ pub fn restart_backend(
     services.restart(&app)
 }
 
-fn runtime_environment(dirs: &RuntimeDirs) -> Vec<(&'static str, String)> {
+/// Каталоги данных — общие для процесса приложения и дочерних процессов backend.
+fn data_environment(dirs: &RuntimeDirs) -> Vec<(&'static str, String)> {
     vec![
         ("NEBULA_DATA_DIR", dirs.data.display().to_string()),
         (
@@ -316,13 +341,18 @@ fn runtime_environment(dirs: &RuntimeDirs) -> Vec<(&'static str, String)> {
             dirs.data.join("nebula.db").display().to_string(),
         ),
         ("NEBULA_BACKUP_DIR", dirs.backups.display().to_string()),
-        ("NEBULA_PARENT_PIPE", "1".to_string()),
-        (
-            "NEBULA_BACKEND_URL",
-            format!("http://{BACKEND_HOST}:{BACKEND_PORT}"),
-        ),
-        ("PYTHONUNBUFFERED", "1".to_string()),
     ]
+}
+
+fn runtime_environment(dirs: &RuntimeDirs) -> Vec<(&'static str, String)> {
+    let mut environment = data_environment(dirs);
+    environment.push(("NEBULA_PARENT_PIPE", "1".to_string()));
+    environment.push((
+        "NEBULA_BACKEND_URL",
+        format!("http://{BACKEND_HOST}:{BACKEND_PORT}"),
+    ));
+    environment.push(("PYTHONUNBUFFERED", "1".to_string()));
+    environment
 }
 
 fn spawn_service(
