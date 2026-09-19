@@ -36,7 +36,7 @@ For convenient local development, testing, and production operations, Nebula pro
 #### Доступные команды (`command`):
 - `start [target]`: Запускает сервисы в фоне с проверкой готовности.
   - `all` (по умолчанию): запускает Backend $\to$ Worker $\to$ Desktop.
-  - `backend`: только FastAPI сервер на `http://127.0.0.1:8000`.
+  - `backend`: только FastAPI сервер на `http://127.0.0.1:17843`.
   - `worker`: только фоновый воркер обработки очереди заданий.
   - `desktop`: только десктопное окно Tauri 2.
 - `stop [target]`: Корректно останавливает сервисы (`SIGTERM`, при зависании `SIGKILL`).

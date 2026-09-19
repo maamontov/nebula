@@ -435,7 +435,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
             <AlertTriangle className="w-4 h-4 text-rose-400" />
             <span>{backendError}</span>
           </div>
-          <span className="text-[11px] text-rose-400">Проверьте запуск бэкенда на localhost:8000</span>
+          <span className="text-[11px] text-rose-400">Проверьте запуск бэкенда на localhost:17843</span>
         </div>
       )}
 

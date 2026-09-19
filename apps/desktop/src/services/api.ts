@@ -1,7 +1,7 @@
 import { isTauri, invoke } from '@tauri-apps/api/core';
 import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus, SpeakerRole, CaptureMode, TrackManifest, JobTemplate, PaginatedInterviews, ReportRevisionSummary, FollowUpSuggestion, FollowUpsStateResponse, GenerateFollowUpsRequest, PatchFollowUpSuggestionRequest, FollowUpMode, JobStatusResponse, AiSettingsResponse, UpdateAiSettingsRequest, TestAiSettingsRequest, TestAiSettingsResponse } from '../types';
 
-const API_BASE = 'http://127.0.0.1:8000/api/v1';
+const API_BASE = 'http://127.0.0.1:17843/api/v1';
 
 // Check if running inside Tauri window
 export function isTauriEnvironment(): boolean {
@@ -92,7 +92,7 @@ async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Prom
         data_dir: '/tmp/nebula/data',
         capture_spool_dir: '/tmp/nebula/data/spool',
         backend_spool_dir: '/tmp/nebula/data/spool',
-        backend_url: 'http://127.0.0.1:8000',
+        backend_url: 'http://127.0.0.1:17843',
         db_path: '/tmp/nebula/data/nebula.db',
         backup_dir: '/tmp/nebula/data/backups',
       } as unknown as T;
@@ -317,6 +317,39 @@ export async function getUploadProgress(sessionId: string): Promise<SessionUploa
 
 export async function getActiveSession(): Promise<ActiveSessionInfo> {
   return invokeTauri<ActiveSessionInfo>('get_active_session');
+}
+
+/**
+ * Состояние встроенного backend, которым управляет desktop-оболочка.
+ * `failed` означает, что backend не поднялся; UI обязан показать причину и дать retry,
+ * а не падать при старте.
+ */
+export interface BackendStatusInfo {
+  state: 'starting' | 'ready' | 'failed' | 'stopped';
+  mode: string | null;
+  backend_url: string;
+  message: string | null;
+  hint: string | null;
+  log_path: string | null;
+}
+
+const BROWSER_BACKEND_STATUS: BackendStatusInfo = {
+  state: 'ready',
+  mode: 'external',
+  backend_url: API_BASE,
+  message: null,
+  hint: null,
+  log_path: null,
+};
+
+export async function getBackendStatus(): Promise<BackendStatusInfo> {
+  if (!isTauriEnvironment()) return BROWSER_BACKEND_STATUS;
+  return invokeTauri<BackendStatusInfo>('get_backend_status');
+}
+
+export async function restartBackend(): Promise<BackendStatusInfo> {
+  if (!isTauriEnvironment()) return BROWSER_BACKEND_STATUS;
+  return invokeTauri<BackendStatusInfo>('restart_backend');
 }
 
 export async function getSystemConfig(): Promise<SystemConfig> {

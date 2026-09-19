@@ -132,7 +132,7 @@ pub fn resolve_capture_spool_dir(spool_dir_arg: &str) -> PathBuf {
 }
 
 pub fn get_backend_url() -> String {
-    std::env::var("NEBULA_BACKEND_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
+    std::env::var("NEBULA_BACKEND_URL").unwrap_or_else(|_| "http://127.0.0.1:17843".to_string())
 }
 
 #[tauri::command]

@@ -7,7 +7,8 @@ import { LiveSessionScreen } from './screens/LiveSessionScreen';
 import { ReviewScreen } from './screens/ReviewScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
 import { InterviewPlan, InterviewStatus, CaptureMode } from './types';
-import { getActiveSession, getInterview } from './services/api';
+import { getActiveSession, getBackendStatus, getInterview, restartBackend } from './services/api';
+import type { BackendStatusInfo } from './services/api';
 import { AlertCircle, X } from 'lucide-react';
 
 type Screen = 'home' | 'templates' | 'setup' | 'live' | 'review' | 'settings';
@@ -41,6 +42,76 @@ export const App: React.FC = () => {
 
   // Warning modal for blocked actions
   const [warningModal, setWarningModal] = useState<string | null>(null);
+
+  // Startup gate: embedded backend must be ready before the UI is usable.
+  const [backendStatus, setBackendStatus] = useState<BackendStatusInfo | null>(null);
+  const [isRestartingBackend, setIsRestartingBackend] = useState(false);
+
+  /**
+   * Опрашивает статус backend, пока он поднимается. `failed` больше не означает
+   * аварийное завершение приложения: пользователь видит причину и может повторить запуск.
+   */
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const poll = async () => {
+      try {
+        const status = await getBackendStatus();
+        if (cancelled) return;
+        setBackendStatus(status);
+        if (status.state === 'starting') {
+          timer = setTimeout(poll, 1000);
+        }
+      } catch (e) {
+        if (cancelled) return;
+        console.warn('getBackendStatus failed or running outside Tauri:', e);
+        setBackendStatus({
+          state: 'ready',
+          mode: 'external',
+          backend_url: 'http://127.0.0.1:17843',
+          message: null,
+          hint: null,
+          log_path: null,
+        });
+      }
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  const handleRetryBackend = async () => {
+    setIsRestartingBackend(true);
+    try {
+      const status = await restartBackend();
+      setBackendStatus(status);
+      if (status.state === 'starting') {
+        let attempts = 0;
+        while (attempts < 120) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          const next = await getBackendStatus();
+          setBackendStatus(next);
+          if (next.state !== 'starting') break;
+          attempts += 1;
+        }
+      }
+    } catch (e) {
+      setBackendStatus({
+        state: 'failed',
+        mode: null,
+        backend_url: 'http://127.0.0.1:17843',
+        message: e instanceof Error ? e.message : String(e),
+        hint: 'Перезапустите приложение.',
+        log_path: null,
+      });
+    } finally {
+      setIsRestartingBackend(false);
+    }
+  };
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -235,6 +306,57 @@ export const App: React.FC = () => {
   const handleBackToHome = () => {
     setScreen('home');
   };
+
+  // Backend ещё не ответил: показываем прогресс вместо пустого или частично
+  // нерабочего интерфейса.
+  if (!backendStatus || backendStatus.state === 'starting') {
+    return (
+      <div className="app-root min-h-screen flex flex-col items-center justify-center gap-4 select-none">
+        <div className="flex items-center gap-3">
+          <span className="w-4 h-4 rounded-full border-2 border-indigo-400 border-t-transparent animate-spin" />
+          <h1 className="text-sm font-semibold text-slate-200">Nebula запускается…</h1>
+        </div>
+        <p className="text-xs text-slate-400">{backendStatus?.message || 'Подготовка встроенного backend'}</p>
+      </div>
+    );
+  }
+
+  // Backend не поднялся: показываем причину и даём retry вместо аварийного выхода.
+  if (backendStatus.state === 'failed') {
+    return (
+      <div className="app-root min-h-screen flex flex-col items-center justify-center p-4 select-none">
+        <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-lg w-full p-6 space-y-4 shadow-2xl">
+          <div className="flex items-center space-x-2 text-red-400">
+            <AlertCircle className="w-5 h-5" />
+            <h3 className="text-base font-bold text-white">Backend не запустился</h3>
+          </div>
+
+          <p className="text-xs text-slate-300 leading-relaxed">
+            {backendStatus.message || 'Встроенный backend Nebula недоступен.'}
+          </p>
+
+          {backendStatus.hint && (
+            <p className="text-xs text-amber-300/90 leading-relaxed">{backendStatus.hint}</p>
+          )}
+
+          {backendStatus.log_path && (
+            <p className="text-[11px] text-slate-500 break-all">Лог: {backendStatus.log_path}</p>
+          )}
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              disabled={isRestartingBackend}
+              onClick={handleRetryBackend}
+              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg shadow transition cursor-pointer"
+            >
+              {isRestartingBackend ? 'Перезапуск…' : 'Повторить'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="app-root min-h-screen flex flex-col select-none">

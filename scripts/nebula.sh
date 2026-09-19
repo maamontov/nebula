@@ -9,6 +9,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Embedded backend listen port. Must stay in sync with `BACKEND_PORT` in
+# apps/desktop/src-tauri/src/backend_runtime.rs, `API_BASE` in
+# apps/desktop/src/services/api.ts and the launcher default in backend/launcher.py.
+BACKEND_PORT=17843
+
 # Load and export environment variables from .env if present
 # Загрузка и экспорт переменных окружения из .env при наличии
 if [[ -f "$ROOT_DIR/.env" ]]; then
@@ -84,23 +89,23 @@ start_backend() {
         return 0
     fi
 
-    # Check if port 8000 is occupied by an external process
+    # Check if port ${BACKEND_PORT} is occupied by an external process
     local port_occupier
-    port_occupier=$(lsof -ti :8000 2>/dev/null || echo "")
+    port_occupier=$(lsof -ti :${BACKEND_PORT} 2>/dev/null || echo "")
     if [[ -n "$port_occupier" ]]; then
-        echo -e "${YELLOW}Port 8000 is already in use by PID $port_occupier. Attempting to terminate...${NC}"
+        echo -e "${YELLOW}Port ${BACKEND_PORT} is already in use by PID $port_occupier. Attempting to terminate...${NC}"
         kill -9 "$port_occupier" 2>/dev/null || true
         sleep 1
     fi
 
     echo -ne "  Starting Backend API (FastAPI)... "
     cd "$ROOT_DIR"
-    nohup uv run uvicorn backend.api.app:app --host 127.0.0.1 --port 8000 > "$log_file" 2>&1 &
+    nohup uv run uvicorn backend.api.app:app --host 127.0.0.1 --port ${BACKEND_PORT} > "$log_file" 2>&1 &
     local new_pid=$!
     echo "$new_pid" > "$pid_file"
 
-    if wait_for_url "http://127.0.0.1:8000/healthz" 20 0.4; then
-        echo -e "${GREEN}[OK]${NC} (PID: $new_pid, http://127.0.0.1:8000)"
+    if wait_for_url "http://127.0.0.1:${BACKEND_PORT}/healthz" 20 0.4; then
+        echo -e "${GREEN}[OK]${NC} (PID: $new_pid, http://127.0.0.1:${BACKEND_PORT})"
     else
         echo -e "${RED}[FAILED]${NC}"
         echo -e "${RED}Backend failed to start. Last log lines:${NC}"
@@ -211,9 +216,9 @@ stop_process() {
 
 stop_backend() {
     stop_process "Backend API" "$RUN_DIR/backend.pid"
-    # Ensure port 8000 is fully freed
+    # Ensure port ${BACKEND_PORT} is fully freed
     local p
-    p=$(lsof -ti :8000 2>/dev/null || echo "")
+    p=$(lsof -ti :${BACKEND_PORT} 2>/dev/null || echo "")
     if [[ -n "$p" ]]; then
         kill -9 $p 2>/dev/null || true
     fi
@@ -249,14 +254,14 @@ print_status() {
         local b_pid
         b_pid=$(cat "$backend_pid_file")
         local health_out
-        health_out=$(curl -s "http://127.0.0.1:8000/healthz" 2>/dev/null || echo "")
+        health_out=$(curl -s "http://127.0.0.1:${BACKEND_PORT}/healthz" 2>/dev/null || echo "")
         if [[ -n "$health_out" ]]; then
-            echo -e "  Backend API:     ${GREEN}● RUNNING${NC} (PID: $b_pid, port: 8000, healthz: OK)"
+            echo -e "  Backend API:     ${GREEN}● RUNNING${NC} (PID: $b_pid, port: ${BACKEND_PORT}, healthz: OK)"
         else
             echo -e "  Backend API:     ${YELLOW}● HANGING / UNRESPONSIVE${NC} (PID: $b_pid)"
         fi
-    elif curl -s -f -o /dev/null "http://127.0.0.1:8000/healthz" 2>/dev/null; then
-        echo -e "  Backend API:     ${GREEN}● EMBEDDED${NC} (managed by Tauri, port: 8000)"
+    elif curl -s -f -o /dev/null "http://127.0.0.1:${BACKEND_PORT}/healthz" 2>/dev/null; then
+        echo -e "  Backend API:     ${GREEN}● EMBEDDED${NC} (managed by Tauri, port: ${BACKEND_PORT})"
     else
         echo -e "  Backend API:     ${RED}○ STOPPED${NC}"
     fi
@@ -267,7 +272,7 @@ print_status() {
         local w_pid
         w_pid=$(cat "$worker_pid_file")
         echo -e "  Pipeline Worker: ${GREEN}● RUNNING${NC} (PID: $w_pid, active queue processing)"
-    elif is_running "$desktop_pid_file" && curl -s -f -o /dev/null "http://127.0.0.1:8000/healthz" 2>/dev/null; then
+    elif is_running "$desktop_pid_file" && curl -s -f -o /dev/null "http://127.0.0.1:${BACKEND_PORT}/healthz" 2>/dev/null; then
         echo -e "  Pipeline Worker: ${GREEN}● EMBEDDED${NC} (managed by Tauri)"
     else
         echo -e "  Pipeline Worker: ${RED}○ STOPPED${NC}"
@@ -288,7 +293,7 @@ print_status() {
     # Database Integrity & Stats (if backend running)
     if is_running "$backend_pid_file"; then
         local integ_out
-        integ_out=$(curl -s "http://127.0.0.1:8000/api/v1/system/integrity" 2>/dev/null || echo "")
+        integ_out=$(curl -s "http://127.0.0.1:${BACKEND_PORT}/api/v1/system/integrity" 2>/dev/null || echo "")
         if [[ "$integ_out" =~ "true" ]]; then
             echo -e "  DB Integrity:    ${GREEN}● PRAGMA integrity_check: OK (SQLite WAL)${NC}"
         else

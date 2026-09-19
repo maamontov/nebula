@@ -4,7 +4,7 @@ mod backend_runtime;
 mod commands;
 mod uploader;
 
-use backend_runtime::PythonServices;
+use backend_runtime::{get_backend_status, restart_backend, PythonServices};
 use commands::{
     get_active_session, get_audio_levels, get_session_manifests, get_system_config,
     get_upload_progress, list_audio_devices, pause_capture, resume_capture, resume_spool_upload,
@@ -17,9 +17,10 @@ fn main() {
         .manage(AppState::default())
         .manage(PythonServices::default())
         .setup(|app| {
-            app.state::<PythonServices>()
-                .start(app.handle())
-                .map_err(std::io::Error::other)?;
+            // Ошибка старта backend не должна валить приложение: паника внутри
+            // setup приводит к abort() через ObjC-границу и SIGABRT без диагностики.
+            // Состояние публикуется в PythonServices и показывается в UI.
+            app.state::<PythonServices>().start(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -34,7 +35,9 @@ fn main() {
             get_system_config,
             verify_spool,
             resume_spool_upload,
-            get_session_manifests
+            get_session_manifests,
+            get_backend_status,
+            restart_backend
         ])
         .build(tauri::generate_context!())
         .expect("error while building nebula desktop application")

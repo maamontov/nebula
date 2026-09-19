@@ -54,7 +54,7 @@ def main() -> None:
 
     api_parser = subparsers.add_parser("api", help="Run the FastAPI service")
     api_parser.add_argument("--host", default="127.0.0.1")
-    api_parser.add_argument("--port", type=int, default=8000)
+    api_parser.add_argument("--port", type=int, default=17843)
     subparsers.add_parser("worker", help="Run the background pipeline worker")
 
     args = parser.parse_args()
