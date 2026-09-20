@@ -23,6 +23,11 @@ def run_api(host: str, port: int) -> None:
     import uvicorn
 
     from backend.api.app import app
+    from backend.db.database import get_db
+
+    # Tauri starts the worker after /healthz becomes available. Complete migrations
+    # before opening the API socket so both processes cannot migrate a fresh DB.
+    get_db().init_schema()
 
     uvicorn.run(
         app,

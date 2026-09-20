@@ -1,6 +1,6 @@
 [project]
 name = "nebula"
-version = "1.0.0"
+version = "1.0.1"
 description = "Nebula AI Interview Copilot - Core & Contracts"
 readme = "README.md"
 requires-python = ">=3.12"

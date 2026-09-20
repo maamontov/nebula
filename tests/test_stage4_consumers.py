@@ -393,8 +393,8 @@ async def test_stage4_out_of_order_stt_ordered_timeline(tmp_path):
 
     try:
         for _ in range(80):
-            st = repo.get_interview_jobs_status(inv_id)
-            if st["counts"].get("COMPLETED") == 3:
+            # Other completed jobs do not imply all STT turns have finished.
+            if len(repo.get_transcript_segments(inv_id, revision_id="trans-rev-1")) == 3:
                 break
             await asyncio.sleep(0.05)
 
