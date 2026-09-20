@@ -150,7 +150,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audio-capture"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "cpal",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "audio-spike"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "audio-capture",
@@ -2257,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "nebula-desktop"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "audio-capture",
  "cpal",

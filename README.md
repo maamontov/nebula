@@ -5,7 +5,7 @@
 <h1 align="center">Nebula</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/версия-1.0.0-2563EB?style=for-the-badge" alt="Версия 1.0.0">
+  <img src="https://img.shields.io/badge/версия-1.0.1-2563EB?style=for-the-badge" alt="Версия 1.0.1">
 </p>
 
 <p align="center">

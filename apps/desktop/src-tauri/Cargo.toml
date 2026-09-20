@@ -1,6 +1,6 @@
 [package]
 name = "nebula-desktop"
-version = "1.0.0"
+version = "1.0.1"
 description = "Nebula AI Interview Decision Support Desktop Shell"
 authors = ["Nebula Team"]
 edition = "2021"
