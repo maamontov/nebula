@@ -76,8 +76,11 @@ fn test_ringbuffer_overflow_surfaced_in_stats_and_manifest() {
 
 #[test]
 fn test_disk_failure_causes_worker_error() {
-    // Spool pointing to a non-writable / invalid path
-    let invalid_path = std::path::PathBuf::from("/proc/nebula_nonexistent_mount/invalid_spool");
+    // A file cannot be used as a parent directory on any supported platform.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let blocking_file = temp_dir.path().join("not-a-directory");
+    std::fs::write(&blocking_file, b"blocked").unwrap();
+    let invalid_path = blocking_file.join("invalid_spool");
     let spool = Arc::new(AudioSpoolManager::new(&invalid_path));
     let clock = MonotonicInterviewClock::new(1);
 
