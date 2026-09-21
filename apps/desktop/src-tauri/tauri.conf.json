@@ -29,8 +29,13 @@
   "bundle": {
     "active": true,
     "targets": [
-      "app"
+      "app",
+      "dmg"
     ],
+    "macOS": {
+      "signingIdentity": "-",
+      "hardenedRuntime": false
+    },
     "resources": [
       "sidecar"
     ],
