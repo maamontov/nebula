@@ -1,0 +1,94 @@
+name: Bump project version
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    name: Bump version
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the target branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Apply version bump
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t labels < <(
+            jq -r '.pull_request.labels[].name | select(startswith("release:"))' \
+              "$GITHUB_EVENT_PATH"
+          )
+          if (( ${#labels[@]} != 1 )); then
+            echo "::error::Merged PR must have exactly one release label."
+            exit 1
+          fi
+
+          case "${labels[0]}" in
+            release:none)
+              echo "No version bump requested."
+              exit 0
+              ;;
+            release:patch) bump=patch ;;
+            release:minor) bump=minor ;;
+            release:major) bump=major ;;
+            *)
+              echo "::error::Unknown release label: ${labels[0]}"
+              exit 1
+              ;;
+          esac
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          marker="Version-Bump-PR: #${PR_NUMBER}"
+
+          for attempt in 1 2 3 4 5; do
+            git fetch origin "$BASE_REF"
+            git checkout --force -B version-bump "origin/$BASE_REF"
+
+            if git log "origin/$BASE_REF" --fixed-strings --grep="$marker" -1 --format=%H | grep -q .; then
+              echo "PR #${PR_NUMBER} was already applied."
+              exit 0
+            fi
+
+            new_version="$(python3 scripts/bump_version.py "$bump")"
+            python3 scripts/bump_version.py check
+            git add \
+              README.md \
+              pyproject.toml \
+              uv.lock \
+              Cargo.lock \
+              crates/audio-capture/Cargo.toml \
+              apps/audio-spike/Cargo.toml \
+              apps/desktop/package.json \
+              apps/desktop/package-lock.json \
+              apps/desktop/src-tauri/Cargo.toml \
+              apps/desktop/src-tauri/tauri.conf.json
+            git commit \
+              -m "chore: bump project version to ${new_version}" \
+              -m "$marker"
+
+            if git push origin HEAD:"$BASE_REF"; then
+              echo "Bumped project version to ${new_version}."
+              exit 0
+            fi
+
+            echo "Push raced with another update; retrying from the latest ${BASE_REF}."
+            sleep $((attempt * 2))
+          done
+
+          echo "::error::Could not push the version bump after 5 attempts."
+          exit 1

@@ -1,0 +1,61 @@
+name: Validate release label
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  release-label:
+    name: Release label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Reject manual version changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_version="$(
+            git show "${BASE_SHA}:pyproject.toml" \
+              | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])'
+          )"
+          current_version="$(python3 scripts/bump_version.py check)"
+          if [[ "$current_version" != "$base_version" ]]; then
+            echo "::error::Do not change the project version in a PR; select a release label instead."
+            exit 1
+          fi
+
+      - name: Require exactly one release label
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t labels < <(
+            jq -r '.pull_request.labels[].name | select(startswith("release:"))' \
+              "$GITHUB_EVENT_PATH"
+          )
+
+          if (( ${#labels[@]} != 1 )); then
+            echo "::error::PR must have exactly one label: release:patch, release:minor, release:major, or release:none."
+            exit 1
+          fi
+
+          case "${labels[0]}" in
+            release:patch|release:minor|release:major|release:none)
+              echo "Selected ${labels[0]}"
+              ;;
+            *)
+              echo "::error::Unknown release label: ${labels[0]}"
+              exit 1
+              ;;
+          esac
