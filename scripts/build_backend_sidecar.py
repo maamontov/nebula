@@ -65,7 +65,15 @@ def build_sidecar() -> None:
     if destination.exists():
         shutil.rmtree(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(built_dir, destination)
+    # symlinks=True обязателен: PyInstaller на macOS отдаёт Python.framework с
+    # симлинками (Versions/Current -> 3.12, Python -> Versions/Current/Python,
+    # _internal/Python -> Python.framework/Versions/3.12/Python). При копировании
+    # по умолчанию (symlinks=False) каждый симлинк разворачивается в полную копию
+    # 7.4 МБ dylib, и сайдкар раздувается с ~32 МБ до ~54 МБ без пользы.
+    shutil.copytree(built_dir, destination, symlinks=True)
+    if target.endswith("apple-darwin"):
+        _flatten_python_framework(destination)
+        _assert_no_symlinks(destination)
 
     staged_binary = destination / f"nebula-python{suffix}"
     if os.name != "nt":
@@ -74,6 +82,49 @@ def build_sidecar() -> None:
     _remove_legacy_onefile(target)
 
     print(f"Built embedded Python sidecar (onedir): {destination}")
+
+def _flatten_python_framework(destination: Path) -> None:
+    """Схлопывает Python.framework в единственный плоский dylib `_internal/Python`.
+
+    PyInstaller раскладывает на macOS и `_internal/Python`, и полный
+    `Python.framework`, связанные симлинками. Tauri-бандлер разворачивает
+    симлинки в копии при копировании ресурсов, из-за чего в готовом `.app`
+    оказывается 4 копии одного dylib (+22 МБ). Загрузчик PyInstaller грузит
+    только `_internal/Python` (проверено через DYLD_PRINT_LIBRARIES), поэтому
+    фреймворк не нужен. Удаление симлинков заодно лишает бандлер повода
+    дублировать файлы.
+    """
+    internal = destination / "_internal"
+    flat = internal / "Python"
+    framework = internal / "Python.framework"
+
+    if not framework.is_dir():
+        return
+    if not flat.is_file():
+        raise RuntimeError(f"PyInstaller layout changed: {flat} is missing")
+
+    if flat.is_symlink():
+        # Копируем реальный файл на место симлинка, чтобы `_internal/Python`
+        # остался обычным файлом после удаления фреймворка.
+        materialized = flat.with_name("Python.materialized")
+        shutil.copy2(flat.resolve(), materialized)
+        flat.unlink()
+        materialized.replace(flat)
+        flat.chmod(0o755)
+
+    shutil.rmtree(framework)
+
+def _assert_no_symlinks(destination: Path) -> None:
+    """Гарантирует отсутствие симлинков в staged-сайдкаре.
+
+    Tauri-бандлер копирует ресурсы с разыменованием симлинков: каждый оставшийся
+    симлинк превращается в полную копию файла и раздувает `.app`. Регресс не
+    ломает приложение, поэтому без явной проверки прошёл бы незамеченным.
+    """
+    remaining = sorted(path for path in destination.rglob("*") if path.is_symlink())
+    if remaining:
+        listed = ", ".join(str(path.relative_to(destination)) for path in remaining[:5])
+        raise RuntimeError(f"Sidecar still contains symlinks that the bundler would expand: {listed}")
 
 def _remove_legacy_onefile(target: str) -> None:
     """Удаляет onefile-бинарник прошлых сборок, чтобы не оставалось двух источников истины."""
