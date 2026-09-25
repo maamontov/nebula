@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { InterviewListItem, InterviewStatus } from '../types';
 import { listInterviews, deleteInterview } from '../services/api';
+import { CustomSelect } from '../components/CustomSelect';
 import {
-  Plus,
   Search,
   Filter,
   Calendar,
@@ -46,6 +46,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const [roleFilter, setRoleFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [dateFilter, setDateFilter] = useState('');
+  const [showFilters, setShowFilters] = useState(false);
 
   // Available roles collected from interviews for dynamic filter
   const [availableRoles, setAvailableRoles] = useState<string[]>([]);
@@ -116,6 +117,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   };
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const activeFiltersCount = [roleFilter, statusFilter, dateFilter].filter(Boolean).length;
 
   const formatDateTime = (isoString: string) => {
     if (!isoString) return '—';
@@ -275,44 +277,27 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   };
 
   return (
-    <div className="home-screen max-w-7xl mx-auto p-6 md:p-8 space-y-6 overflow-y-auto h-[calc(100vh-4rem)]">
+    <div className={`home-screen${!errorMsg && items.length === 0 ? ' home-screen-empty' : ''} max-w-7xl mx-auto p-6 md:p-8 space-y-6 overflow-y-auto h-[calc(100vh-4rem)]`}>
       {/* Header Banner */}
       <div className="home-heading flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-100 flex items-center space-x-3">
             <span>Собеседования</span>
-            <span className="text-xs font-normal text-slate-400 px-2.5 py-0.5 bg-slate-800/80 rounded-full border border-slate-700">
-              Всего: {total}
-            </span>
+            {total > 0 && <span className="home-total-count">{total}</span>}
           </h1>
-          <p className="text-sm text-slate-400 mt-1">
-            Рабочее пространство подготовки, проведения и утверждения отчётов собеседований
-          </p>
         </div>
 
-        <button
-          onClick={onNewInterview}
-          disabled={hasActiveRecording}
-          title={hasActiveRecording ? 'Запись уже активна' : 'Создать новое интервью'}
-            className={`primary-action flex items-center space-x-2 px-5 py-2.5 rounded-xl font-medium transition shadow-lg ${
-            hasActiveRecording
-              ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
-              : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/30'
-          }`}
-        >
-          <Plus className="w-4 h-4" />
-          <span>Новое интервью</span>
-        </button>
       </div>
 
       {/* Filters Toolbar */}
-      <div className="filter-toolbar p-3 rounded-xl bg-slate-900/60 border border-slate-800 flex flex-wrap items-center gap-3">
+      <div className={`filter-toolbar p-3 rounded-xl bg-slate-900/60 border border-slate-800${showFilters ? ' filter-toolbar-expanded' : ''}`}>
+        <div className="filter-toolbar-primary">
         {/* Search */}
         <div className="relative flex-1 min-w-[240px]">
           <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             type="text"
-            placeholder="Поиск по кандидату или названию..."
+            placeholder="Поиск по собеседованиям"
             value={searchQuery}
             onChange={(e) => {
               setSearchQuery(e.target.value);
@@ -322,10 +307,23 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           />
         </div>
 
-        {/* Role Filter */}
-        <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
+        <button
+          type="button"
+          className={`filter-toggle${showFilters ? ' filter-toggle-active' : ''}`}
+          onClick={() => setShowFilters((current) => !current)}
+          aria-expanded={showFilters}
+        >
+          <Filter className="w-4 h-4" />
+          <span>Фильтры</span>
+          {activeFiltersCount > 0 && <span className="filter-count">{activeFiltersCount}</span>}
+        </button>
+        </div>
+
+        <div className="filter-toolbar-secondary" aria-hidden={!showFilters} inert={!showFilters}>
+          {/* Role Filter */}
+          <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
           <Briefcase className="w-4 h-4 text-slate-400" />
-          <select
+          <CustomSelect
             value={roleFilter}
             onChange={(e) => {
               setRoleFilter(e.target.value);
@@ -337,13 +335,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             {availableRoles.map((r) => (
               <option key={r} value={r} className="bg-slate-900">{r}</option>
             ))}
-          </select>
-        </div>
+          </CustomSelect>
+          </div>
 
-        {/* Status Filter */}
-        <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
-          <Filter className="w-4 h-4 text-slate-400" />
-          <select
+          {/* Status Filter */}
+          <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
+          <ShieldCheck className="w-4 h-4 text-slate-400" />
+          <CustomSelect
             value={statusFilter}
             onChange={(e) => {
               setStatusFilter(e.target.value);
@@ -360,13 +358,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             <option value="review" className="bg-slate-900">Проверка</option>
             <option value="finalized" className="bg-slate-900">Завершено</option>
             <option value="reopened" className="bg-slate-900">Переоткрыто</option>
-          </select>
-        </div>
+          </CustomSelect>
+          </div>
 
-        {/* Date Filter */}
-        <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
+          {/* Date Filter */}
+          <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
           <Calendar className="w-4 h-4 text-slate-400" />
-          <select
+          <CustomSelect
             value={dateFilter}
             onChange={(e) => {
               setDateFilter(e.target.value);
@@ -378,12 +376,15 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             <option value="today" className="bg-slate-900">Сегодня</option>
             <option value="7d" className="bg-slate-900">Последние 7 дней</option>
             <option value="30d" className="bg-slate-900">Последние 30 дней</option>
-          </select>
+          </CustomSelect>
+          </div>
         </div>
       </div>
 
       {/* Main Table / List */}
-      <div className="interview-table-shell glass-panel rounded-2xl overflow-hidden shadow-xl border border-slate-800/80">
+      <div className={`interview-table-shell glass-panel rounded-2xl overflow-hidden shadow-xl border border-slate-800/80${
+        !errorMsg && items.length === 0 ? ' interview-table-empty' : ''
+      }`}>
         {isLoading ? (
           <div className="p-16 text-center text-slate-400 space-y-3">
             <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto" />
@@ -401,23 +402,20 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             </button>
           </div>
         ) : items.length === 0 ? (
-          <div className="p-16 text-center space-y-4">
-            <div className="w-14 h-14 rounded-2xl bg-slate-800/60 border border-slate-700 flex items-center justify-center mx-auto text-slate-400">
-              <Briefcase className="w-6 h-6" />
-            </div>
-            <div>
+          <div className="interview-empty-state p-16 text-center space-y-4">
+            <div className="interview-empty-copy">
               <h3 className="text-base font-semibold text-slate-200">Собеседования не найдены</h3>
               <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
                 {searchQuery || roleFilter || statusFilter || dateFilter
-                  ? 'Попробуйте изменить параметры поиска или фильтры.'
-                  : 'Создайте первое интервью для начала проведения и оценки.'}
+                  ? 'Измените запрос или фильтры.'
+                  : 'Создайте первое интервью.'}
               </p>
             </div>
             {!searchQuery && !roleFilter && !statusFilter && !dateFilter && (
               <button
                 onClick={onNewInterview}
                 disabled={hasActiveRecording}
-                className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition shadow-md"
+                className="interview-empty-action px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition shadow-md"
               >
                 Создать первое интервью
               </button>

@@ -119,6 +119,39 @@ export const App: React.FC = () => {
     window.localStorage.setItem('nebula-theme', theme);
   }, [theme]);
 
+  // Keep long-form fields as compact as their content allows. CSS `field-sizing`
+  // provides the native path in newer engines; this fallback also covers the
+  // WebView versions used by older Linux and Windows installations.
+  useEffect(() => {
+    const resizeTextarea = (textarea: HTMLTextAreaElement) => {
+      textarea.style.height = 'auto';
+      const maxHeight = Math.min(window.innerHeight * 0.42, 360);
+      const nextHeight = Math.min(Math.max(textarea.scrollHeight, 76), maxHeight);
+      textarea.style.height = `${nextHeight}px`;
+      textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
+    };
+
+    const resizeAll = () => {
+      document.querySelectorAll<HTMLTextAreaElement>('textarea').forEach(resizeTextarea);
+    };
+
+    const handleInput = (event: Event) => {
+      if (event.target instanceof HTMLTextAreaElement) resizeTextarea(event.target);
+    };
+
+    const observer = new MutationObserver(() => window.requestAnimationFrame(resizeAll));
+    observer.observe(document.body, { childList: true, subtree: true });
+    document.addEventListener('input', handleInput);
+    window.addEventListener('resize', resizeAll);
+    window.requestAnimationFrame(resizeAll);
+
+    return () => {
+      observer.disconnect();
+      document.removeEventListener('input', handleInput);
+      window.removeEventListener('resize', resizeAll);
+    };
+  }, []);
+
   useEffect(() => {
     getActiveSession()
       .then(async (sessionInfo) => {
@@ -379,6 +412,8 @@ export const App: React.FC = () => {
         activeRecordingSession={activeRecordingSession}
         theme={theme}
         onToggleTheme={() => setTheme((current) => (current === 'light' ? 'dark' : 'light'))}
+        onNewInterview={handleNewInterview}
+        hasActiveRecording={Boolean(activeRecordingSession)}
       />
 
       <main className="app-main flex-1 overflow-hidden relative">

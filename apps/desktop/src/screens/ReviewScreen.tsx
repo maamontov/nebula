@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { CustomSelect } from '../components/CustomSelect';
 import {
   InterviewPlan,
   AssessmentProposal,
@@ -1329,10 +1330,6 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 <Lock className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
                 <div>
                   <h4 className="text-sm font-bold text-emerald-300">Отчёт финализирован и зафиксирован</h4>
-                  <p className="text-xs text-slate-300 mt-1 leading-relaxed">
-                    Данный отчёт опечатан (sealed) криптографической контрольной суммой SHA-256. Редактирование оценок заблокировано.
-                    Если необходимо скорректировать оценки или заключение, нажмите «Редактировать результат» — это переведёт собеседование в режим доработки и создаст новую редакцию при повторном утверждении.
-                  </p>
                 </div>
               </div>
               <button
@@ -1349,9 +1346,6 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 <ShieldCheck className="w-5 h-5 text-indigo-400 shrink-0" />
                 <div>
                   <h4 className="text-sm font-bold text-indigo-300">Собеседование на этапе проверки</h4>
-                  <p className="text-xs text-slate-300 mt-0.5">
-                    Выставите оценки на вкладке «Вопросы и ответы», проверьте транскрипт и утвердите итоговый отчёт во вкладке «Результат».
-                  </p>
                 </div>
               </div>
               <button
@@ -2848,7 +2842,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 <span className="text-xs font-semibold text-slate-300">
                   Часть 1 ({Math.round(splittingSegment.start_time_ms / 1000)}с - {splitTimeSec}с)
                 </span>
-                <select
+                <CustomSelect
                   value={splitRole1}
                   onChange={(e) => setSplitRole1(e.target.value as SpeakerRole)}
                   className="bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-xs text-slate-200"
@@ -2856,7 +2850,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                   <option value="interviewer">Интервьюер</option>
                   <option value="candidate">Кандидат</option>
                   <option value="unknown">Не назначено</option>
-                </select>
+                </CustomSelect>
               </div>
               <textarea
                 value={splitText1}
@@ -2873,7 +2867,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 <span className="text-xs font-semibold text-slate-300">
                   Часть 2 ({splitTimeSec}с - {Math.round(splittingSegment.end_time_ms / 1000)}с)
                 </span>
-                <select
+                <CustomSelect
                   value={splitRole2}
                   onChange={(e) => setSplitRole2(e.target.value as SpeakerRole)}
                   className="bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-xs text-slate-200"
@@ -2881,7 +2875,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                   <option value="candidate">Кандидат</option>
                   <option value="interviewer">Интервьюер</option>
                   <option value="unknown">Не назначено</option>
-                </select>
+                </CustomSelect>
               </div>
               <textarea
                 value={splitText2}

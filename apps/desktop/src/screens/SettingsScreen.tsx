@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { CustomSelect } from '../components/CustomSelect';
 import {
   AiSettingsResponse,
   TranscriptionSettings,
@@ -539,19 +540,14 @@ export const SettingsScreen: React.FC = () => {
   };
 
   return (
-    <div className="h-[calc(100vh-4rem)] flex flex-col overflow-hidden bg-[var(--app-bg)]">
+    <div className="settings-screen h-[calc(100vh-4rem)] flex flex-col overflow-hidden bg-[var(--app-bg)]">
       {/* Header */}
-      <div className="p-6 border-b border-[var(--border)] shrink-0 bg-[var(--surface)]">
-        <div className="max-w-5xl mx-auto flex items-start justify-between gap-4">
+      <div className="settings-header p-6 border-b border-[var(--border)] shrink-0 bg-[var(--surface)]">
+        <div className="settings-header-inner max-w-5xl mx-auto flex items-start justify-between gap-4">
           <div>
             <h1 className="text-xl font-bold text-[var(--text-primary)] flex items-center space-x-2">
-              <Sparkles className="w-5 h-5 text-indigo-500" />
               <span>Настройки AI-провайдеров</span>
             </h1>
-            <p className="text-xs text-[var(--text-muted)] mt-1">
-              Глобальная независимая конфигурация распознавания речи (STT) и текстового анализа (LLM). Изменения применяются
-              без перезапуска приложения.
-            </p>
           </div>
 
           <div className="flex items-center space-x-3 text-right">
@@ -569,8 +565,8 @@ export const SettingsScreen: React.FC = () => {
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 overflow-y-auto p-6 space-y-6">
-        <div className="max-w-5xl mx-auto space-y-6">
+      <div className="settings-content flex-1 overflow-y-auto p-6 space-y-6">
+        <div className="settings-content-inner max-w-5xl mx-auto space-y-6">
           {/* Active Blocker Warning */}
           {!serverSettings.can_update && (
             <div className="p-3.5 bg-amber-950/50 border border-amber-800 rounded-xl flex items-center space-x-3 text-amber-200 text-xs">
@@ -599,7 +595,7 @@ export const SettingsScreen: React.FC = () => {
           )}
 
           {/* Card 1: Transcription (STT) */}
-          <div className="p-5 bg-[var(--surface)] border border-[var(--border)] rounded-2xl space-y-4 shadow-sm">
+          <section className="settings-section p-5 bg-[var(--surface)] border border-[var(--border)] rounded-2xl space-y-4 shadow-sm">
             <div className="flex items-center justify-between border-b border-[var(--border)] pb-3">
               <div className="flex items-center space-x-2">
                 <Layers className="w-4 h-4 text-indigo-500" />
@@ -609,7 +605,7 @@ export const SettingsScreen: React.FC = () => {
               {/* Preset Selector */}
               <div className="flex items-center space-x-2">
                 <span className="text-xs text-[var(--text-muted)]">Пресет:</span>
-                <select
+                <CustomSelect
                   value={transcription.preset}
                   onChange={(e) => handlePresetChangeStt(e.target.value as ProviderPreset)}
                   className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -617,7 +613,7 @@ export const SettingsScreen: React.FC = () => {
                   <option value="routerai">RouterAI (RF)</option>
                   <option value="plusvibe">PlusVibe API (RF)</option>
                   <option value="custom">Пользовательский (Custom)</option>
-                </select>
+                </CustomSelect>
               </div>
             </div>
 
@@ -659,14 +655,14 @@ export const SettingsScreen: React.FC = () => {
               {/* Auth Mode */}
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-[var(--text-secondary)]">Режим авторизации</label>
-                <select
+                <CustomSelect
                   value={transcription.auth_mode}
                   onChange={(e) => setTranscription({ ...transcription, auth_mode: e.target.value as AuthMode })}
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
                 >
                   <option value="bearer">Bearer Token (Authorization Header)</option>
                   <option value="none">Без авторизации (None)</option>
-                </select>
+                </CustomSelect>
               </div>
 
               {/* Language */}
@@ -705,7 +701,7 @@ export const SettingsScreen: React.FC = () => {
                 type="button"
                 onClick={handleTestStt}
                 disabled={sttTesting}
-                className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-lg transition flex items-center space-x-1.5 cursor-pointer disabled:opacity-50"
+                className="settings-test-button px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-lg transition flex items-center space-x-1.5 cursor-pointer disabled:opacity-50"
               >
                 <Activity className={`w-3.5 h-3.5 ${sttTesting ? 'animate-spin text-indigo-400' : ''}`} />
                 <span>{sttTesting ? 'Проверка...' : 'Проверить подключение STT'}</span>
@@ -738,10 +734,10 @@ export const SettingsScreen: React.FC = () => {
                 </div>
               )}
             </div>
-          </div>
+          </section>
 
           {/* Card 2: Text Analysis (LLM) */}
-          <div className="p-5 bg-[var(--surface)] border border-[var(--border)] rounded-2xl space-y-4 shadow-sm">
+          <section className="settings-section p-5 bg-[var(--surface)] border border-[var(--border)] rounded-2xl space-y-4 shadow-sm">
             <div className="flex items-center justify-between border-b border-[var(--border)] pb-3">
               <div className="flex items-center space-x-2">
                 <Sparkles className="w-4 h-4 text-indigo-500" />
@@ -751,7 +747,7 @@ export const SettingsScreen: React.FC = () => {
               {/* Preset Selector */}
               <div className="flex items-center space-x-2">
                 <span className="text-xs text-[var(--text-muted)]">Пресет:</span>
-                <select
+                <CustomSelect
                   value={textAnalysis.preset}
                   onChange={(e) => handlePresetChangeLlm(e.target.value as ProviderPreset)}
                   className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -759,7 +755,7 @@ export const SettingsScreen: React.FC = () => {
                   <option value="routerai">RouterAI (RF)</option>
                   <option value="plusvibe">PlusVibe API (RF)</option>
                   <option value="custom">Пользовательский (Custom)</option>
-                </select>
+                </CustomSelect>
               </div>
             </div>
 
@@ -778,14 +774,14 @@ export const SettingsScreen: React.FC = () => {
               {/* Auth Mode */}
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-[var(--text-secondary)]">Режим авторизации</label>
-                <select
+                <CustomSelect
                   value={textAnalysis.auth_mode}
                   onChange={(e) => setTextAnalysis({ ...textAnalysis, auth_mode: e.target.value as AuthMode })}
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
                 >
                   <option value="bearer">Bearer Token (Authorization Header)</option>
                   <option value="none">Без авторизации (None)</option>
-                </select>
+                </CustomSelect>
               </div>
 
               {/* Base URL */}
@@ -843,7 +839,7 @@ export const SettingsScreen: React.FC = () => {
 
                 <div className="space-y-1">
                   <label className="text-[11px] text-slate-400">Структурированный вывод</label>
-                  <select
+                  <CustomSelect
                     value={textAnalysis.primary_model.structured_output_mode}
                     onChange={(e) =>
                       setTextAnalysis({
@@ -859,12 +855,12 @@ export const SettingsScreen: React.FC = () => {
                     <option value="json_object">JSON Object (response_format)</option>
                     <option value="json_schema">JSON Schema (Strict Structured Output)</option>
                     <option value="prompt_instruction">Только инструкция в prompt</option>
-                  </select>
+                  </CustomSelect>
                 </div>
 
                 <div className="space-y-1">
                   <label className="text-[11px] text-slate-400">Политика reasoning</label>
-                  <select
+                  <CustomSelect
                     value={textAnalysis.primary_model.reasoning_policy}
                     onChange={(e) =>
                       setTextAnalysis({
@@ -880,7 +876,7 @@ export const SettingsScreen: React.FC = () => {
                     <option value="provider_default">По умолчанию провайдера</option>
                     <option value="disable_enable_thinking">Отключить enable_thinking: false</option>
                     <option value="disable_reasoning_effort">Отключить reasoning_effort: none</option>
-                  </select>
+                  </CustomSelect>
                 </div>
 
                 <div className="space-y-1">
@@ -907,9 +903,9 @@ export const SettingsScreen: React.FC = () => {
             </div>
 
             {/* Fallback Models Section */}
-            <div className="space-y-3 pt-2">
+            <div className="settings-fallbacks space-y-3 pt-2">
               <div className="flex items-center justify-between">
-                <label className="flex items-center space-x-2 text-xs font-semibold text-[var(--text-primary)] cursor-pointer">
+                <label className="settings-toggle flex items-center space-x-2 text-xs font-semibold text-[var(--text-primary)] cursor-pointer">
                   <input
                     type="checkbox"
                     checked={enableFallbacks}
@@ -922,7 +918,7 @@ export const SettingsScreen: React.FC = () => {
                         handleAddFallbackModel();
                       }
                     }}
-                    className="rounded bg-slate-950 border-slate-700 text-indigo-600 focus:ring-0"
+                    className="settings-checkbox rounded bg-slate-950 border-slate-700 text-indigo-600 focus:ring-0"
                   />
                   <span>Использовать резервные модели (Fallback) при сбоях</span>
                 </label>
@@ -940,11 +936,11 @@ export const SettingsScreen: React.FC = () => {
               </div>
 
               {enableFallbacks && (
-                <div className="space-y-3 pl-4 border-l-2 border-indigo-900/60">
+                <div className="settings-fallback-list space-y-3 pl-4 border-l-2 border-indigo-900/60">
                   {textAnalysis.fallback_models.map((fb, idx) => (
                     <div
                       key={idx}
-                      className="p-3 bg-slate-950/50 border border-slate-800 rounded-xl space-y-3 relative"
+                      className="fallback-model-row p-3 bg-slate-950/50 border border-slate-800 rounded-xl space-y-3 relative"
                     >
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-semibold text-slate-300">
@@ -953,7 +949,7 @@ export const SettingsScreen: React.FC = () => {
                         <button
                           type="button"
                           onClick={() => handleRemoveFallbackModel(idx)}
-                          className="text-slate-400 hover:text-rose-400 p-1 transition"
+                          className="fallback-delete text-slate-400 hover:text-rose-400 p-1 transition"
                           title="Удалить резервную модель"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -962,51 +958,54 @@ export const SettingsScreen: React.FC = () => {
 
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                         <div className="space-y-1">
-                          <label className="text-[11px] text-slate-400">Идентификатор модели</label>
+                          <label className="settings-field-label text-[11px] text-slate-400">Идентификатор модели</label>
                           <input
                             type="text"
                             value={fb.model_id}
                             onChange={(e) => handleUpdateFallbackModel(idx, { model_id: e.target.value })}
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
+                            className="settings-control w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
                           />
                         </div>
 
                         <div className="space-y-1">
-                          <label className="text-[11px] text-slate-400">Структурированный вывод</label>
-                          <select
+                          <label className="settings-field-label text-[11px] text-slate-400">Структурированный вывод</label>
+                          <CustomSelect
                             value={fb.structured_output_mode}
                             onChange={(e) =>
                               handleUpdateFallbackModel(idx, {
                                 structured_output_mode: e.target.value as StructuredOutputMode,
                               })
                             }
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                            className="settings-control w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
                           >
                             <option value="json_object">JSON Object</option>
                             <option value="json_schema">JSON Schema</option>
                             <option value="prompt_instruction">Инструкция в prompt</option>
-                          </select>
+                          </CustomSelect>
                         </div>
 
                         <div className="space-y-1">
-                          <label className="text-[11px] text-slate-400">Политика reasoning</label>
-                          <select
+                          <label className="settings-field-label text-[11px] text-slate-400">Политика reasoning</label>
+                          <CustomSelect
                             value={fb.reasoning_policy}
                             onChange={(e) =>
                               handleUpdateFallbackModel(idx, {
                                 reasoning_policy: e.target.value as ReasoningPolicy,
                               })
                             }
-                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                            className="settings-control w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
                           >
                             <option value="provider_default">По умолчанию провайдера</option>
                             <option value="disable_enable_thinking">Отключить enable_thinking</option>
                             <option value="disable_reasoning_effort">Отключить reasoning_effort</option>
-                          </select>
+                          </CustomSelect>
                         </div>
 
                         <div className="space-y-1">
-                          <label className="text-[11px] text-slate-400">Температура ({fb.temperature})</label>
+                          <label className="settings-range-label text-[11px] text-slate-400">
+                            <span>Температура</span>
+                            <output>{fb.temperature}</output>
+                          </label>
                           <input
                             type="range"
                             min="0"
@@ -1016,7 +1015,7 @@ export const SettingsScreen: React.FC = () => {
                             onChange={(e) =>
                               handleUpdateFallbackModel(idx, { temperature: parseFloat(e.target.value) })
                             }
-                            className="w-full accent-indigo-500 cursor-pointer"
+                            className="settings-range w-full accent-indigo-500 cursor-pointer"
                           />
                         </div>
                       </div>
@@ -1032,7 +1031,7 @@ export const SettingsScreen: React.FC = () => {
                 type="button"
                 onClick={handleTestLlm}
                 disabled={llmTesting}
-                className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-lg transition flex items-center space-x-1.5 cursor-pointer disabled:opacity-50"
+                className="settings-test-button px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-lg transition flex items-center space-x-1.5 cursor-pointer disabled:opacity-50"
               >
                 <Activity className={`w-3.5 h-3.5 ${llmTesting ? 'animate-spin text-indigo-400' : ''}`} />
                 <span>{llmTesting ? 'Проверка...' : 'Проверить подключение LLM'}</span>
@@ -1065,10 +1064,10 @@ export const SettingsScreen: React.FC = () => {
                 </div>
               )}
             </div>
-          </div>
+          </section>
 
           {/* Collapsible Advanced Settings */}
-          <div className="p-4 bg-[var(--surface)] border border-[var(--border)] rounded-2xl shadow-sm">
+          <section className="settings-section p-4 bg-[var(--surface)] border border-[var(--border)] rounded-2xl shadow-sm">
             <button
               type="button"
               onClick={() => setShowAdvanced(!showAdvanced)}
@@ -1140,7 +1139,7 @@ export const SettingsScreen: React.FC = () => {
                 </div>
               </div>
             )}
-          </div>
+          </section>
         </div>
       </div>
 

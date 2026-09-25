@@ -6,8 +6,8 @@ import {
   Briefcase,
   FileSpreadsheet,
   Moon,
+  Plus,
   Settings,
-  ShieldCheck,
   Sparkles,
   Sun,
 } from 'lucide-react';
@@ -30,6 +30,8 @@ interface HeaderProps {
   } | null;
   theme?: Theme;
   onToggleTheme?: () => void;
+  onNewInterview?: () => void;
+  hasActiveRecording?: boolean;
 }
 
 interface NavButtonProps {
@@ -52,9 +54,6 @@ const NavButton: React.FC<NavButtonProps> = ({ label, active, onClick, children 
 );
 
 export const Header: React.FC<HeaderProps> = ({
-  status,
-  candidateName = 'Новое собеседование',
-  role = 'Позиция не выбрана',
   isCapturing = false,
   captureMode,
   currentScreen = 'home',
@@ -62,42 +61,29 @@ export const Header: React.FC<HeaderProps> = ({
   activeRecordingSession = null,
   theme = 'light',
   onToggleTheme,
+  onNewInterview,
+  hasActiveRecording = false,
 }) => {
   const isInterviewScreen = currentScreen === 'live' || currentScreen === 'review' || currentScreen === 'setup';
 
-  const getStatusBadge = () => {
-    switch (status) {
-      case 'recording':
-        return (
-          <span className="status-badge status-recording">
-            <span className="status-dot recording-pulse" />
-            <span>Запись</span>
-          </span>
-        );
-      case 'paused':
-        return <span className="status-badge status-paused">Пауза</span>;
-      case 'review':
-        return <span className="status-badge status-review">Проверка</span>;
-      case 'finalized':
-        return (
-          <span className="status-badge status-finalized">
-            <ShieldCheck className="h-3.5 w-3.5" />
-            <span>Завершено</span>
-          </span>
-        );
-      default:
-        return <span className="status-badge status-draft">Подготовка</span>;
-    }
-  };
-
   return (
-    <>
-      <aside className="app-sidebar" aria-label="Основная навигация">
+    <aside className="app-sidebar" aria-label="Основная навигация">
         <button type="button" className="sidebar-brand" onClick={() => onNavigate?.('home')} aria-label="Перейти к интервью">
           <span className="brand-mark" aria-hidden="true">
             <Sparkles className="h-4 w-4" />
           </span>
           <span className="brand-name">Nebula</span>
+        </button>
+
+        <button
+          type="button"
+          className="sidebar-new-action"
+          onClick={onNewInterview}
+          disabled={hasActiveRecording}
+          title={hasActiveRecording ? 'Запись уже активна' : 'Создать новое интервью'}
+        >
+          <Plus className="sidebar-nav-icon" />
+          <span>Новое интервью</span>
         </button>
 
         <nav className="sidebar-nav">
@@ -124,43 +110,27 @@ export const Header: React.FC<HeaderProps> = ({
           </NavButton>
         </nav>
 
-        <div className="sidebar-footer" aria-hidden="true">
+        <div className="sidebar-footer">
           <span className="sidebar-footer-line" />
-        </div>
-      </aside>
-
-      <header className="app-topbar">
-        <div className="topbar-context">
-          {isInterviewScreen && (
-            <div className="interview-context">
-              <div className="interview-context-title">
-                <span className="interview-context-name">{candidateName}</span>
-                {getStatusBadge()}
-              </div>
-              <span className="interview-context-role">{role}</span>
-            </div>
-          )}
-        </div>
-
-        <div className="topbar-actions">
           {activeRecordingSession && currentScreen !== 'live' && (
-            <div className="recording-return-banner">
+            <button type="button" onClick={() => onNavigate?.('live')} className="sidebar-recording-return">
               <span className="status-dot recording-pulse" aria-hidden="true" />
-              <span className="recording-return-copy">
-                Идёт запись: <strong>{activeRecordingSession.candidateName}</strong>
+              <span className="sidebar-recording-copy">
+                <strong>{activeRecordingSession.candidateName}</strong>
+                <small>Идёт запись</small>
               </span>
-              <button type="button" onClick={() => onNavigate?.('live')} className="recording-return-button">
-                <span>Вернуться к записи</span>
-                <ArrowRight className="h-3.5 w-3.5" />
-              </button>
-            </div>
+              <ArrowRight className="h-3.5 w-3.5" />
+            </button>
           )}
 
-          <AudioMeters isCapturing={isCapturing} captureMode={captureMode || activeRecordingSession?.captureMode} />
+          <div className="sidebar-audio-status">
+            <span className="sidebar-utility-label">Аудио</span>
+            <AudioMeters isCapturing={isCapturing} captureMode={captureMode || activeRecordingSession?.captureMode} />
+          </div>
 
           <button
             type="button"
-            className="theme-toggle"
+            className="theme-toggle sidebar-theme-toggle"
             onClick={onToggleTheme}
             aria-label={theme === 'dark' ? 'Включить светлую тему' : 'Включить тёмную тему'}
             title={theme === 'dark' ? 'Светлая тема' : 'Тёмная тема'}
@@ -169,7 +139,6 @@ export const Header: React.FC<HeaderProps> = ({
             <span className="theme-toggle-label">{theme === 'dark' ? 'Светлая' : 'Тёмная'}</span>
           </button>
         </div>
-      </header>
-    </>
+    </aside>
   );
 };

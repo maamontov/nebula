@@ -10,6 +10,7 @@ import {
   deleteJobTemplate,
   copyQuestionToTemplate,
 } from '../services/api';
+import { CustomSelect } from '../components/CustomSelect';
 import {
   Briefcase,
   Plus,
@@ -483,7 +484,7 @@ export const JobTemplatesScreen: React.FC = () => {
         {/* Template Cards List */}
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
           {isCreatingNew && (
-            <div className="p-3 rounded-xl border border-indigo-500/80 bg-indigo-950/40 text-left space-y-1 shadow-md">
+            <div className="template-list-card p-3 rounded-xl border border-indigo-500/80 bg-indigo-950/40 text-left space-y-1 shadow-md">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-indigo-200 truncate">
                   {editingTemplate.title.trim() || 'Новая должность'}
@@ -516,7 +517,7 @@ export const JobTemplatesScreen: React.FC = () => {
                 <div
                   key={tpl.id}
                   onClick={() => handleSelectTemplate(tpl.id)}
-                  className={`p-3 rounded-xl cursor-pointer border transition text-left space-y-2 group ${
+                  className={`template-list-card${isSelected ? ' template-list-card-selected' : ''} p-3 rounded-xl cursor-pointer border transition text-left space-y-2 group ${
                     isSelected
                       ? 'bg-indigo-950/40 border-indigo-600/80 shadow-md'
                       : 'bg-slate-950/50 hover:bg-slate-800/40 border-slate-800/80'
@@ -541,7 +542,7 @@ export const JobTemplatesScreen: React.FC = () => {
                       </div>
                     </div>
 
-                    {tpl.is_archived && (
+                    {Boolean(tpl.is_archived) && (
                       <span className="px-1.5 py-0.5 text-[10px] font-semibold text-amber-300 bg-amber-950/60 border border-amber-800 rounded">
                         Архив
                       </span>
@@ -592,14 +593,11 @@ export const JobTemplatesScreen: React.FC = () => {
       {/* Right Column: Template & Questions Editor */}
       <div className="templates-editor flex-1 overflow-y-auto p-6 md:p-8 space-y-6">
         {/* Editor Top Bar */}
-        <div className="flex items-center justify-between border-b border-slate-800 pb-4">
+        <div className="templates-editor-header flex items-center justify-between border-b border-slate-800 pb-4">
           <div>
             <h2 className="text-xl font-bold text-slate-100">
               {editingTemplate.id ? 'Редактирование должности' : 'Создание новой должности'}
             </h2>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Настройте требования, перечень вопросов, критерии и веса для интервью
-            </p>
           </div>
 
           <div className="flex items-center space-x-3">
@@ -633,7 +631,7 @@ export const JobTemplatesScreen: React.FC = () => {
         </div>
 
         {/* Basic Fields */}
-        <div className="glass-panel p-6 rounded-2xl space-y-4 shadow-md">
+        <div className="template-basics glass-panel p-6 rounded-2xl space-y-4 shadow-md">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="md:col-span-2 space-y-1.5">
               <label className="text-xs font-semibold text-slate-300">Название должности</label>
@@ -650,7 +648,7 @@ export const JobTemplatesScreen: React.FC = () => {
 
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-300">Уровень (Grade)</label>
-              <select
+              <CustomSelect
                 value={editingTemplate.level}
                 onChange={(e) =>
                   setEditingTemplate((prev) => ({ ...prev, level: e.target.value }))
@@ -662,7 +660,7 @@ export const JobTemplatesScreen: React.FC = () => {
                 <option value="Senior">Senior</option>
                 <option value="Lead">Lead</option>
                 <option value="Principal / Architect">Principal / Architect</option>
-              </select>
+              </CustomSelect>
             </div>
           </div>
 
@@ -694,7 +692,7 @@ export const JobTemplatesScreen: React.FC = () => {
         </div>
 
         {/* Questions Section */}
-        <div className="space-y-4">
+        <div className="template-questions-section space-y-4">
           <div className="flex items-center justify-between">
             <div>
               <h3 className="text-base font-bold text-slate-100 flex items-center space-x-2">
@@ -703,9 +701,6 @@ export const JobTemplatesScreen: React.FC = () => {
                   {editingTemplate.questions.length}
                 </span>
               </h3>
-              <p className="text-xs text-slate-400">
-                Задайте формулировку, вес вопроса и рубрики с критериями оценки
-              </p>
             </div>
 
             <button
@@ -721,11 +716,11 @@ export const JobTemplatesScreen: React.FC = () => {
             {editingTemplate.questions.map((q, qIdx) => (
               <div
                 key={q.id}
-                className="glass-panel p-5 rounded-2xl border border-slate-800/90 space-y-4 shadow-sm"
+                className="template-question-card glass-panel p-5 rounded-2xl border border-slate-800/90 space-y-4 shadow-sm"
               >
                 {/* Question Header */}
-                <div className="flex items-center justify-between gap-3 border-b border-slate-800/60 pb-3">
-                  <div className="flex items-center space-x-2">
+                <div className="template-question-header flex items-center justify-between gap-3 border-b border-slate-800/60 pb-3">
+                  <div className="template-question-title flex items-center space-x-2">
                     <span className="w-6 h-6 rounded-full bg-indigo-950 text-indigo-300 border border-indigo-800 flex items-center justify-center text-xs font-bold font-mono">
                       {qIdx + 1}
                     </span>
@@ -743,7 +738,7 @@ export const JobTemplatesScreen: React.FC = () => {
                     />
                   </div>
 
-                  <div className="flex items-center space-x-1.5 text-xs">
+                  <div className="template-question-actions flex items-center space-x-1.5 text-xs">
                     {/* Weight */}
                     <div className="flex items-center space-x-1 bg-slate-950 border border-slate-800 rounded px-2 py-1 mr-2">
                       <span className="text-slate-500 text-[11px]">Вес:</span>
@@ -858,9 +853,9 @@ export const JobTemplatesScreen: React.FC = () => {
                     {q.criteria.map((crit, critIdx) => (
                       <div
                         key={crit.id}
-                        className="bg-slate-950/70 border border-slate-800/80 p-3 rounded-xl space-y-2.5"
+                        className="template-criterion-row bg-slate-950/70 border border-slate-800/80 p-3 rounded-xl space-y-2.5"
                       >
-                        <div className="flex items-center justify-between gap-3">
+                        <div className="template-criterion-head flex items-center justify-between gap-3">
                           <input
                             type="text"
                             value={crit.title}
@@ -955,7 +950,7 @@ export const JobTemplatesScreen: React.FC = () => {
 
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-300">Целевая должность</label>
-              <select
+              <CustomSelect
                 value={copyQuestionModal.targetTemplateId}
                 onChange={(e) =>
                   setCopyQuestionModal((prev) =>
@@ -971,7 +966,7 @@ export const JobTemplatesScreen: React.FC = () => {
                       {t.title} ({t.level})
                     </option>
                   ))}
-              </select>
+              </CustomSelect>
             </div>
 
             <div className="flex items-center justify-end space-x-3 pt-2">

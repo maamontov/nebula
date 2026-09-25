@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { CustomSelect } from '../components/CustomSelect';
 import {
   AudioDevice,
   CaptureMode,
@@ -381,9 +382,6 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                 </span>
               )}
             </h2>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Кандидат → Должность → Вопросы → Сохранение черновика → Запись
-            </p>
           </div>
         </div>
 
@@ -442,7 +440,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
             </label>
             <div className="flex items-center space-x-2">
               <div className="flex-1">
-                <select
+                <CustomSelect
                   value={selectedTemplateId}
                   onChange={(e) => handleTemplateChange(e.target.value)}
                   className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -453,7 +451,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                       {tpl.title} ({tpl.level || 'Middle'})
                     </option>
                   ))}
-                </select>
+                </CustomSelect>
               </div>
 
               {selectedTemplateId && (
@@ -500,9 +498,6 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
               <span className="w-5 h-5 rounded-full bg-indigo-900/60 text-indigo-300 flex items-center justify-center text-[10px] font-mono">2</span>
               <span>План вопросов собеседования</span>
             </h3>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Копия плана для этого интервью. Изменения не затрагивают шаблон должности.
-            </p>
           </div>
 
           <button
@@ -542,7 +537,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
             {plan.questions.map((q, qIdx) => (
               <div
                 key={q.id}
-                className="bg-slate-950/80 border border-slate-800/90 p-4 rounded-xl space-y-3"
+                className="setup-question-card bg-slate-950/80 border border-slate-800/90 p-4 rounded-xl space-y-3"
               >
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center space-x-2 flex-1">
@@ -730,7 +725,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
               <span>Общее аудиоустройство</span>
             </label>
             <div className="relative">
-              <select
+              <CustomSelect
                 value={selectedShared}
                 onChange={(e) => setSelectedShared(e.target.value)}
                 className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3 pr-10 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -740,7 +735,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                     {d.name} {d.is_default ? '(По умолчанию)' : ''}
                   </option>
                 ))}
-              </select>
+              </CustomSelect>
             </div>
           </div>
         ) : (
@@ -751,7 +746,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                 <span>Микрофон интервьюера</span>
               </label>
               <div className="relative">
-                <select
+                <CustomSelect
                   value={selectedMic}
                   onChange={(e) => setSelectedMic(e.target.value)}
                   className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3 pr-10 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -761,7 +756,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                       {d.name} {d.is_default ? '(По умолчанию)' : ''}
                     </option>
                   ))}
-                </select>
+                </CustomSelect>
               </div>
             </div>
 
@@ -771,7 +766,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                 <span>Звук кандидата (Динамики / Встреча)</span>
               </label>
               <div className="relative">
-                <select
+                <CustomSelect
                   value={selectedSpeaker}
                   onChange={(e) => setSelectedSpeaker(e.target.value)}
                   className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3 pr-10 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -781,7 +776,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                       {d.name}
                     </option>
                   ))}
-                </select>
+                </CustomSelect>
               </div>
             </div>
           </div>
@@ -804,11 +799,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
         </div>
 
         {/* Start Button */}
-        <div className="flex items-center justify-between pt-2">
-          <span className="text-xs text-slate-500">
-            После начала записи план и рубрика будут зафиксированы.
-          </span>
-
+        <div className="flex items-center justify-end pt-2">
           <button
             onClick={handleStart}
             disabled={isSubmitting}
