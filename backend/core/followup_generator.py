@@ -201,6 +201,7 @@ def build_followup_context(
     existing_associations: list[dict[str, Any]] | None = None,
     decisions_history: list[dict[str, Any]] | None = None,
     role_title: str = "",
+    question_marks: list[dict[str, Any]] | None = None,
     active_rubric_revision_id: str = "rub-rev-1",
     active_transcript_revision_id: str = "trans-rev-1",
 ) -> FollowUpContext:
@@ -237,6 +238,7 @@ def build_followup_context(
         questions=q_dicts,
         segments=seg_dicts,
         existing_associations=existing_associations or [],
+        question_marks=question_marks,
     )
     assoc_by_seg_id = {a.segment_id: a for a in matched_assocs}
 

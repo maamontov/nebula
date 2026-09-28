@@ -158,6 +158,15 @@ const PRESET_LLM_CONFIGS: Record<ProviderPreset, Partial<TextAnalysisSettings>> 
   },
 };
 
+/** Backend returns technical English reasons; show the interviewer what to do instead. */
+function describeUpdateBlocker(blocker: string | null | undefined): string {
+  if (!blocker) return 'выполняются фоновые задачи или идёт запись интервью.';
+  if (/currently recording/i.test(blocker)) return 'идёт запись интервью. Настройки можно изменить после её завершения.';
+  if (/currently paused/i.test(blocker)) return 'интервью на паузе. Завершите запись, чтобы изменить настройки.';
+  if (/background job/i.test(blocker)) return 'выполняется обработка интервью. Дождитесь её завершения и повторите.';
+  return blocker;
+}
+
 export const SettingsScreen: React.FC = () => {
   const [serverSettings, setServerSettings] = useState<AiSettingsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -577,7 +586,7 @@ export const SettingsScreen: React.FC = () => {
               <AlertCircle className="w-5 h-5 shrink-0 text-amber-400" />
               <div>
                 <span className="font-semibold">Сохранение временно недоступно: </span>
-                <span>{serverSettings.update_blocker || 'выполняются активные задачи или идёт запись интервью.'}</span>
+                <span>{describeUpdateBlocker(serverSettings.update_blocker)}</span>
               </div>
             </div>
           )}

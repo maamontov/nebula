@@ -21,13 +21,15 @@ import {
   X,
   Edit2,
   Quote,
-  ExternalLink,
   Loader2,
+  MessageSquarePlus,
   AlertTriangle,
   RefreshCw,
   Clock,
   CheckCircle2,
 } from 'lucide-react';
+
+const SLOW_GENERATION_MS = 45000;
 
 export interface FollowUpSuggestionsProps {
   interviewId: string;
@@ -58,7 +60,9 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSubmittingPatch, setIsSubmittingPatch] = useState<string | null>(null);
 
+  const [generatingTooLong, setGeneratingTooLong] = useState(false);
   const isPollingRef = useRef(false);
+  const reloadPendingRef = useRef(false);
   const isMountedRef = useRef(true);
   const activeQuestionIdRef = useRef(questionId);
   const activeInterviewIdRef = useRef(interviewId);
@@ -151,7 +155,11 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
   const loadState = useCallback(
     async (silent = true) => {
       if (!interviewId || !questionId) return;
-      if (isPollingRef.current) return;
+      if (isPollingRef.current) {
+        // Question or mode may have changed while a request is in flight: reload once it ends.
+        reloadPendingRef.current = true;
+        return;
+      }
       isPollingRef.current = true;
 
       try {
@@ -244,23 +252,40 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
         }
       } finally {
         isPollingRef.current = false;
+        if (reloadPendingRef.current && isMountedRef.current) {
+          reloadPendingRef.current = false;
+          void loadStateRef.current(true);
+        }
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [interviewId, questionId, activeMode, autoEnabled, disabled, isPaused, isGenerating, handleGenerate]
   );
 
-  // Initial load and periodic polling
+  // A generation that never finishes (AI provider down, worker busy) must not spin forever.
   useEffect(() => {
-    loadState(false);
+    setGeneratingTooLong(false);
+    if (!isGenerating) return;
+    const timer = setTimeout(() => setGeneratingTooLong(true), SLOW_GENERATION_MS);
+    return () => clearTimeout(timer);
+  }, [isGenerating, questionId]);
+
+  // Initial load and periodic polling. `loadState` changes identity after every response
+  // (it depends on the fetched state), so the interval reads it through a ref; otherwise the
+  // effect restarts on each response and polls the backend in a tight loop.
+  const loadStateRef = useRef(loadState);
+  loadStateRef.current = loadState;
+
+  useEffect(() => {
+    void loadStateRef.current(false);
     const interval = setInterval(() => {
-      loadState(true);
+      void loadStateRef.current(true);
     }, 2500);
 
     return () => {
       clearInterval(interval);
     };
-  }, [loadState]);
+  }, [interviewId, questionId, activeMode]);
 
   // Local countdown for cooldown
   useEffect(() => {
@@ -384,375 +409,298 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
     switch (kind) {
       case 'clarify':
         return (
-          <span className="max-w-full min-w-0 px-2 py-0.5 text-[10px] font-bold leading-tight whitespace-normal rounded bg-indigo-950/80 text-indigo-300 border border-indigo-700/60 flex items-center space-x-1">
-            <HelpCircle className="w-3 h-3" />
+          <span className="chip chip-accent">
+            <HelpCircle />
             <span>Уточнение</span>
           </span>
         );
       case 'deepen':
         return (
-          <span className="max-w-full min-w-0 px-2 py-0.5 text-[10px] font-bold leading-tight whitespace-normal rounded bg-purple-950/80 text-purple-300 border border-purple-700/60 flex items-center space-x-1">
-            <Sparkles className="w-3 h-3" />
+          <span className="chip chip-purple">
+            <Sparkles />
             <span>Углубление</span>
           </span>
         );
       case 'guide':
         return (
-          <span className="max-w-full min-w-0 px-2 py-0.5 text-[10px] font-bold leading-tight whitespace-normal rounded bg-amber-950/80 text-amber-300 border border-amber-600/70 flex items-center space-x-1 shadow-sm">
-            <Compass className="w-3 h-3 text-amber-400" />
-            <span>Наводящий вопрос (подсказка)</span>
+          <span className="chip chip-warning">
+            <Compass />
+            <span>Наводящий</span>
           </span>
         );
     }
   };
 
-  return (
-    <div className="p-3 bg-slate-900/90 border border-slate-800 rounded-xl space-y-3 min-w-0">
-      {/* Header with Title and Auto-toggle */}
-      <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
-        <div className="flex min-w-0 flex-1 items-start space-x-2">
-          <HelpCircle className="w-4 h-4 text-cyan-400 shrink-0" />
-          <div className="min-w-0">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-200 block">
-              Что спросить дальше
-            </span>
-            {questionTitle && (
-              <span className="text-[10px] text-slate-400 break-words block" title={questionTitle}>
-                {questionTitle}
-              </span>
-            )}
-          </div>
-        </div>
+  const renderQuote = (quoteText: string, segId: string | null | undefined, key: React.Key) => (
+    <button
+      key={key}
+      type="button"
+      className="quote"
+      onClick={() => segId && onLocateSegment(segId)}
+      disabled={!segId}
+      title={segId ? 'Показать в стенограмме' : undefined}
+    >
+      <Quote />
+      <span>«{quoteText}»</span>
+    </button>
+  );
 
-        <label className="flex shrink-0 items-center space-x-1.5 cursor-pointer select-none">
+  return (
+    <section className="assist" aria-label="Что спросить дальше">
+      <div className="live-pane-head">
+        <span className="pane-title">Что спросить дальше</span>
+        <label className="assist-toggle" title="Предлагать вопросы автоматически, когда кандидат закончил отвечать">
           <input
             type="checkbox"
+            className="sr-only"
             checked={autoEnabled}
             onChange={(e) => setAutoEnabled(e.target.checked)}
             disabled={disabled}
-            className="rounded border-slate-700 text-indigo-600 focus:ring-indigo-500 bg-slate-800 text-xs w-3.5 h-3.5 cursor-pointer"
           />
-          <span className="text-[11px] text-slate-300 font-medium">Автоподсказки</span>
-          {cooldownRemaining > 0 && autoEnabled && (
-            <span className="text-[10px] text-slate-400 font-mono">({cooldownRemaining}с)</span>
-          )}
+          <span className={`switch${autoEnabled ? ' switch-on' : ''}`} aria-hidden="true" />
+          <span>Авто{cooldownRemaining > 0 && autoEnabled ? ` · ${cooldownRemaining}с` : ''}</span>
         </label>
       </div>
-
-      {/* Action Buttons: Probe & Guide */}
-      <div className="grid grid-cols-2 gap-2">
-        <button
-          type="button"
-          onClick={() => handleGenerate('probe', 'manual')}
-          disabled={disabled || isGenerating}
-          className="min-w-0 flex items-center justify-center space-x-1.5 px-2.5 py-1.5 bg-indigo-600/90 hover:bg-indigo-500 disabled:bg-slate-800/80 disabled:text-slate-500 text-white text-xs font-semibold text-center leading-snug rounded-lg shadow-sm transition cursor-pointer disabled:cursor-not-allowed"
-          title="Сгенерировать уточняющие и углубляющие вопросы по ответу кандидата"
-        >
-          {isGenerating && activeMode === 'probe' ? (
-            <>
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              <span>Генерация...</span>
-            </>
-          ) : (
-            <>
-              <Sparkles className="w-3.5 h-3.5 text-indigo-300" />
-              <span>Предложить вопросы</span>
-            </>
-          )}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => handleGenerate('guide', 'manual')}
-          disabled={disabled || isGenerating}
-          className="min-w-0 flex items-center justify-center space-x-1.5 px-2.5 py-1.5 bg-amber-600/90 hover:bg-amber-500 disabled:bg-slate-800/80 disabled:text-slate-500 text-white text-xs font-semibold text-center leading-snug rounded-lg shadow-sm transition cursor-pointer disabled:cursor-not-allowed"
-          title="Предложить один наводящий вопрос, если кандидат испытывает затруднения"
-        >
-          {isGenerating && activeMode === 'guide' ? (
-            <>
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              <span>Генерация...</span>
-            </>
-          ) : (
-            <>
-              <Compass className="w-3.5 h-3.5 text-amber-200" />
-              <span>Мягко направить</span>
-            </>
-          )}
-        </button>
-      </div>
-
-      {/* Error / Retry Bar */}
-      {errorMessage && (
-        <div className="p-2.5 bg-rose-950/40 border border-rose-800/80 rounded-lg flex flex-wrap items-start justify-between gap-2 text-xs text-rose-300">
-          <div className="flex min-w-0 flex-1 items-start space-x-1.5">
-            <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-            <span className="break-words" title={errorMessage}>{errorMessage}</span>
-          </div>
-          <div className="flex items-center space-x-1 shrink-0">
-            <button
-              type="button"
-              onClick={handleRetry}
-              className="px-2 py-0.5 bg-rose-800/60 hover:bg-rose-700/80 text-white rounded text-[10px] font-semibold flex items-center space-x-1 cursor-pointer transition"
-            >
-              <RefreshCw className="w-2.5 h-2.5" />
-              <span>Повторить</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setErrorMessage(null)}
-              className="p-1 hover:bg-rose-900/50 text-rose-400 hover:text-rose-200 rounded cursor-pointer transition"
-              title="Закрыть"
-            >
-              <X className="w-3 h-3" />
-            </button>
-          </div>
+      {questionTitle && (
+        <div className="assist-question" title={questionTitle}>
+          По текущему вопросу: {questionTitle}
         </div>
       )}
 
-      {/* Warning: Stale answer banner */}
-      {stateResponse?.has_new_answer && !isGenerating && (
-        <div className="p-2 bg-indigo-950/40 border border-indigo-800/60 rounded-lg flex flex-wrap items-start justify-between gap-2 text-xs text-indigo-300">
-          <span className="text-[11px] break-words">Поступили новые реплики кандидата</span>
+      <div className="assist-section">
+        <div className="assist-actions">
           <button
             type="button"
-            onClick={() => handleGenerate(activeMode, 'manual')}
-            disabled={cooldownRemaining > 0}
-            className="px-2 py-0.5 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 text-white text-[10px] font-semibold rounded"
+            onClick={() => handleGenerate('probe', 'manual')}
+            disabled={disabled || isGenerating}
+            className="btn btn-primary btn-sm"
+            title="Уточняющие и углубляющие вопросы по ответу кандидата"
           >
-            Обновить
+            {isGenerating && activeMode === 'probe' ? <Loader2 className="spin" /> : <Sparkles />}
+            <span>Предложить вопросы</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => handleGenerate('guide', 'manual')}
+            disabled={disabled || isGenerating}
+            className="btn btn-secondary btn-sm"
+            title="Один наводящий вопрос, если кандидат затрудняется. Доступен до ответа."
+          >
+            {isGenerating && activeMode === 'guide' ? <Loader2 className="spin" /> : <Compass />}
+            <span>Мягко направить</span>
           </button>
         </div>
-      )}
 
-      {/* Context info: No candidate segments */}
-      {candidateSegments.length === 0 && (
-        <div className="p-3 text-center text-xs text-slate-400 border border-dashed border-slate-800 rounded-lg space-y-1">
-          <Clock className="w-4 h-4 mx-auto text-slate-500" />
-          <p>Ожидание ответа кандидата на текущий вопрос</p>
-          <p className="text-[10px] text-slate-500">
-            «Мягко направить» можно запросить уже сейчас, даже без ответа
-          </p>
-          {unassignedSharedCount > 0 && (
-            <p className="text-[10px] text-amber-400 font-medium">
-              Назначьте реплики кандидата в стенограмме для генерации подсказок
-            </p>
-          )}
-        </div>
-      )}
+        {errorMessage && (
+          <div className="notice notice-danger assist-gap">
+            <AlertTriangle />
+            <div className="notice-body">
+              {errorMessage}
+              <div className="notice-actions">
+                <button type="button" onClick={handleRetry} className="btn btn-secondary btn-sm">
+                  <RefreshCw />
+                  <span>Повторить</span>
+                </button>
+                <button type="button" onClick={() => setErrorMessage(null)} className="btn btn-ghost btn-sm">
+                  <X />
+                  <span>Скрыть</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
-      {/* Generating Loader */}
-      {isGenerating && (
-        <div className="p-4 bg-slate-950/60 border border-indigo-900/60 rounded-lg flex items-center justify-center space-x-2 text-xs text-indigo-300 animate-pulse">
-          <Loader2 className="w-4 h-4 animate-spin text-indigo-400" />
-          <span>Анализируем ответ кандидата...</span>
-        </div>
-      )}
+        {stateResponse?.has_new_answer && !isGenerating && visibleSuggestions.length > 0 && (
+          <div className="notice notice-info assist-gap">
+            <MessageSquarePlus />
+            <div className="notice-body">
+              Кандидат продолжил отвечать — подсказки могли устареть.
+              <div className="notice-actions">
+                <button
+                  type="button"
+                  onClick={() => handleGenerate(activeMode, 'manual')}
+                  disabled={cooldownRemaining > 0}
+                  className="btn btn-secondary btn-sm"
+                >
+                  <RefreshCw />
+                  <span>Обновить</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
-      {/* Informative message when no suggestions were needed */}
-      {visibleSuggestions.length === 0 && !isGenerating && !errorMessage && stateResponse?.latest_request?.outcome === 'no_suggestions' && (
-        <div className="p-3 text-center text-xs text-slate-400 border border-slate-800/80 rounded-lg space-y-1 bg-slate-950/40">
-          <Check className="w-4 h-4 mx-auto text-emerald-400" />
-          <p className="text-slate-300 font-medium">Ответ достаточно полон</p>
-          <p className="text-[10px] text-slate-500">Дополнительные вопросы по текущим критериям не требуются</p>
-        </div>
-      )}
+        {isGenerating && (
+          <div className="assist-loading" role="status">
+            <Loader2 className="spin" />
+            <span>{activeMode === 'guide' ? 'Готовим наводящий вопрос…' : 'Анализируем ответ кандидата…'}</span>
+          </div>
+        )}
 
-      {/* Suggestion Cards */}
-      {visibleSuggestions.length > 0 && !isGenerating && (
-        <div className="space-y-2.5">
-          {visibleSuggestions.map((s) => {
-            const isEditing = editingId === s.id;
-            const isGuide = s.kind === 'guide';
-            const isAsked = s.status === 'asked';
+        {isGenerating && generatingTooLong && (
+          <div className="notice notice-warning assist-gap">
+            <Clock />
+            <div className="notice-body">
+              AI отвечает дольше обычного. Проверьте подключение модели в настройках или повторите запрос.
+              <div className="notice-actions">
+                <button type="button" onClick={handleRetry} className="btn btn-secondary btn-sm">
+                  <RefreshCw />
+                  <span>Повторить</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
-            return (
-              <div
-                key={s.id}
-                className={`p-3 rounded-xl border transition-all space-y-2 ${
-                  isGuide
-                    ? 'bg-amber-950/20 border-amber-800/60 shadow-md shadow-amber-950/30'
-                    : isAsked
-                    ? 'bg-emerald-950/20 border-emerald-800/50'
-                    : 'bg-slate-950/70 border-slate-800'
-                }`}
-              >
-                {/* Kind & Status Badges */}
-                <div className="flex flex-wrap items-start justify-between gap-1.5">
-                  <div className="flex flex-wrap items-center gap-1.5 min-w-0">
-                    {getKindBadge(s.kind)}
-                    {s.is_stale && !isAsked && (
-                      <span className="px-1.5 py-0.5 text-[9px] font-semibold text-amber-400 bg-amber-950/80 border border-amber-800/70 rounded">
-                        Ответ изменился
+        {!isGenerating && visibleSuggestions.length === 0 && !errorMessage && (
+          stateResponse?.latest_request?.outcome === 'no_suggestions' ? (
+            <div className="assist-empty">
+              <Check />
+              <span>Ответ достаточно полный</span>
+              <small>Дополнительные вопросы по критериям не нужны</small>
+            </div>
+          ) : candidateSegments.length === 0 ? (
+            <div className="assist-empty">
+              <Clock />
+              <span>Ждём ответ кандидата</span>
+              <small>
+                {unassignedSharedCount > 0
+                  ? 'Отметьте в стенограмме, какие реплики принадлежат кандидату'
+                  : 'Если кандидат затрудняется, можно «мягко направить» уже сейчас'}
+              </small>
+            </div>
+          ) : (
+            <div className="assist-empty">
+              <Sparkles />
+              <span>{autoEnabled ? 'Подсказки появятся, когда кандидат закончит мысль' : 'Нажмите «Предложить вопросы»'}</span>
+            </div>
+          )
+        )}
+
+        {visibleSuggestions.length > 0 && !isGenerating && (
+          <div className="suggestions">
+            {visibleSuggestions.map((s) => {
+              const isEditing = editingId === s.id;
+              const isGuide = s.kind === 'guide';
+              const isAsked = s.status === 'asked';
+              const isBusy = isSubmittingPatch === s.id;
+
+              return (
+                <article
+                  key={s.id}
+                  className={`suggestion${isGuide ? ' suggestion-guide' : ''}${isAsked ? ' suggestion-asked' : ''}`}
+                >
+                  <div className="suggestion-head">
+                    <span className="inline-group">
+                      {getKindBadge(s.kind)}
+                      {Boolean(s.is_stale) && !isAsked && <span className="chip chip-warning">Ответ изменился</span>}
+                    </span>
+                    {isAsked && (
+                      <span className="chip chip-success">
+                        <CheckCircle2 />
+                        <span>Задан</span>
                       </span>
                     )}
                   </div>
 
-                  {isAsked && (
-                    <span className="px-2 py-0.5 text-[10px] font-bold text-emerald-300 bg-emerald-950/80 border border-emerald-700/60 rounded flex items-center space-x-1">
-                      <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                      <span>Задан</span>
-                    </span>
-                  )}
-                </div>
-
-                {/* Suggested Question Text */}
-                {isEditing ? (
-                  <div className="space-y-1.5">
-                    <textarea
-                      value={editingText}
-                      onChange={(e) => setEditingText(e.target.value)}
-                      rows={2}
-                      className="w-full text-xs p-2 rounded bg-slate-900 border border-indigo-600 text-slate-100 focus:outline-none"
-                      placeholder="Отредактируйте формулировку вопроса..."
-                    />
-                    <div className="flex justify-end space-x-1.5">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEditingId(null);
-                          setEditingText('');
-                        }}
-                        className="px-2 py-0.5 text-[10px] text-slate-400 hover:text-slate-200"
-                      >
-                        Отмена
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleDecision(s, 'asked', editingText)}
-                        disabled={isSubmittingPatch === s.id || !editingText.trim()}
-                        className="px-2.5 py-0.5 text-[10px] font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded flex items-center space-x-1"
-                      >
-                        <Check className="w-3 h-3" />
-                        <span>Подтвердить</span>
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <div>
-                    <p className="text-xs font-medium text-slate-100 leading-relaxed">
-                      {s.asked_text || s.question_text || s.suggested_text}
-                    </p>
-                    {s.asked_text && s.asked_text !== (s.question_text || s.suggested_text) && (
-                      <p className="text-[10px] text-slate-400 italic mt-0.5">
-                        Исходный: «{s.question_text || s.suggested_text}»
-                      </p>
-                    )}
-                  </div>
-                )}
-
-                {/* Purpose / Rationale */}
-                {(s.purpose || s.rationale) && (
-                  <p className="text-[11px] text-slate-400 leading-normal">
-                    {s.purpose || s.rationale}
-                  </p>
-                )}
-
-                {/* Evidence Quotes / Source Refs with Clickable Transcript Jump */}
-                {((s.source_refs && s.source_refs.length > 0) || s.evidence_quote) && (
-                  <div className="space-y-1">
-                    {s.source_refs && s.source_refs.length > 0 ? (
-                      s.source_refs.map((ref, idx) => {
-                        const segId = ref.segment_id || (ref as any).turn_id;
-                        const quoteText = ref.exact_quote || (ref as any).quote;
-                        if (!quoteText) return null;
-                        return (
-                          <div
-                            key={idx}
-                            onClick={() => {
-                              if (segId) {
-                                onLocateSegment(segId);
-                              }
-                            }}
-                            className={`group p-2 rounded border text-[11px] flex items-start space-x-1.5 transition cursor-pointer ${
-                              segId
-                                ? 'bg-slate-900/80 hover:bg-indigo-950/40 border-slate-800 hover:border-indigo-600 text-slate-300'
-                                : 'bg-slate-900/50 border-slate-800 text-slate-400'
-                            }`}
-                            title={segId ? 'Перейти к цитате в стенограмме' : undefined}
-                          >
-                            <Quote className="w-3 h-3 text-indigo-400 shrink-0 mt-0.5" />
-                            <div className="flex-1 italic leading-snug">«{quoteText}»</div>
-                            {segId && (
-                              <ExternalLink className="w-2.5 h-2.5 text-indigo-400 group-hover:text-amber-300 shrink-0 mt-0.5" />
-                            )}
-                          </div>
-                        );
-                      })
-                    ) : s.evidence_quote ? (
-                      <div
-                        onClick={() => {
-                          if (s.evidence_segment_id) {
-                            onLocateSegment(s.evidence_segment_id);
-                          }
-                        }}
-                        className={`group p-2 rounded border text-[11px] flex items-start space-x-1.5 transition cursor-pointer ${
-                          s.evidence_segment_id
-                            ? 'bg-slate-900/80 hover:bg-indigo-950/40 border-slate-800 hover:border-indigo-600 text-slate-300'
-                            : 'bg-slate-900/50 border-slate-800 text-slate-400'
-                        }`}
-                        title={s.evidence_segment_id ? 'Перейти к цитате в стенограмме' : undefined}
-                      >
-                        <Quote className="w-3 h-3 text-indigo-400 shrink-0 mt-0.5" />
-                        <div className="flex-1 italic leading-snug">«{s.evidence_quote}»</div>
-                        {s.evidence_segment_id && (
-                          <ExternalLink className="w-2.5 h-2.5 text-indigo-400 group-hover:text-amber-300 shrink-0 mt-0.5" />
-                        )}
+                  {isEditing ? (
+                    <>
+                      <textarea
+                        value={editingText}
+                        onChange={(e) => setEditingText(e.target.value)}
+                        rows={3}
+                        autoFocus
+                        className="suggestion-edit"
+                        placeholder="Как вы сформулировали вопрос"
+                      />
+                      <div className="suggestion-foot">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingId(null);
+                            setEditingText('');
+                          }}
+                          className="btn btn-ghost btn-sm"
+                        >
+                          Отмена
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDecision(s, 'asked', editingText)}
+                          disabled={isBusy || !editingText.trim()}
+                          className="btn btn-primary btn-sm"
+                        >
+                          <Check />
+                          <span>Сохранить как заданный</span>
+                        </button>
                       </div>
-                    ) : null}
-                  </div>
-                )}
+                    </>
+                  ) : (
+                    <>
+                      <p className="suggestion-text">{s.asked_text || s.question_text || s.suggested_text}</p>
+                      {s.asked_text && s.asked_text !== (s.question_text || s.suggested_text) && (
+                        <p className="suggestion-purpose">Исходная формулировка: «{s.question_text || s.suggested_text}»</p>
+                      )}
+                    </>
+                  )}
 
-                {/* Actions when not asked yet */}
-                {!isAsked && !isEditing && (
-                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-800/80">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setEditingId(s.id);
-                        setEditingText(s.question_text || s.suggested_text || '');
-                      }}
-                      className="flex items-center space-x-1 text-[10px] text-slate-400 hover:text-indigo-300 transition"
-                      title="Отредактировать формулировку перед подтверждением"
-                    >
-                      <Edit2 className="w-2.5 h-2.5" />
-                      <span>С правкой</span>
-                    </button>
+                  {!isAsked && (s.purpose || s.rationale) && <p className="suggestion-purpose">{s.purpose || s.rationale}</p>}
 
-                    <div className="flex items-center space-x-1.5">
+                  {!isAsked &&
+                    (s.source_refs && s.source_refs.length > 0
+                      ? s.source_refs.map((ref, idx) => {
+                          const segId = ref.segment_id || (ref as any).turn_id;
+                          const quoteText = ref.exact_quote || (ref as any).quote;
+                          return quoteText ? renderQuote(quoteText, segId, idx) : null;
+                        })
+                      : s.evidence_quote
+                      ? renderQuote(s.evidence_quote, s.evidence_segment_id, 'evidence')
+                      : null)}
+
+                  {!isAsked && !isEditing && (
+                    <div className="suggestion-foot">
                       <button
                         type="button"
-                        onClick={() => handleDecision(s, 'dismissed')}
-                        disabled={isSubmittingPatch === s.id}
-                        className="px-2 py-1 text-[10px] font-semibold text-slate-400 hover:text-rose-300 hover:bg-rose-950/40 border border-slate-700/60 rounded transition flex items-center space-x-1"
-                        title="Отклонить эту подсказку"
+                        onClick={() => {
+                          setEditingId(s.id);
+                          setEditingText(s.question_text || s.suggested_text || '');
+                        }}
+                        className="btn btn-ghost btn-sm"
+                        title="Задали вопрос другими словами — сохраните вашу формулировку"
                       >
-                        <X className="w-2.5 h-2.5" />
-                        <span>Не подходит</span>
+                        <Edit2 />
+                        <span>Задал иначе</span>
                       </button>
-
-                      <button
-                        type="button"
-                        onClick={() => handleDecision(s, 'asked')}
-                        disabled={isSubmittingPatch === s.id}
-                        className="px-2.5 py-1 text-[10px] font-semibold bg-emerald-600/90 hover:bg-emerald-500 text-white rounded shadow-sm transition flex items-center space-x-1"
-                        title="Отметить вопрос как заданный кандидату"
-                      >
-                        {isSubmittingPatch === s.id ? (
-                          <Loader2 className="w-2.5 h-2.5 animate-spin" />
-                        ) : (
-                          <Check className="w-2.5 h-2.5" />
-                        )}
-                        <span>Задан</span>
-                      </button>
+                      <span className="inline-group">
+                        <button
+                          type="button"
+                          onClick={() => handleDecision(s, 'dismissed')}
+                          disabled={isBusy}
+                          className="btn btn-ghost btn-sm"
+                          title="Скрыть подсказку"
+                        >
+                          <X />
+                          <span>Скрыть</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDecision(s, 'asked')}
+                          disabled={isBusy}
+                          className="btn btn-secondary btn-sm"
+                          title="Отметить, что вы задали этот вопрос"
+                        >
+                          {isBusy ? <Loader2 className="spin" /> : <Check />}
+                          <span>Задал</span>
+                        </button>
+                      </span>
                     </div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </section>
   );
 };

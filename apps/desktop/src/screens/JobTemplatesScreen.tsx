@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { pluralRu } from '../utils/plural';
 import { JobTemplate, PlannedQuestion, RubricCriterion } from '../types';
 import {
   listJobTemplates,
@@ -541,7 +542,7 @@ export const JobTemplatesScreen: React.FC = () => {
                       </div>
                     </div>
 
-                    {tpl.is_archived && (
+                    {Boolean(tpl.is_archived) && (
                       <span className="px-1.5 py-0.5 text-[10px] font-semibold text-amber-300 bg-amber-950/60 border border-amber-800 rounded">
                         Архив
                       </span>
@@ -551,7 +552,7 @@ export const JobTemplatesScreen: React.FC = () => {
                   <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1 border-t border-slate-800/60">
                     <span>
                       {tpl.questions?.length || 0}{' '}
-                      {tpl.questions?.length === 1 ? 'вопрос' : 'вопросов'} • v{tpl.version}
+                      {pluralRu(tpl.questions?.length || 0, ['вопрос', 'вопроса', 'вопросов'])} • v{tpl.version}
                     </span>
 
                     <div className="flex items-center space-x-1 opacity-80 group-hover:opacity-100">
@@ -624,7 +625,7 @@ export const JobTemplatesScreen: React.FC = () => {
             <button
               onClick={handleSave}
               disabled={isSaving}
-              className="flex items-center space-x-2 px-5 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition shadow-lg shadow-indigo-600/30 disabled:opacity-50 cursor-pointer"
+              className="flex shrink-0 items-center space-x-2 px-5 py-2 text-xs font-semibold whitespace-nowrap bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition shadow-lg shadow-indigo-600/30 disabled:opacity-50 cursor-pointer"
             >
               <Save className="w-4 h-4" />
               <span>{isSaving ? 'Сохранение...' : editingTemplate.id ? 'Сохранить должность' : 'Создать должность'}</span>

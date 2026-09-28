@@ -314,7 +314,6 @@ describe('SettingsScreen Component', () => {
     const onNavigate = vi.fn();
     render(
       <Header
-        status="draft"
         currentScreen="home"
         onNavigate={onNavigate}
       />

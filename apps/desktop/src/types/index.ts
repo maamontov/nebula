@@ -87,6 +87,25 @@ export interface TranscriptSegment {
   parent_segment_id?: string | null;
 }
 
+/** Interviewer mark: "question N is being asked from `at_ms` on" (capture timeline). */
+export interface QuestionMark {
+  id: string;
+  question_id: string;
+  at_ms: number;
+  created_at: string;
+}
+
+export interface LiveInterviewState {
+  interview_id: string;
+  status: InterviewStatus;
+  transcript_segments: TranscriptSegment[];
+  assessment_proposals: AssessmentProposal[];
+  question_marks: QuestionMark[];
+  current_question_id: string | null;
+  segment_questions: Record<string, { question_id: string; is_ambiguous: boolean }>;
+  suggested_question: { question_id: string; segment_id: string; confidence: number } | null;
+}
+
 export interface EvidenceQuote {
   segment_id: string;
   exact_quote: string;

@@ -2865,6 +2865,102 @@ class Repository:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    # -------------------------------------------------------------
+    # Question Marks (interviewer: "asking question N from now on")
+    # -------------------------------------------------------------
+    def add_question_mark(self, interview_id: str, question_id: str, at_ms: int) -> dict[str, Any]:
+        mark = {
+            "id": f"qmark-{uuid.uuid4().hex[:12]}",
+            "interview_id": interview_id,
+            "question_id": question_id,
+            "at_ms": max(0, int(at_ms)),
+            "created_at": utc_now_iso(),
+        }
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO question_marks (id, interview_id, question_id, at_ms, created_at)
+                VALUES (:id, :interview_id, :question_id, :at_ms, :created_at)
+                """,
+                mark,
+            )
+            conn.execute(
+                "INSERT INTO audit_events (id, interview_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    f"audit-{uuid.uuid4().hex[:12]}",
+                    interview_id,
+                    "QUESTION_MARKED",
+                    json.dumps({"question_id": question_id, "at_ms": mark["at_ms"]}),
+                    mark["created_at"],
+                ),
+            )
+        return mark
+
+    def get_question_marks(self, interview_id: str) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM question_marks WHERE interview_id = ? ORDER BY at_ms ASC, created_at ASC",
+                (interview_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def refresh_associations(
+        self,
+        interview_id: str,
+        questions: list[dict[str, Any]],
+        revision_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Associates segments that have no association yet (answers that arrived after a previous
+        evaluation must not be lost). When the interviewer marked questions, automated links are
+        also re-derived from the marks; manual links are never touched. Returns stored associations.
+        """
+        from backend.core.matcher import QuestionMatcher
+
+        with self.db.transaction() as conn:
+            inv = conn.execute(
+                "SELECT active_transcript_revision_id FROM interviews WHERE id = ?", (interview_id,)
+            ).fetchone()
+        rev = revision_id or (inv["active_transcript_revision_id"] if inv and inv["active_transcript_revision_id"] else "trans-rev-1")
+        segments = self.get_transcript_segments(interview_id, revision_id=rev)
+        existing = self.get_associations(interview_id, revision_id=rev)
+        if not questions or not segments:
+            return existing
+
+        existing_by_seg = {a["segment_id"]: a for a in existing}
+        marks = self.get_question_marks(interview_id)
+        if not marks and all(seg["id"] in existing_by_seg for seg in segments):
+            return existing
+        results = QuestionMatcher().associate_segments(
+            questions,
+            segments,
+            existing_associations=existing,
+            question_marks=marks,
+        )
+        for r in results:
+            prev = existing_by_seg.get(r.segment_id)
+            if prev and (prev.get("is_manually_adjusted") or not marks):
+                continue
+            if (
+                prev
+                and prev.get("question_id") == r.question_id
+                and bool(prev.get("is_ambiguous")) == r.is_ambiguous
+                and (prev.get("notes") or "") == (r.notes or "")
+            ):
+                continue
+            self.save_association(
+                assoc_id=f"assoc-{uuid.uuid4().hex[:8]}",
+                interview_id=interview_id,
+                question_id=r.question_id,
+                segment_id=r.segment_id,
+                confidence=r.confidence,
+                is_ambiguous=r.is_ambiguous,
+                is_manually_adjusted=False,
+                notes=r.notes,
+                revision_id=rev,
+            )
+        return self.get_associations(interview_id, revision_id=rev)
+
     def reassociate_segment(
         self,
         interview_id: str,

@@ -1,5 +1,5 @@
 import { isTauri, invoke } from '@tauri-apps/api/core';
-import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus, SpeakerRole, CaptureMode, TrackManifest, JobTemplate, PaginatedInterviews, ReportRevisionSummary, FollowUpSuggestion, FollowUpsStateResponse, GenerateFollowUpsRequest, PatchFollowUpSuggestionRequest, FollowUpMode, JobStatusResponse, AiSettingsResponse, UpdateAiSettingsRequest, TestAiSettingsRequest, TestAiSettingsResponse } from '../types';
+import { AudioDevice, AudioLevels, InterviewDetails, InterviewPlan, AssessmentProposal, TranscriptSegment, InterviewStatus, SpeakerRole, CaptureMode, TrackManifest, JobTemplate, PaginatedInterviews, ReportRevisionSummary, FollowUpSuggestion, FollowUpsStateResponse, GenerateFollowUpsRequest, PatchFollowUpSuggestionRequest, FollowUpMode, JobStatusResponse, LiveInterviewState, QuestionMark, AiSettingsResponse, UpdateAiSettingsRequest, TestAiSettingsRequest, TestAiSettingsResponse } from '../types';
 
 const API_BASE = 'http://127.0.0.1:17843/api/v1';
 
@@ -495,6 +495,31 @@ export async function resumeInterview(interviewId: string): Promise<{ status: st
     method: 'POST',
   });
   if (!res.ok) throw new Error(`Resume interview error: ${res.statusText}`);
+  return res.json();
+}
+
+/** Lightweight polling payload for the live screen: transcript, proposals, question marks. */
+export async function getLiveState(interviewId: string): Promise<LiveInterviewState> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/live-state`);
+  if (!res.ok) throw new Error(`Live state error: ${res.statusText}`);
+  return res.json();
+}
+
+/** Marks that the interviewer starts asking `questionId` at `atMs` on the capture timeline. */
+export async function addQuestionMark(
+  interviewId: string,
+  questionId: string,
+  atMs: number
+): Promise<{ mark: QuestionMark; question_marks: QuestionMark[]; created: boolean }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/question-marks`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question_id: questionId, at_ms: Math.max(0, Math.round(atMs)) }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Question mark error: ${res.statusText}`);
+  }
   return res.json();
 }
 

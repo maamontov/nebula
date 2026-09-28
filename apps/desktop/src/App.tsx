@@ -22,7 +22,6 @@ export const App: React.FC = () => {
   const [screen, setScreen] = useState<Screen>('home');
   const [interviewId, setInterviewId] = useState<string>('');
   const [plan, setPlan] = useState<InterviewPlan | null>(null);
-  const [interviewStatus, setInterviewStatus] = useState<InterviewStatus>('draft');
   const [currentCandidateName, setCurrentCandidateName] = useState<string>('');
   const [currentRole, setCurrentRole] = useState<string>('');
 
@@ -128,8 +127,6 @@ export const App: React.FC = () => {
             const data = await getInterview(activeSessionId);
             if (data && data.interview) {
               setInterviewId(activeSessionId);
-              const restoredStatus = sessionInfo.is_paused ? 'paused' : data.interview.status;
-              setInterviewStatus(restoredStatus);
               const mode = data.interview.capture_mode as CaptureMode | undefined;
               const candName = data.interview.candidate_name || data.plan?.candidate_name || '';
               const candRole = data.interview.role || data.plan?.role || '';
@@ -167,20 +164,8 @@ export const App: React.FC = () => {
       });
   }, []);
 
-  const getStatus = (): InterviewStatus => {
-    if (activeRecordingSession && screen === 'live') {
-      return activeRecordingSession.isPaused ? 'paused' : interviewStatus === 'paused' ? 'paused' : 'recording';
-    }
-    switch (screen) {
-      case 'setup':
-        return 'draft';
-      case 'live':
-        return 'recording';
-      case 'review':
-        return interviewStatus;
-      default:
-        return 'draft';
-    }
+  const handlePauseChange = (isPaused: boolean) => {
+    setActiveRecordingSession((current) => (current ? { ...current, isPaused } : current));
   };
 
   const handleNavigate = (targetScreen: 'home' | 'templates' | 'live' | 'settings') => {
@@ -209,7 +194,6 @@ export const App: React.FC = () => {
     setPlan(null);
     setCurrentCandidateName('');
     setCurrentRole('');
-    setInterviewStatus('draft');
     setScreen('setup');
   };
 
@@ -237,7 +221,6 @@ export const App: React.FC = () => {
         setPlan(data.plan);
       }
       const actualStatus = data.interview?.status || status;
-      setInterviewStatus(actualStatus);
 
       const candName = data.interview?.candidate_name || data.plan?.candidate_name || '';
       const candRole = data.interview?.role || data.plan?.role || '';
@@ -266,7 +249,7 @@ export const App: React.FC = () => {
       }
     } catch (err: any) {
       console.error('Failed to load interview:', err);
-      alert(`Не удалось открыть собеседование: ${err.message || err}`);
+      setWarningModal(`Не удалось открыть собеседование: ${err.message || err}`);
     }
   };
 
@@ -279,7 +262,6 @@ export const App: React.FC = () => {
   ) => {
     setInterviewId(id);
     setPlan(newPlan);
-    setInterviewStatus('recording');
     const resolvedCandName = startedCandidateName || newPlan.candidate_name || currentCandidateName || 'Кандидат';
     const resolvedRole = startedRole || newPlan.role || currentRole || 'Должность не указана';
     setCurrentCandidateName(resolvedCandName);
@@ -299,7 +281,6 @@ export const App: React.FC = () => {
   const handleFinishSession = (id: string) => {
     setActiveRecordingSession(null);
     setInterviewId(id);
-    setInterviewStatus('review');
     setScreen('review');
   };
 
@@ -361,20 +342,10 @@ export const App: React.FC = () => {
   return (
     <div className="app-root min-h-screen flex flex-col select-none">
       <Header
-        status={getStatus()}
-        candidateName={
-          screen === 'live' || screen === 'review' || screen === 'setup'
-            ? currentCandidateName || plan?.candidate_name || (screen === 'setup' ? 'Подготовка интервью' : 'Кандидат')
-            : undefined
-        }
-        role={
-          screen === 'live' || screen === 'review' || screen === 'setup'
-            ? currentRole || plan?.role || (screen === 'setup' ? 'Выбор должности' : 'Позиция не указана')
-            : undefined
-        }
         isCapturing={Boolean(activeRecordingSession)}
         captureMode={activeRecordingSession?.captureMode}
         currentScreen={screen}
+        showTopbar={screen !== 'live'}
         onNavigate={handleNavigate}
         activeRecordingSession={activeRecordingSession}
         theme={theme}
@@ -411,7 +382,9 @@ export const App: React.FC = () => {
               plan={activeRecordingSession.plan}
               candidateName={activeRecordingSession.candidateName}
               role={activeRecordingSession.role}
+              captureMode={activeRecordingSession.captureMode}
               onFinishSession={handleFinishSession}
+              onPauseChange={handlePauseChange}
             />
           </div>
         )}

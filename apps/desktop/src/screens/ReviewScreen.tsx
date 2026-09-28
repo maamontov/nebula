@@ -1672,7 +1672,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                       </div>
                     )}
 
-                    {prop?.is_rejected && (
+                    {prop && Boolean(prop.is_rejected) && (
                       <div className="p-3 bg-rose-950/60 border border-rose-800 rounded-lg text-rose-200 text-xs space-y-1.5">
                         <div className="font-bold flex items-center space-x-1.5 text-rose-300">
                           <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
@@ -1860,7 +1860,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                     {!isFinalized && (
                       <div className="pt-2">
                         <label className="block text-[11px] font-medium text-slate-400 mb-1">
-                          Комментарий проверяющего (Human Note):
+                          Комментарий проверяющего:
                         </label>
                         <div className="flex items-center space-x-2">
                           <input

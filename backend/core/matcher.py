@@ -5,6 +5,7 @@ Adheres to docs/implementation-plan.md Sections 7, 10, and 11:
 - Identifies clarification / follow-up queries.
 - Detects interruptions and track overlaps.
 - Explicitly flags ambiguities instead of guessing (Principle: Ambiguity is never hidden).
+- Treats interviewer question marks ("I am asking question N now") as authoritative boundaries.
 """
 
 import re
@@ -19,6 +20,19 @@ class InterruptionEvent:
     overlap_start_ms: int
     overlap_end_ms: int
     overlap_duration_ms: int
+
+
+# An interviewer often starts asking a question a few seconds before pressing "next question".
+# Interviewer speech that starts this long before a mark still belongs to the marked question.
+# Интервьюер часто начинает говорить чуть раньше, чем отмечает переход к вопросу.
+MARK_LEAD_MS = 5000
+
+
+@dataclass
+class QuestionSwitchHint:
+    question_id: str
+    segment_id: str
+    confidence: float
 
 
 @dataclass
@@ -99,16 +113,104 @@ class QuestionMatcher:
         # Normalize with min floor
         return min(1.0, score * 2.5)
 
+    @staticmethod
+    def _normalize_marks(
+        question_marks: list[dict[str, Any]] | None, known_question_ids: set[str]
+    ) -> list[tuple[int, str]]:
+        marks = [
+            (int(m["at_ms"]), str(m["question_id"]))
+            for m in (question_marks or [])
+            if m.get("question_id") in known_question_ids and m.get("at_ms") is not None
+        ]
+        marks.sort(key=lambda m: m[0])
+        return marks
+
+    @staticmethod
+    def _marked_question(
+        seg: dict[str, Any], role: str, marks: list[tuple[int, str]]
+    ) -> str | None:
+        """Returns the question the interviewer had marked as current when the segment started."""
+        if not marks:
+            return None
+        start = int(seg.get("start_time_ms", 0))
+        result: str | None = None
+        prev_at = None
+        for at_ms, qid in marks:
+            boundary = at_ms
+            if role == "interviewer":
+                # Never let the lead window cross the previous mark.
+                boundary = max(at_ms - MARK_LEAD_MS, prev_at if prev_at is not None else at_ms - MARK_LEAD_MS)
+            if start >= boundary:
+                result = qid
+            prev_at = at_ms
+        return result
+
+    def suggest_question_switch(
+        self,
+        questions: list[dict[str, Any]],
+        segments: list[dict[str, Any]],
+        question_marks: list[dict[str, Any]] | None,
+        min_confidence: float = 0.3,
+    ) -> QuestionSwitchHint | None:
+        """
+        Looks at interviewer speech after the latest mark and suggests switching the current
+        question when the interviewer seems to be asking a different, not yet marked question.
+        This is only a hint for the UI: it never changes associations by itself.
+        """
+        known_ids = {q.get("id") or q.get("question_id") for q in questions}
+        marks = self._normalize_marks(question_marks, known_ids)
+        if not marks:
+            return None
+        last_at, current_qid = marks[-1]
+        marked_ids = {qid for _, qid in marks}
+
+        interviewer_after = [
+            s for s in segments
+            if int(s.get("start_time_ms", 0)) >= last_at
+            and (
+                str(s.get("speaker_role") or "").lower() == "interviewer"
+                or (
+                    str(s.get("speaker_role") or "").lower() in ("", "unknown")
+                    and str(s.get("track_id", "")).lower() == "interviewer"
+                )
+            )
+        ]
+        if not interviewer_after:
+            return None
+
+        latest = max(interviewer_after, key=lambda s: int(s.get("start_time_ms", 0)))
+        text = str(latest.get("text") or "")
+        by_id = {(q.get("id") or q.get("question_id")): q for q in questions}
+        current_q = by_id.get(current_qid) or {}
+        current_rel = self.calculate_relevance(
+            text,
+            current_q.get("text") or current_q.get("prompt") or "",
+            current_q.get("criteria") or [],
+        )
+
+        best: tuple[str, float] | None = None
+        for qid, q in by_id.items():
+            if qid == current_qid or qid in marked_ids:
+                continue
+            rel = self.calculate_relevance(text, q.get("text") or q.get("prompt") or "", q.get("criteria") or [])
+            if rel > min_confidence and rel > current_rel and (best is None or rel > best[1]):
+                best = (qid, rel)
+        if not best:
+            return None
+        return QuestionSwitchHint(question_id=best[0], segment_id=str(latest["id"]), confidence=round(best[1], 2))
+
     def associate_segments(
         self,
         questions: list[dict[str, Any]],
         segments: list[dict[str, Any]],
         existing_associations: list[dict[str, Any]] | None = None,
+        question_marks: list[dict[str, Any]] | None = None,
     ) -> list[SegmentAssociation]:
         """
         Associates speech segments with planned questions.
         Handles:
         1. Preservation of manual adjustments (never overwritten by automated matcher).
+        1a. Interviewer question marks: speech after a mark belongs to the marked question.
         2. Contextual continuity from interviewer questions.
         3. Clarifications (short follow-ups from interviewer).
         4. Answers are attributed only to questions the interviewer has already asked.
@@ -124,6 +226,9 @@ class QuestionMatcher:
             existing_by_seg = {a["segment_id"]: a for a in existing_associations}
 
         interruptions = self.detect_interruptions(segments)
+        marks = self._normalize_marks(
+            question_marks, {q.get("id") or q.get("question_id") for q in questions}
+        )
         active_question_id = questions[0].get("id") or questions[0].get("question_id")
         # Questions the interviewer has actually asked so far in the transcript.
         # A candidate answer can only belong to a question that was already asked: otherwise the
@@ -172,6 +277,31 @@ class QuestionMatcher:
                 ),
                 None,
             )
+
+            marked_qid = self._marked_question(seg, role, marks)
+            if marked_qid:
+                # The interviewer explicitly marked which question is being asked:
+                # this is authoritative and never overridden by keyword matching.
+                # Интервьюер явно отметил текущий вопрос — это важнее совпадения слов.
+                active_question_id = marked_qid
+                asked_question_ids.add(marked_qid)
+                is_unknown = role == "unknown"
+                associations.append(
+                    SegmentAssociation(
+                        segment_id=seg_id,
+                        question_id=marked_qid,
+                        confidence=0.0 if is_unknown else 1.0,
+                        is_ambiguous=is_unknown,
+                        is_clarification=False,
+                        interruption=seg_int,
+                        notes=(
+                            "Общая дорожка (роль не назначена)"
+                            if is_unknown
+                            else "По отметке интервьюера"
+                        ),
+                    )
+                )
+                continue
 
             if role == "interviewer":
                 # Check if interviewer asked a new question or clarification

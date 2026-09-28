@@ -1,5 +1,5 @@
 import React from 'react';
-import { InterviewStatus, CaptureMode } from '../types';
+import { CaptureMode } from '../types';
 import { AudioMeters } from './AudioMeters';
 import {
   ArrowRight,
@@ -7,7 +7,6 @@ import {
   FileSpreadsheet,
   Moon,
   Settings,
-  ShieldCheck,
   Sparkles,
   Sun,
 } from 'lucide-react';
@@ -15,9 +14,6 @@ import {
 type Theme = 'light' | 'dark';
 
 interface HeaderProps {
-  status: InterviewStatus;
-  candidateName?: string;
-  role?: string;
   isCapturing?: boolean;
   captureMode?: CaptureMode;
   currentScreen?: 'home' | 'templates' | 'setup' | 'live' | 'review' | 'settings';
@@ -27,7 +23,10 @@ interface HeaderProps {
     candidateName: string;
     role: string;
     captureMode?: CaptureMode;
+    isPaused?: boolean;
   } | null;
+  /** The live screen renders its own session bar, so the top bar is hidden there. */
+  showTopbar?: boolean;
   theme?: Theme;
   onToggleTheme?: () => void;
 }
@@ -52,9 +51,6 @@ const NavButton: React.FC<NavButtonProps> = ({ label, active, onClick, children 
 );
 
 export const Header: React.FC<HeaderProps> = ({
-  status,
-  candidateName = 'Новое собеседование',
-  role = 'Позиция не выбрана',
   isCapturing = false,
   captureMode,
   currentScreen = 'home',
@@ -62,33 +58,9 @@ export const Header: React.FC<HeaderProps> = ({
   activeRecordingSession = null,
   theme = 'light',
   onToggleTheme,
+  showTopbar = true,
 }) => {
   const isInterviewScreen = currentScreen === 'live' || currentScreen === 'review' || currentScreen === 'setup';
-
-  const getStatusBadge = () => {
-    switch (status) {
-      case 'recording':
-        return (
-          <span className="status-badge status-recording">
-            <span className="status-dot recording-pulse" />
-            <span>Запись</span>
-          </span>
-        );
-      case 'paused':
-        return <span className="status-badge status-paused">Пауза</span>;
-      case 'review':
-        return <span className="status-badge status-review">Проверка</span>;
-      case 'finalized':
-        return (
-          <span className="status-badge status-finalized">
-            <ShieldCheck className="h-3.5 w-3.5" />
-            <span>Завершено</span>
-          </span>
-        );
-      default:
-        return <span className="status-badge status-draft">Подготовка</span>;
-    }
-  };
 
   return (
     <>
@@ -129,25 +101,16 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
       </aside>
 
+      {showTopbar && (
       <header className="app-topbar">
-        <div className="topbar-context">
-          {isInterviewScreen && (
-            <div className="interview-context">
-              <div className="interview-context-title">
-                <span className="interview-context-name">{candidateName}</span>
-                {getStatusBadge()}
-              </div>
-              <span className="interview-context-role">{role}</span>
-            </div>
-          )}
-        </div>
+        <div className="topbar-context" />
 
         <div className="topbar-actions">
           {activeRecordingSession && currentScreen !== 'live' && (
-            <div className="recording-return-banner">
-              <span className="status-dot recording-pulse" aria-hidden="true" />
+            <div className={`recording-return-banner${activeRecordingSession.isPaused ? ' recording-return-paused' : ''}`}>
+              <span className={`status-dot${activeRecordingSession.isPaused ? '' : ' recording-pulse'}`} aria-hidden="true" />
               <span className="recording-return-copy">
-                Идёт запись: <strong>{activeRecordingSession.candidateName}</strong>
+                {activeRecordingSession.isPaused ? 'Запись на паузе' : 'Идёт запись'}: <strong>{activeRecordingSession.candidateName}</strong>
               </span>
               <button type="button" onClick={() => onNavigate?.('live')} className="recording-return-button">
                 <span>Вернуться к записи</span>
@@ -156,7 +119,9 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           )}
 
-          <AudioMeters isCapturing={isCapturing} captureMode={captureMode || activeRecordingSession?.captureMode} />
+          {isCapturing && (
+            <AudioMeters isCapturing={isCapturing} captureMode={captureMode || activeRecordingSession?.captureMode} />
+          )}
 
           <button
             type="button"
@@ -170,6 +135,7 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
         </div>
       </header>
+      )}
     </>
   );
 };

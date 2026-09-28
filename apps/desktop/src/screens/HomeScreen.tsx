@@ -280,7 +280,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       <div className="home-heading flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-100 flex items-center space-x-3">
-            <span>Собеседования</span>
+            <span>Интервью</span>
             <span className="text-xs font-normal text-slate-400 px-2.5 py-0.5 bg-slate-800/80 rounded-full border border-slate-700">
               Всего: {total}
             </span>
@@ -406,7 +406,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               <Briefcase className="w-6 h-6" />
             </div>
             <div>
-              <h3 className="text-base font-semibold text-slate-200">Собеседования не найдены</h3>
+              <h3 className="text-base font-semibold text-slate-200">Интервью не найдены</h3>
               <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
                 {searchQuery || roleFilter || statusFilter || dateFilter
                   ? 'Попробуйте изменить параметры поиска или фильтры.'

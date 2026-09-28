@@ -51,7 +51,6 @@ from backend.core.followup_generator import (
     format_followup_prompt,
     validate_followup_response,
 )
-from backend.core.matcher import QuestionMatcher
 from backend.core.profiles import (
     get_default_llm_model,
     get_default_provider,
@@ -1006,9 +1005,11 @@ class PipelineWorker:
             else:
                 rubric_description = "Technical depth & correctness"
 
-        # 2. Fetch transcript segments and associations strictly for this revision
+        # 2. Fetch transcript segments and re-associate them strictly for this revision.
+        # Associations are refreshed every time (manual links preserved) so answer segments that
+        # arrived after a previous evaluation and interviewer question marks are both honoured.
         all_segments = self.repo.get_transcript_segments(interview_id, revision_id=trans_rev)
-        assocs = self.repo.get_associations(interview_id, revision_id=trans_rev)
+        assocs = self.repo.refresh_associations(interview_id, questions, revision_id=trans_rev)
 
         # Identify candidate speech segments associated with this question (strictly exclude interviewer/unknown)
         associated_seg_ids = {a["segment_id"] for a in assocs if a.get("question_id") == question_id}
@@ -1016,31 +1017,6 @@ class PipelineWorker:
             s for s in all_segments
             if s["id"] in associated_seg_ids and is_candidate_segment(s)
         ]
-
-        # If no associations for this question, run QuestionMatcher across all plan questions
-        if not candidate_segments_data and questions and all_segments:
-            matcher = QuestionMatcher()
-            match_results = matcher.associate_segments(questions, all_segments, existing_associations=assocs)
-            for r in match_results:
-                assoc_id = f"assoc-{uuid.uuid4().hex[:8]}"
-                self.repo.save_association(
-                    assoc_id=assoc_id,
-                    interview_id=interview_id,
-                    question_id=r.question_id,
-                    segment_id=r.segment_id,
-                    confidence=r.confidence,
-                    is_ambiguous=r.is_ambiguous,
-                    is_manually_adjusted=False,
-                    notes=r.notes,
-                    revision_id=trans_rev,
-                )
-            assocs = self.repo.get_associations(interview_id, revision_id=trans_rev)
-            associated_seg_ids = {a["segment_id"] for a in assocs if a.get("question_id") == question_id}
-            candidate_segments_data = [
-                s for s in all_segments
-                if s["id"] in associated_seg_ids and is_candidate_segment(s)
-            ]
-
 
         first_crit_id = criteria[0]["id"] if criteria else "criterion-core"
 

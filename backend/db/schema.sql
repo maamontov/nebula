@@ -190,6 +190,18 @@ CREATE INDEX IF NOT EXISTS idx_assoc_interview_question ON question_associations
 CREATE INDEX IF NOT EXISTS idx_report_revisions ON report_revisions(interview_id, revision_number);
 CREATE INDEX IF NOT EXISTS idx_job_templates_archived ON job_templates(is_archived);
 
+-- Interviewer marks "question N is being asked from this moment" on the capture timeline.
+-- They are authoritative boundaries for question-answer association.
+CREATE TABLE IF NOT EXISTS question_marks (
+    id TEXT PRIMARY KEY,
+    interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    at_ms INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_question_marks_interview ON question_marks(interview_id, at_ms);
+
 CREATE TABLE IF NOT EXISTS audio_chunks (
     interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
     track_id TEXT NOT NULL,

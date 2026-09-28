@@ -303,6 +303,12 @@ class IngestAudioChunkRequest(BaseModel):
     payload_hex: str
 
 
+class QuestionMarkRequest(BaseModel):
+    question_id: str
+    # Position on the capture timeline (active recording time, pauses excluded).
+    at_ms: int = Field(ge=0)
+
+
 class StopInterviewRequest(BaseModel):
     manifests: list[TrackManifest] = Field(default_factory=list)
 
@@ -719,6 +725,7 @@ async def get_interview_endpoint(
         "human_assessments": human_assessments,
         "scoring": scoring,
         "asked_followups": repo.get_asked_followup_history(interview_id),
+        "question_marks": repo.get_question_marks(interview_id),
     }
 
 
@@ -1117,6 +1124,88 @@ async def resume_interview_endpoint(
         raise HTTPException(status_code=409, detail=str(e))
 
 
+def _live_question_state(
+    repo: Repository,
+    interview_id: str,
+    questions: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    marks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Current question, per-segment question links and a switch hint for the live screen."""
+    matcher = QuestionMatcher()
+    current_question_id = marks[-1]["question_id"] if marks else None
+    segment_questions: dict[str, dict[str, Any]] = {}
+    hint = None
+    if questions and segments:
+        assocs = repo.get_associations(interview_id)
+        for r in matcher.associate_segments(questions, segments, existing_associations=assocs, question_marks=marks):
+            segment_questions[r.segment_id] = {"question_id": r.question_id, "is_ambiguous": r.is_ambiguous}
+        found = matcher.suggest_question_switch(questions, segments, marks)
+        if found:
+            hint = {"question_id": found.question_id, "segment_id": found.segment_id, "confidence": found.confidence}
+    return {
+        "question_marks": marks,
+        "current_question_id": current_question_id,
+        "segment_questions": segment_questions,
+        "suggested_question": hint,
+    }
+
+
+@app.post("/api/v1/interviews/{interview_id}/question-marks")
+async def add_question_mark_endpoint(
+    interview_id: str,
+    payload: QuestionMarkRequest,
+    repo: Repository = Depends(get_repository),
+):
+    """The interviewer marks that a planned question is being asked from `at_ms` on."""
+    validate_safe_id(interview_id, "interview_id")
+    validate_safe_id(payload.question_id, "question_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if InterviewStatus(inv["status"]) not in (InterviewStatus.RECORDING, InterviewStatus.PAUSED):
+        raise HTTPException(status_code=409, detail="Question marks can only be set while recording")
+
+    plan = repo.get_latest_plan(interview_id)
+    questions = plan["payload"].get("questions", []) if plan else []
+    if payload.question_id not in {q.get("id") for q in questions}:
+        raise HTTPException(status_code=400, detail=f"Question '{payload.question_id}' not found in plan")
+
+    marks = repo.get_question_marks(interview_id)
+    if marks and marks[-1]["question_id"] == payload.question_id:
+        return {"mark": marks[-1], "question_marks": marks, "created": False}
+    if marks and payload.at_ms < marks[-1]["at_ms"]:
+        # The capture clock is monotonic; a smaller value means a stale client clock.
+        payload.at_ms = marks[-1]["at_ms"]
+
+    mark = repo.add_question_mark(interview_id, payload.question_id, payload.at_ms)
+    return {"mark": mark, "question_marks": repo.get_question_marks(interview_id), "created": True}
+
+
+@app.get("/api/v1/interviews/{interview_id}/live-state")
+async def get_live_state_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    """Lightweight polling payload for the live interview screen (no scoring computation)."""
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    rev = inv.get("active_transcript_revision_id") or "trans-rev-1"
+    segments = repo.get_transcript_segments(interview_id, revision_id=rev)
+    plan = repo.get_latest_plan(interview_id)
+    questions = plan["payload"].get("questions", []) if plan else []
+    marks = repo.get_question_marks(interview_id)
+    return {
+        "interview_id": interview_id,
+        "status": inv["status"],
+        "transcript_segments": segments,
+        "assessment_proposals": repo.get_assessment_proposals(interview_id),
+        **_live_question_state(repo, interview_id, questions, segments, marks),
+    }
+
+
 @app.post("/api/v1/interviews/{interview_id}/stop")
 async def stop_interview_endpoint(
     interview_id: str,
@@ -1332,21 +1421,13 @@ async def enqueue_job_endpoint(
         payload.payload.pop("candidate_text", None)
 
         all_segments = repo.get_transcript_segments(interview_id, revision_id=transcript_rev)
-        assocs = repo.get_associations(interview_id, revision_id=transcript_rev)
-
+        questions = (plan or {}).get("payload", {}).get("questions", []) if plan else []
+        assocs = repo.refresh_associations(interview_id, questions, revision_id=transcript_rev)
         associated_seg_ids = {a["segment_id"] for a in assocs if a.get("question_id") == q_id}
         candidate_segments = [
             s for s in all_segments
             if s["id"] in associated_seg_ids and is_candidate_segment(s)
         ]
-
-        if not candidate_segments and plan and "payload" in plan and all_segments:
-            questions = plan["payload"].get("questions", [])
-            if questions:
-                matcher = QuestionMatcher()
-                match_results = matcher.associate_segments(questions, all_segments, existing_associations=assocs)
-                matched_ids = {r.segment_id for r in match_results if r.question_id == q_id}
-                candidate_segments = [s for s in all_segments if s["id"] in matched_ids and is_candidate_segment(s)]
 
         candidate_fp = compute_candidate_fingerprint(candidate_segments, rubric_rev, transcript_rev)
         payload.payload["candidate_fingerprint"] = candidate_fp
@@ -1440,6 +1521,7 @@ async def get_followups_endpoint(
         role_title=inv.get("role") or "",
         active_rubric_revision_id=active_rub_rev,
         active_transcript_revision_id=active_trans_rev,
+        question_marks=repo.get_question_marks(interview_id),
     )
 
     state = repo.get_followup_state(
@@ -1565,6 +1647,7 @@ async def generate_followups_endpoint(
         role_title=inv.get("role") or "",
         active_rubric_revision_id=active_rub_rev,
         active_transcript_revision_id=active_trans_rev,
+        question_marks=repo.get_question_marks(interview_id),
     )
 
     if fu_context.is_context_too_large:
@@ -2212,30 +2295,9 @@ async def get_associations_endpoint(
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
 
-    assocs = repo.get_associations(interview_id)
     plan = repo.get_latest_plan(interview_id)
-    segments = repo.get_transcript_segments(interview_id)
-    if plan and segments:
-        associated_segment_ids = {a["segment_id"] for a in assocs}
-        unassociated = [s for s in segments if s["id"] not in associated_segment_ids]
-        if unassociated:
-            questions = plan.get("payload", {}).get("questions", [])
-            matcher = QuestionMatcher()
-            results = matcher.associate_segments(questions, segments, existing_associations=assocs)
-            for r in results:
-                if r.segment_id not in associated_segment_ids:
-                    assoc_id = f"assoc-{uuid.uuid4().hex[:8]}"
-                    repo.save_association(
-                        assoc_id=assoc_id,
-                        interview_id=interview_id,
-                        question_id=r.question_id,
-                        segment_id=r.segment_id,
-                        confidence=r.confidence,
-                        is_ambiguous=r.is_ambiguous,
-                        is_manually_adjusted=False,
-                        notes=r.notes,
-                    )
-            assocs = repo.get_associations(interview_id)
+    questions = plan.get("payload", {}).get("questions", []) if plan else []
+    assocs = repo.refresh_associations(interview_id, questions)
 
     return {"interview_id": interview_id, "associations": assocs}
 
