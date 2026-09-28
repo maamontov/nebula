@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { ReviewScreen } from '../ReviewScreen';
 import * as api from '../../services/api';
 
@@ -112,5 +112,37 @@ describe('ReviewScreen evaluation', () => {
       is_excluded: true,
       exclusion_reason: 'Не задавался',
     });
+  });
+
+  it('a criterion score is the single place to change the question score and saves exactly what was chosen', async () => {
+    vi.mocked(api.getInterviewJobsStatus).mockResolvedValue({ active_jobs: [] } as any);
+    await openQuestionsTab();
+
+    // q2 has an AI proposal of 4: the question score is shown read-only.
+    const cards = await screen.findAllByText('Балл вопроса');
+    const q2Card = cards[1].closest('.glass-panel') as HTMLElement;
+    expect(cards[1].parentElement).toHaveTextContent('4 / 5');
+
+    fireEvent.click(within(q2Card).getByRole('button', { name: '2' }));
+    expect(within(q2Card).getByText('Есть несохранённые изменения')).toBeInTheDocument();
+    expect(cards[1].parentElement).toHaveTextContent('2 / 5');
+
+    fireEvent.click(within(q2Card).getByRole('button', { name: /Подтвердить оценку/ }));
+    await waitFor(() => expect(api.reviewAssessment).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.reviewAssessment).mock.calls[0][1]).toBe('q2');
+    expect(vi.mocked(api.reviewAssessment).mock.calls[0][2]).toMatchObject({
+      scores: [{ criterion_id: 'c2', score: 2 }],
+    });
+  });
+
+  it('confirm button stays disabled until every criterion has a score', async () => {
+    vi.mocked(api.getInterviewJobsStatus).mockResolvedValue({ active_jobs: [] } as any);
+    await openQuestionsTab();
+    const q1Card = (await screen.findAllByText('Балл вопроса'))[0].closest('.glass-panel') as HTMLElement;
+    expect(within(q1Card).getByText('не выставлен')).toBeInTheDocument();
+    expect(within(q1Card).getByRole('button', { name: /Подтвердить оценку/ })).toBeDisabled();
+
+    fireEvent.click(within(q1Card).getByRole('button', { name: '3' }));
+    expect(within(q1Card).getByRole('button', { name: /Подтвердить оценку/ })).not.toBeDisabled();
   });
 });

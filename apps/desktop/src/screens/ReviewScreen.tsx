@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   InterviewPlan,
   AssessmentProposal,
@@ -140,6 +140,38 @@ function describeEvaluationError(raw: string | null | undefined): string {
   return raw.length > 160 ? `${raw.slice(0, 160)}…` : raw;
 }
 
+/** Integer scale of a criterion, e.g. [1, 2, 3, 4, 5]. */
+function criterionScale(c: { min_score?: number; max_score?: number }): number[] {
+  const min = Math.max(0, Math.round(c.min_score ?? 1));
+  const max = Math.max(min, Math.round(c.max_score ?? 5));
+  return Array.from({ length: Math.min(max - min + 1, 11) }, (_, i) => min + i);
+}
+
+/**
+ * Question score shown to the reviewer: weighted average of criterion scores normalised to a
+ * 5-point scale. Only a preview — the authoritative total is computed by the backend.
+ */
+function weightedCriteriaAverage(
+  q: { criteria: Array<{ id: string; weight?: number; max_score?: number }> },
+  scores: Record<string, number> | undefined
+): { value: number; max: number } | null {
+  if (!scores) return null;
+  let sum = 0;
+  let weights = 0;
+  for (const c of q.criteria) {
+    const v = scores[c.id];
+    if (v === undefined || v === null) continue;
+    const w = c.weight ?? 1;
+    sum += (v / (c.max_score || 5)) * 5 * w;
+    weights += w;
+  }
+  return weights > 0 ? { value: Math.round((sum / weights) * 10) / 10, max: 5 } : null;
+}
+
+function formatScoreValue(v: number): string {
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+
 export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   interviewId,
   plan,
@@ -219,6 +251,10 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [selectedQuote, setSelectedQuote] = useState<{ quote: string; segmentId: string } | null>(null);
   const [reviewerNotes, setReviewerNotes] = useState<Record<string, string>>({});
   const [savedSuccess, setSavedSuccess] = useState<Record<string, boolean>>({});
+  // Questions with unsaved reviewer edits (criterion scores or comment).
+  const [dirtyQuestions, setDirtyQuestions] = useState<Record<string, boolean>>({});
+  const dirtyQuestionsRef = useRef<Record<string, boolean>>({});
+  dirtyQuestionsRef.current = dirtyQuestions;
   const [isSavingQuestion, setIsSavingQuestion] = useState<Record<string, boolean>>({});
   const [isConfirmingAll, setIsConfirmingAll] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -313,9 +349,18 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
       setProposals(existingProps);
       setHumanAssessments(existingHuman);
-      setQuestionScores(initialScores);
-      setCriterionScores(initialCritScores);
-      setReviewerNotes(initialNotes);
+      // A reload after saving one question must not wipe unsaved edits in other questions.
+      const dirty = dirtyQuestionsRef.current;
+      const keepDirty = <T,>(fresh: Record<string, T>, prev: Record<string, T>) => {
+        const merged = { ...fresh };
+        for (const qid of Object.keys(dirty)) {
+          if (dirty[qid] && prev[qid] !== undefined) merged[qid] = prev[qid];
+        }
+        return merged;
+      };
+      setQuestionScores((prev) => keepDirty(initialScores, prev));
+      setCriterionScores((prev) => keepDirty(initialCritScores, prev));
+      setReviewerNotes((prev) => keepDirty(initialNotes, prev));
       setExcludedQuestions(exclusionsMap);
       setSegments(data.transcript_segments || []);
 
@@ -641,8 +686,19 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     }
   };
 
+  const markDirty = (questionId: string, value: boolean) =>
+    setDirtyQuestions((prev) => {
+      if (Boolean(prev[questionId]) === value) return prev;
+      const next = { ...prev };
+      if (value) next[questionId] = true;
+      else delete next[questionId];
+      dirtyQuestionsRef.current = next;
+      return next;
+    });
+
   const handleCriterionScoreChange = (questionId: string, criterionId: string, newScore: number) => {
     if (isFinalized) return;
+    markDirty(questionId, true);
     setCriterionScores((prev) => {
       const qCrits = { ...(prev[questionId] || {}), [criterionId]: newScore };
       return { ...prev, [questionId]: qCrits };
@@ -662,19 +718,6 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       if (count > 0) {
         setQuestionScores((prev) => ({ ...prev, [questionId]: Math.round(sum / count) }));
       }
-    }
-  };
-
-  const handleScoreChange = (questionId: string, newScore: number) => {
-    if (isFinalized) return;
-    setQuestionScores((prev) => ({ ...prev, [questionId]: newScore }));
-    const q = plan.questions.find((x) => x.id === questionId);
-    if (q) {
-      const qCrits: Record<string, number> = {};
-      q.criteria.forEach((c) => {
-        qCrits[c.id] = newScore;
-      });
-      setCriterionScores((prev) => ({ ...prev, [questionId]: qCrits }));
     }
   };
 
@@ -749,32 +792,23 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     return msg.includes('409') && /revision/i.test(msg);
   };
 
-  const handleSaveApproval = async (questionId: string, overrideScore?: number) => {
+  const handleSaveApproval = async (questionId: string) => {
     if (isFinalized) return;
     const q = plan.questions.find((x) => x.id === questionId);
     if (!q) return;
 
-    const prop = proposals.find((p) => p.question_id === questionId);
-    const chosenScore =
-      overrideScore !== undefined
-        ? overrideScore
-        : questionScores[questionId] !== undefined
-        ? questionScores[questionId]
-        : prop?.scores?.[0]?.score;
-
-    if (chosenScore === undefined) {
-      alert('Пожалуйста, сначала выберите балл для этого вопроса.');
+    // The question score is derived from its criteria: they are the only thing submitted.
+    const qCrits = criterionScores[questionId] || {};
+    const missing = q.criteria.filter((c) => qCrits[c.id] === undefined || qCrits[c.id] === null);
+    if (q.criteria.length === 0 || missing.length > 0) {
+      alert(
+        missing.length > 0
+          ? `Выставьте балл по критериям: ${missing.map((c) => c.title).join(', ')}.`
+          : 'У вопроса нет критериев оценки — добавьте их в плане или исключите вопрос.'
+      );
       return;
     }
-
-    const qCrits = criterionScores[questionId] || {};
-    const scoresToSubmit = q.criteria.map((c) => {
-      const val = qCrits[c.id] ?? chosenScore;
-      return {
-        criterion_id: c.id,
-        score: val !== undefined ? val : 3.0,
-      };
-    });
+    const scoresToSubmit = q.criteria.map((c) => ({ criterion_id: c.id, score: qCrits[c.id] }));
 
     setIsSavingQuestion((prev) => ({ ...prev, [questionId]: true }));
     try {
@@ -785,6 +819,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         is_manually_adjusted: true,
       });
 
+      markDirty(questionId, false);
       setSavedSuccess((prev) => ({ ...prev, [questionId]: true }));
       setFinalizeError(null);
       setTimeout(() => {
@@ -837,6 +872,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           reviewer_notes: reviewerNotes[q.id] || 'Оценка подтверждена экспертом',
           is_manually_adjusted: true,
         });
+        markDirty(q.id, false);
       }
       setFinalizeError(null);
       if (withoutScore.length > 0) {
@@ -1606,8 +1642,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
           {plan.questions.map((q, idx) => {
             const prop = [...proposals].reverse().find((p) => p.question_id === q.id);
-            const currentScore = questionScores[q.id] ?? prop?.scores?.[0]?.score;
+            const questionAvg = weightedCriteriaAverage(q, criterionScores[q.id]);
+            const currentScore = questionAvg ? formatScoreValue(questionAvg.value) : undefined;
             const isSaved = savedSuccess[q.id];
+            const isDirty = Boolean(dirtyQuestions[q.id]);
+            const missingCriteria = q.criteria.filter((c) => criterionScores[q.id]?.[c.id] === undefined || criterionScores[q.id]?.[c.id] === null);
             const isExcluded = excludedQuestions[q.id]?.isExcluded;
             const exclusionReason = excludedQuestions[q.id]?.reason;
             const humanAssessment = humanAssessments.find((ha) => ha.question_id === q.id);
@@ -1631,6 +1670,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                           <XCircle className="w-3 h-3" />
                           <span>Исключён из оценки</span>
                         </span>
+                      ) : isDirty ? (
+                        <span className="px-2 py-0.5 text-[10px] font-semibold text-amber-400 bg-amber-950/60 border border-amber-800/60 rounded flex items-center space-x-1">
+                          <AlertTriangle className="w-3 h-3" />
+                          <span>Есть несохранённые изменения</span>
+                        </span>
                       ) : isHumanStale ? (
                         <span className="px-2 py-0.5 text-[10px] font-semibold text-amber-400 bg-amber-950/60 border border-amber-800/60 rounded flex items-center space-x-1">
                           <AlertTriangle className="w-3 h-3" />
@@ -1639,7 +1683,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                       ) : hasHuman ? (
                         <span className="px-2 py-0.5 text-[10px] font-semibold text-emerald-400 bg-emerald-950/60 border border-emerald-800/60 rounded flex items-center space-x-1">
                           <ShieldCheck className="w-3 h-3" />
-                          <span>Подтверждено экспертом ({currentScore} / 5.0)</span>
+                          <span>Подтверждено экспертом</span>
                         </span>
                       ) : prop?.is_rejected ? (
                         <span className="px-2 py-0.5 text-[10px] font-semibold text-rose-400 bg-rose-950/60 border border-rose-800/60 rounded flex items-center space-x-1">
@@ -1648,7 +1692,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                         </span>
                       ) : currentScore !== undefined ? (
                         <span className="px-2 py-0.5 text-[10px] font-semibold text-indigo-300 bg-indigo-950/60 border border-indigo-800/60 rounded">
-                          Черновик: {currentScore} / 5.0
+                          Предложение AI — требует подтверждения
                         </span>
                       ) : (
                         <span className="px-2 py-0.5 text-[10px] font-semibold text-slate-400 bg-slate-800 rounded">
@@ -1686,54 +1730,21 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                     )}
 
                     {!isExcluded && (
-                      <div className="flex items-center space-x-2">
-                        <div className="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800">
-                          <span className="text-xs text-slate-400 font-medium">Балл (1–5):</span>
-                          {[1, 2, 3, 4, 5].map((val) => {
-                            const isSelected = currentScore === val;
-                            return (
-                              <button
-                                key={val}
-                                type="button"
-                                disabled={isFinalized}
-                                onClick={() => {
-                                  handleScoreChange(q.id, val);
-                                  handleSaveApproval(q.id, val);
-                                }}
-                                className={`w-7 h-7 rounded text-xs font-bold transition cursor-pointer flex items-center justify-center ${
-                                  isSelected
-                                    ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/40 ring-2 ring-indigo-400 scale-105'
-                                    : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200'
-                                } ${isFinalized ? 'cursor-not-allowed opacity-80' : ''}`}
-                              >
-                                {val}
-                              </button>
-                            );
-                          })}
-                        </div>
-
-                        {!isFinalized && (
-                          <button
-                            type="button"
-                            disabled={isSavingQuestion[q.id]}
-                            onClick={() => handleSaveApproval(q.id)}
-                            className={`px-3 py-1.5 text-xs font-semibold rounded-lg flex items-center space-x-1.5 transition cursor-pointer shadow-sm ${
-                              hasHuman && !isHumanStale
-                                ? 'bg-emerald-950/70 text-emerald-300 border border-emerald-700/80 hover:bg-emerald-900/60'
-                                : 'bg-indigo-600 text-white hover:bg-indigo-500 shadow-indigo-600/30'
-                            }`}
-                            title="Подтвердить оценку эксперта"
-                          >
-                            {isSavingQuestion[q.id] ? (
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            ) : hasHuman && !isHumanStale ? (
-                              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                            ) : (
-                              <Check className="w-3.5 h-3.5" />
-                            )}
-                            <span>{hasHuman && !isHumanStale ? 'Подтверждено' : 'Подтвердить'}</span>
-                          </button>
-                        )}
+                      <div
+                        className="flex flex-col items-end px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800"
+                        title="Балл вопроса считается по баллам критериев с учётом их весов"
+                      >
+                        <span className="text-[10px] font-medium uppercase tracking-wider text-slate-500">Балл вопроса</span>
+                        <span className="text-sm font-bold text-slate-100">
+                          {questionAvg ? (
+                            <>
+                              {formatScoreValue(questionAvg.value)}
+                              <span className="text-xs font-medium text-slate-500"> / {questionAvg.max}</span>
+                            </>
+                          ) : (
+                            <span className="text-xs font-medium text-slate-500">не выставлен</span>
+                          )}
+                        </span>
                       </div>
                     )}
                   </div>
@@ -1784,7 +1795,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                       {prop?.scores?.[0]?.explanation ||
                         (currentScore !== undefined
                           ? 'Оценка выставлена экспертом-интервьюером вручную.'
-                          : 'Оценка по этому вопросу отсутствует. Выберите балл выше или запустите автооценку.')}
+                          : 'Оценка по этому вопросу отсутствует. Выставьте балл ниже или запустите автооценку.')}
                     </p>
 
                     {/* Evidence Quotes with Click-to-Inspect */}
@@ -1821,7 +1832,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                     {q.criteria && q.criteria.length > 0 && (
                       <div className="space-y-2 pt-2 border-t border-slate-800">
                         <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                          Оценка критериев вопроса ({q.criteria.length}):
+                          {q.criteria.length === 1 ? 'Оценка ответа' : `Оценка по критериям (${q.criteria.length})`}:
                         </span>
                         {q.criteria.map((crit) => {
                           const cScore = criterionScores[q.id]?.[crit.id];
@@ -1842,7 +1853,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                                 )}
                               </div>
                               <div className="flex items-center space-x-1 bg-slate-900 px-2 py-1 rounded-lg border border-slate-800">
-                                {[1, 2, 3, 4, 5].map((val) => {
+                                {criterionScale(crit).map((val) => {
                                   const isCritSelected = cScore === val;
                                   return (
                                     <button
@@ -1943,37 +1954,62 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
                     {/* Reviewer Note Input */}
                     {!isFinalized && (
-                      <div className="pt-2">
-                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                      <div className="pt-2 space-y-2">
+                        <label className="block text-[11px] font-medium text-slate-400">
                           Комментарий проверяющего:
                         </label>
-                        <div className="flex items-center space-x-2">
-                          <input
-                            type="text"
-                            value={reviewerNotes[q.id] || ''}
-                            onChange={(e) =>
-                              setReviewerNotes({ ...reviewerNotes, [q.id]: e.target.value })
-                            }
-                            placeholder="Обоснование решения / замечания..."
-                            className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => handleSaveApproval(q.id)}
-                            className="flex items-center space-x-1 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-lg transition cursor-pointer"
-                          >
-                            {isSaved ? (
-                              <>
-                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                                <span className="text-emerald-400">Сохранено</span>
-                              </>
-                            ) : (
-                              <>
-                                <Check className="w-3.5 h-3.5" />
-                                <span>Сохранить</span>
-                              </>
-                            )}
-                          </button>
+                        <input
+                          type="text"
+                          value={reviewerNotes[q.id] || ''}
+                          onChange={(e) => {
+                            setReviewerNotes({ ...reviewerNotes, [q.id]: e.target.value });
+                            markDirty(q.id, true);
+                          }}
+                          placeholder="Обоснование решения / замечания..."
+                          className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                        />
+                        <div className="flex flex-wrap items-center justify-end gap-3">
+                          {missingCriteria.length > 0 && (
+                            <span className="text-[11px] text-amber-300">
+                              Выставьте балл: {missingCriteria.map((c) => c.title).join(', ')}
+                            </span>
+                          )}
+                          {(() => {
+                            const confirmed = hasHuman && !isHumanStale && !isDirty;
+                            const label = isSaved
+                              ? 'Сохранено'
+                              : confirmed
+                              ? 'Подтверждено'
+                              : isDirty && hasHuman
+                              ? 'Сохранить изменения'
+                              : 'Подтвердить оценку';
+                            return (
+                              <button
+                                type="button"
+                                disabled={isSavingQuestion[q.id] || missingCriteria.length > 0 || confirmed}
+                                onClick={() => handleSaveApproval(q.id)}
+                                className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg flex items-center space-x-1.5 transition shadow-sm disabled:cursor-default ${
+                                  confirmed || isSaved
+                                    ? 'bg-emerald-950/70 text-emerald-300 border border-emerald-700/80'
+                                    : 'bg-indigo-600 text-white hover:bg-indigo-500 shadow-indigo-600/30 disabled:opacity-50 cursor-pointer'
+                                }`}
+                                title={
+                                  confirmed
+                                    ? 'Оценка подтверждена. Измените балл или комментарий, чтобы сохранить новую версию.'
+                                    : 'Сохранить оценку эксперта по этому вопросу'
+                                }
+                              >
+                                {isSavingQuestion[q.id] ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : confirmed || isSaved ? (
+                                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : (
+                                  <Check className="w-3.5 h-3.5" />
+                                )}
+                                <span>{label}</span>
+                              </button>
+                            );
+                          })()}
                         </div>
                       </div>
                     )}
