@@ -1,12 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, Pause, Play, Loader2, Square, WifiOff, Lightbulb, X } from 'lucide-react';
+import { AlertTriangle, Pause, Play, Loader2, Square, WifiOff, Lightbulb, X, MicOff } from 'lucide-react';
 import {
   AssessmentProposal,
   CaptureMode,
   InterviewPlan,
   QuestionMark,
   SpeakerRole,
-  TrackManifest,
   TranscriptSegment,
 } from '../types';
 import {
@@ -14,25 +13,21 @@ import {
   enqueueJob,
   getActiveSession,
   getInterviewJobsStatus,
-  getInterviewReadiness,
   getLiveState,
-  getUploadProgress,
   pauseAudioCapture,
   pauseInterview,
   resumeAudioCapture,
   resumeInterview,
   setSegmentSpeakerRole,
-  stopAudioCapture,
-  stopInterview,
-  updateInterviewStatus,
 } from '../services/api';
 import { AudioMeters } from '../components/AudioMeters';
 import { FollowUpSuggestions } from '../components/FollowUpSuggestions';
 import { QuestionList, EvalStatus } from '../components/live/QuestionList';
 import { QuestionFocus } from '../components/live/QuestionFocus';
 import { LiveTranscript, LiveTranscriptHandle } from '../components/live/LiveTranscript';
-import { StopSessionDialog, StopStep, StopStepKey, StopStepState } from '../components/live/StopSessionDialog';
-import { formatClock, questionTitle, resolveRole } from '../components/live/liveUtils';
+import { StopSessionDialog } from '../components/live/StopSessionDialog';
+import { useInterviewFinalizer } from '../components/live/useInterviewFinalizer';
+import { describeSttError, formatClock, questionTitle, resolveRole } from '../components/live/liveUtils';
 import '../styles/live.css';
 
 interface QuestionEvalJobState {
@@ -49,6 +44,9 @@ interface LiveSessionScreenProps {
   captureMode?: CaptureMode;
   onFinishSession: (interviewId: string) => void;
   onPauseChange?: (isPaused: boolean) => void;
+  /** Recording stopped but processing is not finished; the user leaves to come back later. */
+  onLeaveProcessing?: (interviewId: string) => void;
+  onOpenSettings?: () => void;
 }
 
 const LIVE_POLL_MS = 1000;
@@ -57,15 +55,6 @@ const CLOCK_SYNC_MS = 10000;
 // After the interviewer moves on, the tail of the answer still needs to be transcribed.
 // После перехода к следующему вопросу ждём распознавания конца ответа.
 const AUTO_EVAL_DELAY_MS = 12000;
-const READINESS_ATTEMPTS = 120;
-const READINESS_INTERVAL_MS = 500;
-
-const INITIAL_STOP_STEPS: StopStep[] = [
-  { key: 'capture', label: 'Остановка записи', state: 'pending' },
-  { key: 'finalize', label: 'Сохранение аудиодорожек', state: 'pending' },
-  { key: 'upload', label: 'Выгрузка и распознавание аудио', state: 'pending' },
-  { key: 'review', label: 'Подготовка экрана проверки', state: 'pending' },
-];
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -80,6 +69,8 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   captureMode,
   onFinishSession,
   onPauseChange,
+  onLeaveProcessing,
+  onOpenSettings,
 }) => {
   const questions = plan.questions;
 
@@ -139,6 +130,7 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
   const [suggested, setSuggested] = useState<{ question_id: string; segment_id: string } | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
   const [connectionLost, setConnectionLost] = useState(false);
+  const [transcriptionIssue, setTranscriptionIssue] = useState<{ failed_jobs: number; error: string | null } | null>(null);
   const failuresRef = useRef(0);
   const inFlightRef = useRef(false);
   // Bumped on every local question mark so a poll started earlier cannot roll the question back.
@@ -182,6 +174,11 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
         prev?.segment_id === state.suggested_question?.segment_id && prev?.question_id === state.suggested_question?.question_id
           ? prev
           : state.suggested_question
+      );
+      setTranscriptionIssue((prev) =>
+        prev?.failed_jobs === state.transcription_issue?.failed_jobs && prev?.error === state.transcription_issue?.error
+          ? prev
+          : state.transcription_issue ?? null
       );
       setIsLoaded(true);
     } catch {
@@ -480,93 +477,24 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
 
   // ------------------------------------------------------------------ Stop
   const [stopPhase, setStopPhase] = useState<'idle' | 'confirm' | 'progress'>('idle');
-  const [stopSteps, setStopSteps] = useState<StopStep[]>(INITIAL_STOP_STEPS);
-  const [stopError, setStopError] = useState<string | null>(null);
-  const stopProgressRef = useRef<{
-    captureStopped: boolean;
-    interviewStopped: boolean;
-    manifests: Array<TrackManifest | Record<string, unknown>>;
-  }>({ captureStopped: false, interviewStopped: false, manifests: [] });
+  const finalizer = useInterviewFinalizer({ interviewId, onFinished: onFinishSession });
   const isStopping = stopPhase === 'progress';
 
-  const setStep = (key: StopStepKey, state: StopStepState, detail?: string | null) =>
-    setStopSteps((prev) => prev.map((s) => (s.key === key ? { ...s, state, detail: detail === undefined ? s.detail : detail } : s)));
-
-  const waitForReadiness = async () => {
-    let lastDetails = '';
-    for (let attempt = 0; attempt < READINESS_ATTEMPTS; attempt++) {
-      try {
-        const [upload, readiness] = await Promise.all([
-          getUploadProgress(interviewId).catch(() => null),
-          getInterviewReadiness(interviewId),
-        ]);
-        if (readiness.is_ready) return;
-        lastDetails = readiness.details;
-        const parts: string[] = [];
-        if (upload && upload.total_chunks > 0) parts.push(`выгружено ${upload.uploaded_chunks} из ${upload.total_chunks} фрагментов`);
-        const pending = readiness.stt_jobs?.pending ?? 0;
-        if (pending > 0) parts.push(`распознаётся фрагментов: ${pending}`);
-        setStep('upload', 'active', parts.join(' · ') || null);
-      } catch {
-        // transient: retry
-      }
-      await new Promise((r) => setTimeout(r, READINESS_INTERVAL_MS));
-    }
-    throw new Error(`Аудио ещё обрабатывается${lastDetails ? ` (${lastDetails})` : ''}. Подождите и повторите.`);
-  };
-
-  const runStop = async (skipWaiting = false) => {
+  const startStop = (options?: { acceptIncomplete?: boolean }) => {
     setStopPhase('progress');
-    setStopError(null);
     cancelScheduledEvaluations();
-    const progress = stopProgressRef.current;
-    let step: StopStepKey = 'capture';
-    try {
-      if (!progress.captureStopped) {
-        setStep('capture', 'active');
-        const result = await stopAudioCapture();
-        progress.manifests = Array.isArray(result.manifests)
-          ? result.manifests
-          : result.manifests && typeof result.manifests === 'object'
-          ? Object.values(result.manifests)
-          : [];
-        progress.captureStopped = true;
-      }
-      setStep('capture', 'done');
-
-      step = 'finalize';
-      if (!progress.interviewStopped) {
-        setStep('finalize', 'active');
-        await stopInterview(interviewId, progress.manifests);
-        progress.interviewStopped = true;
-      }
-      setStep('finalize', 'done');
-
-      step = 'upload';
-      if (skipWaiting) {
-        setStep('upload', 'done', 'пропущено — оставшиеся реплики появятся позже');
-      } else {
-        setStep('upload', 'active', null);
-        await waitForReadiness();
-        setStep('upload', 'done', null);
-      }
-
-      step = 'review';
-      setStep('review', 'active');
-      await updateInterviewStatus(interviewId, 'processing', 'review');
-      setStep('review', 'done');
-      onFinishSession(interviewId);
-    } catch (e) {
-      setStep(step, 'error');
-      setStopError(errorText(e));
-    }
+    void finalizer.run(options);
   };
 
   const cancelStop = () => {
-    if (stopProgressRef.current.captureStopped) return;
+    if (finalizer.captureStopped) return;
+    finalizer.reset();
     setStopPhase('idle');
-    setStopSteps(INITIAL_STOP_STEPS);
-    setStopError(null);
+  };
+
+  const leaveProcessing = () => {
+    finalizer.cancel();
+    onLeaveProcessing?.(interviewId);
   };
 
   // ------------------------------------------------------------------ Render
@@ -609,6 +537,21 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
           </button>
         </div>
       </header>
+
+      {transcriptionIssue && !connectionLost && (
+        <div className="live-banner" role="alert">
+          <MicOff />
+          <span>
+            Речь не распознаётся: {describeSttError(transcriptionIssue.error)}. Запись продолжается — стенограмму можно будет
+            восстановить после исправления настроек.
+          </span>
+          {onOpenSettings && (
+            <button type="button" className="btn btn-secondary btn-sm live-banner-action" onClick={onOpenSettings}>
+              Открыть настройки
+            </button>
+          )}
+        </div>
+      )}
 
       {connectionLost && (
         <div className="live-banner" role="alert">
@@ -722,13 +665,16 @@ export const LiveSessionScreen: React.FC<LiveSessionScreenProps> = ({
           askedCount={Object.keys(firstMarkMs).length}
           totalQuestions={questions.length}
           evaluatedCount={evaluatedCount}
-          steps={stopSteps}
-          error={stopError}
-          captureStopped={stopProgressRef.current.captureStopped}
+          steps={finalizer.steps}
+          error={finalizer.error}
+          captureStopped={finalizer.captureStopped}
+          canAcceptIncomplete={finalizer.canAcceptIncomplete}
+          waitingLong={finalizer.waitingLong}
           onCancel={cancelStop}
-          onConfirm={() => void runStop()}
-          onRetry={() => void runStop()}
-          onSkipWaiting={() => void runStop(true)}
+          onConfirm={() => startStop()}
+          onRetry={() => startStop()}
+          onAcceptIncomplete={() => startStop({ acceptIncomplete: true })}
+          onLeave={leaveProcessing}
         />
       )}
     </div>

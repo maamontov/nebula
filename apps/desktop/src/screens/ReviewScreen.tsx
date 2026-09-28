@@ -512,7 +512,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           await loadData();
           const activatedRev = job.transcript_revision_id || activeBatchJob.targetRevisionId;
           setRetranscribeSuccess(
-            `Пакетная перестенограмма успешно завершена! Активная ревизия переключена на: ${activatedRev}`
+            `Перераспознавание записи завершено. Активная ревизия стенограммы: ${activatedRev}`
           );
         } else if (job.status === 'FAILED') {
           clearInterval(poll);
@@ -1938,7 +1938,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                       ? activeBatchJob.status === 'PROCESSING'
                         ? 'Выполняется...'
                         : 'В очереди...'
-                      : 'Пакетная перестенограмма'}
+                      : 'Перераспознать запись'}
                   </span>
                 </button>
               )}
@@ -1967,8 +1967,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 <div className="flex items-center space-x-2">
                   <span className="font-semibold text-slate-200">
                     {activeBatchJob.status === 'PROCESSING'
-                      ? 'Пакетная перестенограмма выполняется'
-                      : 'Пакетная перестенограмма в очереди'}
+                      ? 'Перераспознавание записи выполняется'
+                      : 'Перераспознавание записи в очереди'}
                   </span>
                   <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-indigo-900/60 border border-indigo-700/50 text-indigo-300">
                     {activeBatchJob.jobId}

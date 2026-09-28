@@ -2865,6 +2865,27 @@ class Repository:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def retry_failed_transcription_jobs(self, interview_id: str) -> int:
+        """Re-queues failed STT jobs (e.g. after the API key was configured). Returns the count."""
+        now = utc_now_iso()
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'PENDING', attempts = 0, error_message = NULL,
+                    locked_until = NULL, locked_by = NULL, started_at = NULL, completed_at = NULL, updated_at = ?
+                WHERE interview_id = ? AND status = 'FAILED' AND type IN ('TRANSCRIBE_AUDIO', 'TRANSCRIBE_TURN')
+                """,
+                (now, interview_id),
+            )
+            count = cur.rowcount
+            if count:
+                conn.execute(
+                    "INSERT INTO audit_events (id, interview_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (f"audit-{uuid.uuid4().hex[:12]}", interview_id, "TRANSCRIPTION_RETRY_REQUESTED", json.dumps({"jobs": count}), now),
+                )
+            return count
+
     # -------------------------------------------------------------
     # Question Marks (interviewer: "asking question N from now on")
     # -------------------------------------------------------------

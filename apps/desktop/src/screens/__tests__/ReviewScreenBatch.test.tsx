@@ -103,7 +103,7 @@ describe('ReviewScreen Batch Retranscribe (R6)', () => {
     // Verify progress banner is displayed with job ID
     await waitFor(() => {
       expect(screen.getByText('job-batch-restore-1')).toBeInTheDocument();
-      expect(screen.getByText(/Пакетная перестенограмма выполняется/)).toBeInTheDocument();
+      expect(screen.getByText(/Перераспознавание записи выполняется/)).toBeInTheDocument();
     });
   });
 
@@ -128,7 +128,7 @@ describe('ReviewScreen Batch Retranscribe (R6)', () => {
     });
     fireEvent.click(screen.getByText(/Транскрипт/));
 
-    const retranscribeBtn = await screen.findByRole('button', { name: /Пакетная перестенограмма/ });
+    const retranscribeBtn = await screen.findByRole('button', { name: /Перераспознать запись/ });
     expect(retranscribeBtn).toBeInTheDocument();
 
     // Click start
@@ -141,7 +141,7 @@ describe('ReviewScreen Batch Retranscribe (R6)', () => {
     // Immediately shows banner and does NOT show premature success
     await waitFor(() => {
       expect(screen.getByText('job-batch-999')).toBeInTheDocument();
-      expect(screen.queryByText(/Пакетная перестенограмма успешно завершена/)).toBeNull();
+      expect(screen.queryByText(/Перераспознавание записи завершено/)).toBeNull();
     });
 
     // Mock polling returns COMPLETED
@@ -166,7 +166,7 @@ describe('ReviewScreen Batch Retranscribe (R6)', () => {
     await waitFor(
       () => {
         expect(
-          screen.getByText(/Пакетная перестенограмма успешно завершена! Активная ревизия переключена на: trans-rev-2/)
+          screen.getByText(/Перераспознавание записи завершено. Активная ревизия стенограммы: trans-rev-2/)
         ).toBeInTheDocument();
       },
       { timeout: 4000 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { LiveSessionScreen } from '../LiveSessionScreen';
 import * as api from '../../services/api';
 import { InterviewPlan, LiveInterviewState } from '../../types';
@@ -27,6 +27,7 @@ vi.mock('../../services/api', () => ({
   generateFollowUps: vi.fn(),
   patchFollowUpSuggestion: vi.fn(),
   retryFollowUpRequest: vi.fn(),
+  retryFailedTranscription: vi.fn(),
 }));
 
 const criterion = (id: string, title: string) => ({ id, title, description: '', min_score: 1, max_score: 5, weight: 1 });
@@ -161,6 +162,90 @@ describe('LiveSessionScreen', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Кандидат' }));
     await waitFor(() => expect(api.setSegmentSpeakerRole).toHaveBeenCalledWith('inv-1', 's9', 'candidate'));
+  });
+});
+
+describe('LiveSessionScreen finishing', () => {
+  const sttFailed = {
+    is_ready: false,
+    state: 'STT_FAILED',
+    details: '2 audio transcription / assembly jobs failed.',
+    stt_jobs: { completed: 21, pending: 0, failed: 2 },
+    failed_error: "Missing STT API key: provider 'RouterAI' requires Bearer authentication.",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.getLiveState).mockResolvedValue(liveState());
+    vi.mocked(api.getActiveSession).mockResolvedValue({ is_recording: true, is_paused: false, session_id: 'inv-1', elapsed_ms: 65000, epoch: 1 });
+    vi.mocked(api.getInterviewJobsStatus).mockResolvedValue({ active_jobs: [] } as any);
+    vi.mocked(api.getAudioLevels).mockResolvedValue({ interviewer_rms: 0, interviewer_peak: 0, candidate_rms: 0, candidate_peak: 0 });
+    vi.mocked(api.getFollowUpsState).mockResolvedValue({ suggestions: [], status: 'idle' } as any);
+    vi.mocked(api.stopAudioCapture).mockResolvedValue({ manifests: [] } as any);
+    vi.mocked(api.stopInterview).mockResolvedValue({ status: 'processing' });
+    vi.mocked(api.getUploadProgress).mockResolvedValue({ total_chunks: 21, uploaded_chunks: 21 } as any);
+    vi.mocked(api.getInterviewReadiness).mockResolvedValue(sttFailed as any);
+    vi.mocked(api.updateInterviewStatus).mockResolvedValue({ status: 'review' });
+    vi.mocked(api.retryFailedTranscription).mockResolvedValue({ requeued_jobs: 2 });
+  });
+
+  const stopAndConfirm = async () => {
+    await screen.findByText('B-tree хранит ключи упорядоченно');
+    fireEvent.click(screen.getByRole('button', { name: 'Завершить' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: /Завершить/ }));
+  };
+
+  it('reports a recognition failure at once and lets the user open review anyway', async () => {
+    const onFinishSession = vi.fn();
+    renderScreen({ onFinishSession });
+    await stopAndConfirm();
+
+    expect(await screen.findByText(/не задан или неверен API-ключ распознавания речи/)).toBeInTheDocument();
+    expect(api.getInterviewReadiness).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Открыть проверку сейчас' }));
+    await waitFor(() =>
+      expect(api.updateInterviewStatus).toHaveBeenCalledWith('inv-1', 'processing', 'review', undefined, { allowIncompleteTranscript: true })
+    );
+    expect(onFinishSession).toHaveBeenCalledWith('inv-1');
+    expect(api.stopAudioCapture).toHaveBeenCalledTimes(1);
+  });
+
+  it('retry re-queues failed recognition instead of waiting in vain', async () => {
+    renderScreen();
+    await stopAndConfirm();
+    await screen.findByText(/API-ключ распознавания речи/);
+
+    vi.mocked(api.getInterviewReadiness).mockResolvedValue({ is_ready: true, state: 'READY_FOR_REVIEW', details: '' } as any);
+    fireEvent.click(screen.getByRole('button', { name: 'Повторить' }));
+
+    await waitFor(() => expect(api.retryFailedTranscription).toHaveBeenCalledWith('inv-1'));
+    await waitFor(() =>
+      expect(api.updateInterviewStatus).toHaveBeenCalledWith('inv-1', 'processing', 'review', undefined, { allowIncompleteTranscript: false })
+    );
+    expect(api.stopAudioCapture).toHaveBeenCalledTimes(1);
+    expect(api.stopInterview).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets the user leave and come back later once the recording is stopped', async () => {
+    const onLeaveProcessing = vi.fn();
+    renderScreen({ onLeaveProcessing });
+    await stopAndConfirm();
+    await screen.findByText(/API-ключ распознавания речи/);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Закрыть, вернуться позже' }));
+    expect(onLeaveProcessing).toHaveBeenCalledWith('inv-1');
+  });
+
+  it('warns during recording when speech is not being recognised', async () => {
+    vi.mocked(api.getLiveState).mockResolvedValue(
+      liveState({ transcription_issue: { failed_jobs: 3, error: 'Missing STT API key' } })
+    );
+    const onOpenSettings = vi.fn();
+    renderScreen({ onOpenSettings });
+    expect(await screen.findByText(/Речь не распознаётся/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Открыть настройки' }));
+    expect(onOpenSettings).toHaveBeenCalled();
   });
 });
 

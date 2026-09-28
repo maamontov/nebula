@@ -6,6 +6,7 @@ import { SetupScreen } from './screens/SetupScreen';
 import { LiveSessionScreen } from './screens/LiveSessionScreen';
 import { ReviewScreen } from './screens/ReviewScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
+import { ProcessingInterviewDialog } from './components/live/ProcessingInterviewDialog';
 import { InterviewPlan, InterviewStatus, CaptureMode } from './types';
 import { getActiveSession, getBackendStatus, getInterview, restartBackend } from './services/api';
 import type { BackendStatusInfo } from './services/api';
@@ -38,6 +39,9 @@ export const App: React.FC = () => {
 
   // Existing draft ID to resume in SetupScreen
   const [setupExistingInterviewId, setSetupExistingInterviewId] = useState<string | null>(null);
+
+  // Interview reopened in `processing`: its processing dialog is shown over the current screen.
+  const [processingInterviewId, setProcessingInterviewId] = useState<string | null>(null);
 
   // Warning modal for blocked actions
   const [warningModal, setWarningModal] = useState<string | null>(null);
@@ -243,8 +247,11 @@ export const App: React.FC = () => {
           });
         }
         setScreen('live');
+      } else if (actualStatus === 'processing') {
+        // Recording was stopped but the transcript is not ready yet: finish processing first.
+        setProcessingInterviewId(id);
       } else {
-        // processing, review, finalized
+        // review, finalized
         setScreen('review');
       }
     } catch (err: any) {
@@ -282,6 +289,19 @@ export const App: React.FC = () => {
     setActiveRecordingSession(null);
     setInterviewId(id);
     setScreen('review');
+  };
+
+  const handleProcessingFinished = (id: string) => {
+    setProcessingInterviewId(null);
+    setInterviewId(id);
+    setScreen('review');
+  };
+
+  // Recording is stopped but processing is not finished: the interview stays in the list as
+  // «Обработка» and is finished when reopened.
+  const handleLeaveProcessing = () => {
+    setActiveRecordingSession(null);
+    setScreen('home');
   };
 
   const handleBackToHome = () => {
@@ -385,6 +405,8 @@ export const App: React.FC = () => {
               captureMode={activeRecordingSession.captureMode}
               onFinishSession={handleFinishSession}
               onPauseChange={handlePauseChange}
+              onLeaveProcessing={handleLeaveProcessing}
+              onOpenSettings={() => setScreen('settings')}
             />
           </div>
         )}
@@ -417,6 +439,15 @@ export const App: React.FC = () => {
         {/* Screen: Settings */}
         {screen === 'settings' && <SettingsScreen />}
       </main>
+
+      {processingInterviewId && (
+        <ProcessingInterviewDialog
+          key={processingInterviewId}
+          interviewId={processingInterviewId}
+          onFinished={handleProcessingFinished}
+          onClose={() => setProcessingInterviewId(null)}
+        />
+      )}
 
       {/* Warning Modal */}
       {warningModal && (

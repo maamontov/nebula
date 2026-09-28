@@ -466,7 +466,8 @@ export async function updateInterviewStatus(
   id: string,
   currentStatus: InterviewStatus,
   targetStatus: InterviewStatus,
-  consent?: { confirmedAt: string; version: string }
+  consent?: { confirmedAt: string; version: string },
+  options?: { allowIncompleteTranscript?: boolean }
 ): Promise<{ status: string }> {
   const res = await fetch(`${API_BASE}/interviews/${id}/status`, {
     method: 'POST',
@@ -476,9 +477,20 @@ export async function updateInterviewStatus(
       target_status: targetStatus,
       consent_confirmed_at: consent?.confirmedAt,
       consent_version: consent?.version,
+      allow_incomplete_transcript: options?.allowIncompleteTranscript ?? false,
     }),
   });
-  if (!res.ok) throw new Error(`Update status error: ${res.statusText}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Update status error: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** Re-queues failed speech recognition jobs (e.g. after the STT key was configured). */
+export async function retryFailedTranscription(interviewId: string): Promise<{ requeued_jobs: number }> {
+  const res = await fetch(`${API_BASE}/interviews/${interviewId}/transcription/retry-failed`, { method: 'POST' });
+  if (!res.ok) throw new Error(`Retry transcription error: ${res.statusText}`);
   return res.json();
 }
 
@@ -561,6 +573,8 @@ export interface InterviewReadiness {
   details: string;
   missing_chunks?: Record<string, number[]>;
   stt_jobs?: { completed: number; pending: number; failed: number };
+  /** First error of failed speech recognition jobs (state STT_FAILED). */
+  failed_error?: string | null;
   manifests?: Record<string, unknown>;
 }
 

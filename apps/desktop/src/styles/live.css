@@ -684,6 +684,11 @@
   font-size: 12px;
 }
 
+.live-banner-action {
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
 .live-banner svg {
   width: 15px;
   height: 15px;
@@ -1095,7 +1100,7 @@
 
 .dialog {
   width: 100%;
-  max-width: 460px;
+  max-width: 560px;
   padding: 22px;
   background: var(--surface-elevated);
   border: 1px solid var(--border);

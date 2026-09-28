@@ -104,6 +104,8 @@ export interface LiveInterviewState {
   current_question_id: string | null;
   segment_questions: Record<string, { question_id: string; is_ambiguous: boolean }>;
   suggested_question: { question_id: string; segment_id: string; confidence: number } | null;
+  /** Speech recognition keeps failing (e.g. no STT API key); audio is still being recorded. */
+  transcription_issue?: { failed_jobs: number; error: string | null } | null;
 }
 
 export interface EvidenceQuote {

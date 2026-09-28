@@ -23,10 +23,18 @@ interface StopSessionDialogProps {
   error: string | null;
   /** Recording is already stopped: going back to the live screen is no longer possible. */
   captureStopped: boolean;
+  /** Audio is stored and only the transcript is incomplete: review can be opened right away. */
+  canAcceptIncomplete: boolean;
+  /** Waiting takes long: offer not to wait. */
+  waitingLong: boolean;
+  /** Interview was reopened from the list (recording stopped earlier). */
+  resumed?: boolean;
   onCancel: () => void;
   onConfirm: () => void;
   onRetry: () => void;
-  onSkipWaiting: () => void;
+  onAcceptIncomplete: () => void;
+  /** Close the dialog; the interview stays in processing and can be reopened from the list. */
+  onLeave: () => void;
 }
 
 export const StopSessionDialog: React.FC<StopSessionDialogProps> = ({
@@ -38,10 +46,14 @@ export const StopSessionDialog: React.FC<StopSessionDialogProps> = ({
   steps,
   error,
   captureStopped,
+  canAcceptIncomplete,
+  waitingLong,
+  resumed = false,
   onCancel,
   onConfirm,
   onRetry,
-  onSkipWaiting,
+  onAcceptIncomplete,
+  onLeave,
 }) => {
   const confirmRef = useRef<HTMLButtonElement>(null);
 
@@ -58,7 +70,6 @@ export const StopSessionDialog: React.FC<StopSessionDialogProps> = ({
   }, [phase, onCancel]);
 
   const notAsked = totalQuestions - askedCount;
-  const failedStep = steps.find((s) => s.state === 'error');
 
   return (
     <div className="dialog-backdrop" role="presentation">
@@ -105,11 +116,13 @@ export const StopSessionDialog: React.FC<StopSessionDialogProps> = ({
           </>
         ) : (
           <>
-            <h2 id="stop-dialog-title">{error ? 'Завершение прервано' : 'Завершаем интервью'}</h2>
+            <h2 id="stop-dialog-title">
+              {error ? 'Обработка остановилась' : resumed ? 'Обработка интервью' : 'Завершаем интервью'}
+            </h2>
             <p>
               {error
-                ? 'Запись и данные сохранены. Можно повторить шаг или продолжить позже.'
-                : 'Это займёт до минуты: дожидаемся выгрузки аудио и распознавания последних реплик.'}
+                ? 'Запись сохранена. Выберите, как продолжить.'
+                : 'Обычно это занимает до минуты: дожидаемся выгрузки аудио и распознавания последних реплик.'}
             </p>
             <ol className="steps">
               {steps.map((step) => (
@@ -136,16 +149,32 @@ export const StopSessionDialog: React.FC<StopSessionDialogProps> = ({
                 <div className="notice-body">{error}</div>
               </div>
             )}
+            {!error && waitingLong && captureStopped && (
+              <div className="dialog-actions">
+                <button type="button" className="btn btn-ghost" onClick={onLeave}>
+                  Закрыть, вернуться позже
+                </button>
+                {canAcceptIncomplete && (
+                  <button type="button" className="btn btn-secondary" onClick={onAcceptIncomplete}>
+                    Не ждать — открыть проверку
+                  </button>
+                )}
+              </div>
+            )}
             {error && (
               <div className="dialog-actions">
-                {!captureStopped && (
+                {!captureStopped ? (
                   <button type="button" className="btn btn-secondary" onClick={onCancel}>
                     Вернуться к записи
                   </button>
+                ) : (
+                  <button type="button" className="btn btn-ghost" onClick={onLeave} title="Интервью останется в списке со статусом «Обработка»">
+                    Закрыть, вернуться позже
+                  </button>
                 )}
-                {failedStep?.key === 'upload' && (
-                  <button type="button" className="btn btn-secondary" onClick={onSkipWaiting}>
-                    Открыть проверку без ожидания
+                {canAcceptIncomplete && (
+                  <button type="button" className="btn btn-secondary" onClick={onAcceptIncomplete}>
+                    Открыть проверку сейчас
                   </button>
                 )}
                 <button type="button" className="btn btn-primary" onClick={onRetry}>

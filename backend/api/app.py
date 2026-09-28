@@ -248,6 +248,9 @@ class TransitionStateRequest(BaseModel):
     target_status: InterviewStatus
     consent_confirmed_at: str | None = None
     consent_version: str | None = None
+    # Open review although some speech is not transcribed yet (failed or still running STT).
+    # Audio must be fully ingested: missing chunks or unsealed manifests are never bypassed.
+    allow_incomplete_transcript: bool = False
 
 
 class ReassociateSegmentRequest(BaseModel):
@@ -752,6 +755,10 @@ async def delete_interview_endpoint(
     return {"status": "deleted", "interview_id": interview_id, "success": True}
 
 
+# Readiness states where all audio is stored and only transcription is incomplete.
+INCOMPLETE_TRANSCRIPT_STATES = ("STT_FAILED", "STT_IN_PROGRESS")
+
+
 def check_interview_readiness(
     interview_id: str,
     repo: Repository,
@@ -804,7 +811,7 @@ def check_interview_readiness(
     # Query jobs
     with repo.db.transaction() as conn:
         job_rows = conn.execute(
-            "SELECT id, type, status FROM jobs WHERE interview_id = ?",
+            "SELECT id, type, status, error_message FROM jobs WHERE interview_id = ?",
             (interview_id,),
         ).fetchall()
 
@@ -826,7 +833,7 @@ def check_interview_readiness(
             repo.flush_turn_assembly(interview_id)
         with repo.db.transaction() as conn:
             job_rows = conn.execute(
-                "SELECT id, type, status FROM jobs WHERE interview_id = ?",
+                "SELECT id, type, status, error_message FROM jobs WHERE interview_id = ?",
                 (interview_id,),
             ).fetchall()
 
@@ -859,6 +866,7 @@ def check_interview_readiness(
                     "is_ready": False,
                     "state": "STT_FAILED",
                     "details": f"{len(failed_jobs)} audio transcription / assembly jobs failed.",
+                    "failed_error": next((r["error_message"] for r in failed_jobs if r["error_message"]), None),
                     "missing_chunks": {},
                     "stt_jobs": {"completed": len(completed_jobs), "pending": len(pending_jobs), "failed": len(failed_jobs)},
                     "manifests": manifests_found,
@@ -961,6 +969,21 @@ async def get_interview_readiness_endpoint(
     return report
 
 
+@app.post("/api/v1/interviews/{interview_id}/transcription/retry-failed")
+async def retry_failed_transcription_endpoint(
+    interview_id: str,
+    repo: Repository = Depends(get_repository),
+):
+    """Re-queues failed speech recognition jobs, e.g. after fixing the STT provider settings."""
+    validate_safe_id(interview_id, "interview_id")
+    inv = repo.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if InterviewStatus(inv["status"]) in (InterviewStatus.FINALIZED, InterviewStatus.DELETED):
+        raise HTTPException(status_code=409, detail="Interview is finalized or deleted")
+    return {"requeued_jobs": repo.retry_failed_transcription_jobs(interview_id)}
+
+
 @app.post("/api/v1/interviews/{interview_id}/status")
 async def update_status_endpoint(
     interview_id: str,
@@ -973,13 +996,17 @@ async def update_status_endpoint(
     if not inv:
         raise HTTPException(status_code=404, detail="Interview not found")
 
+    incomplete_report: dict[str, Any] | None = None
     if payload.target_status == InterviewStatus.REVIEW:
         is_ready, report = check_interview_readiness(interview_id, repo, spool_dir)
-        if not is_ready:
+        bypassable = report["state"] in INCOMPLETE_TRANSCRIPT_STATES
+        if not is_ready and not (payload.allow_incomplete_transcript and bypassable):
             raise HTTPException(
                 status_code=409,
                 detail=f"Interview readiness gate failed: {report['details']} (state: {report['state']})",
             )
+        if not is_ready:
+            incomplete_report = report
 
     try:
         current_status = InterviewStatus(inv["status"])
@@ -996,6 +1023,13 @@ async def update_status_endpoint(
             event_type="STATUS_TRANSITIONED",
             payload={"from": current_status.value, "to": new_status.value},
         )
+        if incomplete_report is not None:
+            repo.record_audit_event(
+                event_id=f"audit-{uuid.uuid4().hex[:8]}",
+                interview_id=interview_id,
+                event_type="REVIEW_OPENED_WITH_INCOMPLETE_TRANSCRIPT",
+                payload={"state": incomplete_report["state"], "stt_jobs": incomplete_report.get("stt_jobs")},
+            )
         return {"status": new_status.value}
     except InvalidStateTransitionError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1197,9 +1231,24 @@ async def get_live_state_endpoint(
     plan = repo.get_latest_plan(interview_id)
     questions = plan["payload"].get("questions", []) if plan else []
     marks = repo.get_question_marks(interview_id)
+    with repo.db.transaction() as conn:
+        failed_stt = conn.execute(
+            """
+            SELECT error_message FROM jobs
+            WHERE interview_id = ? AND type IN ('TRANSCRIBE_AUDIO', 'TRANSCRIBE_TURN') AND status = 'FAILED'
+            ORDER BY updated_at DESC
+            """,
+            (interview_id,),
+        ).fetchall()
+    transcription_issue = (
+        {"failed_jobs": len(failed_stt), "error": next((r["error_message"] for r in failed_stt if r["error_message"]), None)}
+        if failed_stt
+        else None
+    )
     return {
         "interview_id": interview_id,
         "status": inv["status"],
+        "transcription_issue": transcription_issue,
         "transcript_segments": segments,
         "assessment_proposals": repo.get_assessment_proposals(interview_id),
         **_live_question_state(repo, interview_id, questions, segments, marks),

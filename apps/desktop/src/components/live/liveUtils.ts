@@ -49,3 +49,12 @@ export function proposalAverage(
 export function formatScore(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(1);
 }
+
+/** Human-readable reason for a speech recognition failure reported by the backend. */
+export function describeSttError(raw: string | null | undefined): string {
+  if (!raw) return 'сервис распознавания речи вернул ошибку';
+  if (/api key|bearer|unauthori[sz]ed|\b401\b|\b403\b/i.test(raw)) return 'не задан или неверен API-ключ распознавания речи';
+  if (/timed? ?out/i.test(raw)) return 'сервис распознавания речи не ответил вовремя';
+  if (/connect|network|resolve|unreachable/i.test(raw)) return 'нет связи с сервисом распознавания речи';
+  return raw;
+}
