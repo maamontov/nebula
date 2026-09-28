@@ -130,6 +130,16 @@ interface ReviewScreenProps {
   onBackToHome?: () => void;
 }
 
+/** Short human-readable reason for a failed EVALUATE_QUESTION job. */
+function describeEvaluationError(raw: string | null | undefined): string {
+  if (!raw) return 'модель не вернула результат';
+  if (/validation error/i.test(raw)) return 'модель вернула ответ в неожиданном формате';
+  if (/api key|bearer|unauthori[sz]ed|\b401\b|\b403\b/i.test(raw)) return 'не задан или неверен API-ключ модели анализа';
+  if (/timed? ?out/i.test(raw)) return 'модель не ответила вовремя';
+  if (/rate limit|\b429\b/i.test(raw)) return 'превышен лимит запросов к модели';
+  return raw.length > 160 ? `${raw.slice(0, 160)}…` : raw;
+}
+
 export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   interviewId,
   plan,
@@ -217,6 +227,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [trackedEvalJobIds, setTrackedEvalJobIds] = useState<string[]>([]);
   const [exportError, setExportError] = useState<string | null>(null);
   const [evalWarning, setEvalWarning] = useState<string | null>(null);
+  const [failedEvaluations, setFailedEvaluations] = useState<Array<{ questionId: string; reason: string }>>([]);
 
   // Split Segment modal
   const [splittingSegment, setSplittingSegment] = useState<TranscriptSegment | null>(null);
@@ -452,11 +463,12 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           clearInterval(poll);
           setTrackedEvalJobIds([]);
           setIsEvaluatingAll(false);
-          if (failed.length > 0) {
-            setEvalWarning(`Автооценка завершена с ошибками для ${failed.length} вопросов. Проверьте детали.`);
-          } else {
-            setEvalProgressText(null);
-          }
+          setEvalProgressText(null);
+          setFailedEvaluations(
+            failed
+              .filter((j) => j.question_id)
+              .map((j) => ({ questionId: j.question_id as string, reason: describeEvaluationError(j.error_message) }))
+          );
         }
       } catch (e) {
         console.warn('Review eval poll error:', e);
@@ -581,6 +593,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       setSegments((prev) =>
         prev.map((s) => (s.id === segId ? { ...s, speaker_role: role } : s))
       );
+      // Every transcript edit creates a new revision on the backend; reviews must target it.
+      await loadData();
     } catch (e: any) {
       console.error('Failed to set speaker role:', e);
       alert(`Ошибка изменения роли: ${e.message || e}`);
@@ -620,6 +634,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         return copy;
       });
       setSplittingSegment(null);
+      await loadData();
     } catch (e: any) {
       console.error('Failed to split segment:', e);
       alert(`Ошибка разделения сегмента: ${e.message || e}`);
@@ -721,6 +736,19 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     }
   };
 
+  /** Active transcript revision straight from the backend (the local copy may be outdated). */
+  const fetchActiveRevision = async (): Promise<string> => {
+    const data = await getInterview(interviewId);
+    const rev = data.interview?.active_transcript_revision_id || activeRevisionId;
+    setActiveRevisionId(rev);
+    return rev;
+  };
+
+  const isRevisionConflict = (e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    return msg.includes('409') && /revision/i.test(msg);
+  };
+
   const handleSaveApproval = async (questionId: string, overrideScore?: number) => {
     if (isFinalized) return;
     const q = plan.questions.find((x) => x.id === questionId);
@@ -766,8 +794,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       await loadData();
     } catch (e: any) {
       console.error('Save review error:', e);
-      if (e?.message?.includes('409')) {
-        alert('Конфликт версий (409): стенограмма собеседования была изменена в новой ревизии. Данные страницы будут обновлены.');
+      if (isRevisionConflict(e)) {
+        alert('Стенограмма изменилась после загрузки страницы. Данные обновлены — проверьте оценку и подтвердите ещё раз.');
         await loadData();
       } else {
         alert(`Ошибка при сохранении оценки: ${e?.message || e}`);
@@ -780,15 +808,23 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const handleConfirmAllAssessments = async () => {
     if (isFinalized || isConfirmingAll) return;
     setIsConfirmingAll(true);
+    setEvalWarning(null);
     try {
-      for (const q of plan.questions) {
+      const revision = await fetchActiveRevision();
+      const withoutScore: number[] = [];
+      for (const [idx, q] of plan.questions.entries()) {
         if (excludedQuestions[q.id]?.isExcluded) continue;
         const human = humanAssessments.find((ha) => ha.question_id === q.id);
-        if (human && !human.is_stale && human.transcript_revision_id === activeRevisionId) {
+        if (human && !human.is_stale && human.transcript_revision_id === revision) {
           continue;
         }
-        const prop = proposals.find((p) => p.question_id === q.id);
-        const chosenScore = questionScores[q.id] ?? prop?.scores?.[0]?.score ?? 3.0;
+        const prop = [...proposals].reverse().find((p) => p.question_id === q.id && !p.is_rejected);
+        const chosenScore = questionScores[q.id] ?? prop?.scores?.[0]?.score ?? undefined;
+        if (chosenScore === undefined || chosenScore === null) {
+          // No AI proposal and no reviewer choice: a score must never be invented.
+          withoutScore.push(idx + 1);
+          continue;
+        }
         const qCrits = criterionScores[q.id] || {};
         const scoresToSubmit = q.criteria.map((c) => ({
           criterion_id: c.id,
@@ -796,16 +832,26 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         }));
 
         await reviewAssessment(interviewId, q.id, {
-          expected_transcript_revision: activeRevisionId,
+          expected_transcript_revision: revision,
           scores: scoresToSubmit,
           reviewer_notes: reviewerNotes[q.id] || 'Оценка подтверждена экспертом',
           is_manually_adjusted: true,
         });
       }
       setFinalizeError(null);
+      if (withoutScore.length > 0) {
+        setEvalWarning(
+          `Без оценки остались вопросы № ${withoutScore.join(', ')}. Выставьте балл вручную, повторите автооценку или исключите вопрос из оценки.`
+        );
+      }
       await loadData();
     } catch (err: any) {
-      alert(`Ошибка при подтверждении всех оценок: ${err?.message || err}`);
+      alert(
+        isRevisionConflict(err)
+          ? 'Стенограмма изменилась во время подтверждения. Данные обновлены — повторите действие.'
+          : `Ошибка при подтверждении всех оценок: ${err?.message || err}`
+      );
+      await loadData();
     } finally {
       setIsConfirmingAll(false);
     }
@@ -828,14 +874,22 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     const qId = excludingQuestionModal.questionId;
     setIsSubmittingExclusion(true);
     try {
-      await reviewAssessment(interviewId, qId, {
-        expected_transcript_revision: activeRevisionId,
-        scores: [],
-        reviewer_notes: `Вопрос исключён экспертом: ${reason}`,
-        is_manually_adjusted: true,
-        is_excluded: true,
-        exclusion_reason: reason,
-      });
+      const submit = (revision: string) =>
+        reviewAssessment(interviewId, qId, {
+          expected_transcript_revision: revision,
+          scores: [],
+          reviewer_notes: `Вопрос исключён экспертом: ${reason}`,
+          is_manually_adjusted: true,
+          is_excluded: true,
+          exclusion_reason: reason,
+        });
+      try {
+        await submit(activeRevisionId);
+      } catch (e) {
+        // Exclusion does not depend on transcript content: retry against the current revision.
+        if (!isRevisionConflict(e)) throw e;
+        await submit(await fetchActiveRevision());
+      }
       setExcludedQuestions((prev) => ({
         ...prev,
         [qId]: { isExcluded: true, reason },
@@ -866,7 +920,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
     try {
       await reviewAssessment(interviewId, questionId, {
-        expected_transcript_revision: activeRevisionId,
+        expected_transcript_revision: await fetchActiveRevision(),
         scores: scoresToSubmit,
         reviewer_notes: 'Вопрос возвращён в оценку экспертом',
         is_manually_adjusted: true,
@@ -1013,10 +1067,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     }
   };
 
-  const handleAutoEvaluateAll = async () => {
+  const handleAutoEvaluateAll = async (onlyQuestionIds?: string[]) => {
     if (isFinalized || isEvaluatingAll) return;
     setEvalWarning(null);
     setEvalProgressText(null);
+    setFailedEvaluations([]);
 
     const candidateSegments = segments.filter((s) => {
       if (s.speaker_role === 'candidate') return true;
@@ -1034,7 +1089,9 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     try {
       const jobIds: string[] = [];
       const concurrencyLimit = 3;
-      const queue = [...plan.questions];
+      const queue = plan.questions.filter(
+        (q) => (!onlyQuestionIds || onlyQuestionIds.includes(q.id)) && !excludedQuestions[q.id]?.isExcluded
+      );
 
       const runWorker = async () => {
         while (queue.length > 0) {
@@ -1480,7 +1537,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
                 <button
                   type="button"
-                  onClick={handleAutoEvaluateAll}
+                  onClick={() => void handleAutoEvaluateAll()}
                   disabled={isEvaluatingAll}
                   className="flex items-center space-x-2 px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-semibold rounded-lg shadow-sm transition cursor-pointer disabled:cursor-not-allowed"
                 >
@@ -1505,6 +1562,34 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           {evalWarning && (
             <div className="p-3 bg-amber-950/40 border border-amber-800 text-amber-200 text-xs rounded-lg">
               {evalWarning}
+            </div>
+          )}
+
+          {failedEvaluations.length > 0 && !isEvaluatingAll && (
+            <div className="p-3 bg-rose-950/40 border border-rose-800 text-rose-200 text-xs rounded-lg flex items-start justify-between gap-3">
+              <div className="flex items-start space-x-2 min-w-0">
+                <AlertTriangle className="w-4 h-4 text-rose-400 flex-shrink-0 mt-0.5" />
+                <div className="space-y-1 min-w-0">
+                  <strong>Не удалось оценить:</strong>
+                  {failedEvaluations.map((f) => {
+                    const idx = plan.questions.findIndex((q) => q.id === f.questionId);
+                    return (
+                      <div key={f.questionId} className="break-words">
+                        Вопрос №{idx + 1} — {f.reason}
+                      </div>
+                    );
+                  })}
+                  <div className="text-rose-300/80">Можно повторить, выставить балл вручную или исключить вопрос из оценки.</div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleAutoEvaluateAll(failedEvaluations.map((f) => f.questionId))}
+                className="flex-shrink-0 flex items-center space-x-1.5 px-3 py-1.5 bg-slate-900 border border-slate-700 hover:bg-slate-800 text-slate-200 text-xs font-medium rounded-lg transition cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Повторить</span>
+              </button>
             </div>
           )}
 

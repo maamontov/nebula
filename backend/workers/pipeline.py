@@ -278,6 +278,34 @@ class WorkerAiBundle:
     default_language: str
 
 
+def normalize_critical_errors(raw: Any) -> list[str]:
+    """
+    The assessment prompt asks for critical errors as objects (severity, title, description,
+    evidence), while the proposal contract stores human-readable strings. Models also sometimes
+    return plain strings. Both shapes are converted to strings; anything else is dropped.
+    """
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            text = item.strip()
+        elif isinstance(item, dict):
+            severity = str(item.get("severity") or "").strip()
+            title = str(item.get("title") or "").strip()
+            description = str(item.get("description") or "").strip()
+            if title and description and description != title:
+                body = f"{title} — {description}"
+            else:
+                body = title or description
+            text = f"{severity}: {body}" if severity and body else body
+        else:
+            continue
+        if text:
+            result.append(text)
+    return result
+
+
 class PipelineWorker:
     def __init__(
         self,
@@ -1193,7 +1221,7 @@ class PipelineWorker:
         # 5. Programmatic Evidence Validation
         parsed_json = llm_res.get("data", llm_res) if isinstance(llm_res, dict) else {}
         scores = parsed_json.get("scores", [])
-        critical_errors = parsed_json.get("critical_errors", [])
+        critical_errors = normalize_critical_errors(parsed_json.get("critical_errors", []))
 
         proposal_scores_objs: list[CriterionScoreProposal] = []
         for s in scores:
