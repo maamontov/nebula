@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { CustomSelect } from '../components/CustomSelect';
+import { PageHeader } from '../components/PageHeader';
 import {
   InterviewPlan,
   AssessmentProposal,
@@ -1127,9 +1128,9 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     'Должность не указана';
 
   return (
-    <div className="review-screen max-w-6xl mx-auto p-6 space-y-6 overflow-y-auto h-[calc(100vh-4rem)]">
+    <div className="review-screen workspace-page overflow-y-auto">
       {/* Top Header & Context */}
-      <div className="review-header glass-panel p-5 rounded-2xl flex flex-wrap items-center justify-between gap-4 shadow-xl">
+      <PageHeader className="review-header">
         <div className="flex items-center space-x-4">
           <div className="review-hero-icon w-12 h-12 rounded-xl flex items-center justify-center shadow-lg shrink-0">
             <Award className="w-7 h-7 text-white" />
@@ -1216,7 +1217,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             )}
           </div>
         </div>
-      </div>
+      </PageHeader>
 
       {reopenSuccessMsg && (
         <div className="p-3 bg-emerald-950/60 border border-emerald-800 text-emerald-300 text-xs rounded-xl flex items-center justify-between shadow-md">
@@ -1235,7 +1236,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       )}
 
       {/* Tabs Navigation Bar */}
-      <div className="flex items-center space-x-1 border-b border-slate-800 pb-2">
+      <div className="review-tabs flex items-center space-x-1 border-b border-slate-800 pb-2 overflow-x-auto">
         <button
           type="button"
           onClick={() => setActiveTab('overview')}
@@ -2843,6 +2844,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                   Часть 1 ({Math.round(splittingSegment.start_time_ms / 1000)}с - {splitTimeSec}с)
                 </span>
                 <CustomSelect
+                  aria-label="Говорящий в первой части"
                   value={splitRole1}
                   onChange={(e) => setSplitRole1(e.target.value as SpeakerRole)}
                   className="bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-xs text-slate-200"
@@ -2868,6 +2870,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                   Часть 2 ({splitTimeSec}с - {Math.round(splittingSegment.end_time_ms / 1000)}с)
                 </span>
                 <CustomSelect
+                  aria-label="Говорящий во второй части"
                   value={splitRole2}
                   onChange={(e) => setSplitRole2(e.target.value as SpeakerRole)}
                   className="bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-xs text-slate-200"

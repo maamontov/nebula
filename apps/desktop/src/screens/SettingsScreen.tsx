@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { CustomSelect } from '../components/CustomSelect';
+import { PageHeader } from '../components/PageHeader';
 import {
   AiSettingsResponse,
   TranscriptionSettings,
@@ -543,7 +544,7 @@ export const SettingsScreen: React.FC = () => {
     <div className="settings-screen h-[calc(100vh-4rem)] flex flex-col overflow-hidden bg-[var(--app-bg)]">
       {/* Header */}
       <div className="settings-header p-6 border-b border-[var(--border)] shrink-0 bg-[var(--surface)]">
-        <div className="settings-header-inner max-w-5xl mx-auto flex items-start justify-between gap-4">
+        <PageHeader className="settings-header-inner">
           <div>
             <h1 className="text-xl font-bold text-[var(--text-primary)] flex items-center space-x-2">
               <span>Настройки AI-провайдеров</span>
@@ -561,7 +562,7 @@ export const SettingsScreen: React.FC = () => {
               </div>
             </div>
           </div>
-        </div>
+        </PageHeader>
       </div>
 
       {/* Main Content */}
@@ -606,6 +607,7 @@ export const SettingsScreen: React.FC = () => {
               <div className="flex items-center space-x-2">
                 <span className="text-xs text-[var(--text-muted)]">Пресет:</span>
                 <CustomSelect
+                  aria-label="Пресет STT"
                   value={transcription.preset}
                   onChange={(e) => handlePresetChangeStt(e.target.value as ProviderPreset)}
                   className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -656,6 +658,7 @@ export const SettingsScreen: React.FC = () => {
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-[var(--text-secondary)]">Режим авторизации</label>
                 <CustomSelect
+                  aria-label="Режим авторизации STT"
                   value={transcription.auth_mode}
                   onChange={(e) => setTranscription({ ...transcription, auth_mode: e.target.value as AuthMode })}
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -748,6 +751,7 @@ export const SettingsScreen: React.FC = () => {
               <div className="flex items-center space-x-2">
                 <span className="text-xs text-[var(--text-muted)]">Пресет:</span>
                 <CustomSelect
+                  aria-label="Пресет LLM"
                   value={textAnalysis.preset}
                   onChange={(e) => handlePresetChangeLlm(e.target.value as ProviderPreset)}
                   className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -775,6 +779,7 @@ export const SettingsScreen: React.FC = () => {
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-[var(--text-secondary)]">Режим авторизации</label>
                 <CustomSelect
+                  aria-label="Режим авторизации LLM"
                   value={textAnalysis.auth_mode}
                   onChange={(e) => setTextAnalysis({ ...textAnalysis, auth_mode: e.target.value as AuthMode })}
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -840,6 +845,7 @@ export const SettingsScreen: React.FC = () => {
                 <div className="space-y-1">
                   <label className="text-[11px] text-slate-400">Структурированный вывод</label>
                   <CustomSelect
+                    aria-label="Структурированный вывод основной модели"
                     value={textAnalysis.primary_model.structured_output_mode}
                     onChange={(e) =>
                       setTextAnalysis({
@@ -861,6 +867,7 @@ export const SettingsScreen: React.FC = () => {
                 <div className="space-y-1">
                   <label className="text-[11px] text-slate-400">Политика reasoning</label>
                   <CustomSelect
+                    aria-label="Политика reasoning основной модели"
                     value={textAnalysis.primary_model.reasoning_policy}
                     onChange={(e) =>
                       setTextAnalysis({
@@ -970,6 +977,7 @@ export const SettingsScreen: React.FC = () => {
                         <div className="space-y-1">
                           <label className="settings-field-label text-[11px] text-slate-400">Структурированный вывод</label>
                           <CustomSelect
+                            aria-label={`Структурированный вывод резервной модели ${idx + 1}`}
                             value={fb.structured_output_mode}
                             onChange={(e) =>
                               handleUpdateFallbackModel(idx, {
@@ -987,6 +995,7 @@ export const SettingsScreen: React.FC = () => {
                         <div className="space-y-1">
                           <label className="settings-field-label text-[11px] text-slate-400">Политика reasoning</label>
                           <CustomSelect
+                            aria-label={`Политика reasoning резервной модели ${idx + 1}`}
                             value={fb.reasoning_policy}
                             onChange={(e) =>
                               handleUpdateFallbackModel(idx, {
@@ -1144,8 +1153,8 @@ export const SettingsScreen: React.FC = () => {
       </div>
 
       {/* Footer Actions */}
-      <div className="p-4 border-t border-[var(--border)] bg-[var(--surface)] shrink-0">
-        <div className="max-w-5xl mx-auto flex items-center justify-between">
+      <div className="settings-footer border-t border-[var(--border)] bg-[var(--surface)] shrink-0">
+        <div className="settings-footer-inner flex items-center justify-between">
           <div className="text-xs text-[var(--text-muted)] flex items-center space-x-2">
             {isDirty ? (
               <span className="text-amber-400 font-medium">Есть несохранённые изменения</span>

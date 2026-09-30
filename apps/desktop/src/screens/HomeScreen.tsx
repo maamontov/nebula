@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { InterviewListItem, InterviewStatus } from '../types';
 import { listInterviews, deleteInterview } from '../services/api';
 import { CustomSelect } from '../components/CustomSelect';
+import { PageHeader } from '../components/PageHeader';
 import {
   Search,
   Filter,
@@ -39,6 +40,8 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const [page, setPage] = useState(1);
   const [pageSize] = useState(15);
   const [isLoading, setIsLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
+  const requestSequence = useRef(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Filters
@@ -56,6 +59,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const [isDeleting, setIsDeleting] = useState(false);
 
   const fetchInterviews = useCallback(async () => {
+    const requestId = ++requestSequence.current;
     setIsLoading(true);
     setErrorMsg(null);
     try {
@@ -82,8 +86,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         from_date: fromDate,
       });
 
+      if (requestId !== requestSequence.current) return;
       setItems(res.items);
       setTotal(res.total);
+      setHasLoaded(true);
 
       // Collect unique roles for filter dropdown
       const roles = new Set<string>();
@@ -92,14 +98,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       });
       setAvailableRoles((prev) => Array.from(new Set([...prev, ...Array.from(roles)])));
     } catch (err: any) {
+      if (requestId !== requestSequence.current) return;
       setErrorMsg(err.message || 'Ошибка загрузки собеседований');
     } finally {
-      setIsLoading(false);
+      if (requestId === requestSequence.current) setIsLoading(false);
     }
   }, [page, pageSize, searchQuery, roleFilter, statusFilter, dateFilter]);
 
   useEffect(() => {
-    fetchInterviews();
+    void fetchInterviews();
+    return () => { requestSequence.current += 1; };
   }, [fetchInterviews]);
 
   const handleDelete = async () => {
@@ -277,9 +285,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   };
 
   return (
-    <div className={`home-screen${!errorMsg && items.length === 0 ? ' home-screen-empty' : ''} max-w-7xl mx-auto p-6 md:p-8 space-y-6 overflow-y-auto h-[calc(100vh-4rem)]`}>
+    <div className="home-screen workspace-page overflow-y-auto">
       {/* Header Banner */}
-      <div className="home-heading flex flex-col md:flex-row md:items-center justify-between gap-4">
+      <PageHeader className="home-heading">
         <div>
           <h1 className="text-2xl font-bold text-slate-100 flex items-center space-x-3">
             <span>Собеседования</span>
@@ -287,7 +295,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           </h1>
         </div>
 
-      </div>
+      </PageHeader>
 
       {/* Filters Toolbar */}
       <div className={`filter-toolbar p-3 rounded-xl bg-slate-900/60 border border-slate-800${showFilters ? ' filter-toolbar-expanded' : ''}`}>
@@ -324,6 +332,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
           <Briefcase className="w-4 h-4 text-slate-400" />
           <CustomSelect
+            aria-label="Должность"
             value={roleFilter}
             onChange={(e) => {
               setRoleFilter(e.target.value);
@@ -342,6 +351,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
           <ShieldCheck className="w-4 h-4 text-slate-400" />
           <CustomSelect
+            aria-label="Статус"
             value={statusFilter}
             onChange={(e) => {
               setStatusFilter(e.target.value);
@@ -365,6 +375,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           <div className="filter-control flex items-center space-x-1.5 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
           <Calendar className="w-4 h-4 text-slate-400" />
           <CustomSelect
+            aria-label="Период"
             value={dateFilter}
             onChange={(e) => {
               setDateFilter(e.target.value);
@@ -382,10 +393,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       </div>
 
       {/* Main Table / List */}
-      <div className={`interview-table-shell glass-panel rounded-2xl overflow-hidden shadow-xl border border-slate-800/80${
+      <div aria-busy={isLoading} className={`interview-table-shell glass-panel rounded-2xl overflow-hidden shadow-xl border border-slate-800/80${
         !errorMsg && items.length === 0 ? ' interview-table-empty' : ''
       }`}>
-        {isLoading ? (
+        {isLoading && hasLoaded && <span role="status" className="home-refresh-status">Обновление…</span>}
+        {isLoading && !hasLoaded ? (
           <div className="p-16 text-center text-slate-400 space-y-3">
             <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto" />
             <p className="text-sm">Загрузка собеседований...</p>

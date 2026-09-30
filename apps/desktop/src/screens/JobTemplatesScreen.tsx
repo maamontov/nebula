@@ -11,6 +11,7 @@ import {
   copyQuestionToTemplate,
 } from '../services/api';
 import { CustomSelect } from '../components/CustomSelect';
+import { PageHeader } from '../components/PageHeader';
 import {
   Briefcase,
   Plus,
@@ -591,9 +592,9 @@ export const JobTemplatesScreen: React.FC = () => {
       </div>
 
       {/* Right Column: Template & Questions Editor */}
-      <div className="templates-editor flex-1 overflow-y-auto p-6 md:p-8 space-y-6">
+      <div className="templates-editor workspace-page flex-1 overflow-y-auto">
         {/* Editor Top Bar */}
-        <div className="templates-editor-header flex items-center justify-between border-b border-slate-800 pb-4">
+        <PageHeader className="templates-editor-header">
           <div>
             <h2 className="text-xl font-bold text-slate-100">
               {editingTemplate.id ? 'Редактирование должности' : 'Создание новой должности'}
@@ -628,7 +629,7 @@ export const JobTemplatesScreen: React.FC = () => {
               <span>{isSaving ? 'Сохранение...' : editingTemplate.id ? 'Сохранить должность' : 'Создать должность'}</span>
             </button>
           </div>
-        </div>
+        </PageHeader>
 
         {/* Basic Fields */}
         <div className="template-basics glass-panel p-6 rounded-2xl space-y-4 shadow-md">
@@ -649,6 +650,7 @@ export const JobTemplatesScreen: React.FC = () => {
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-300">Уровень (Grade)</label>
               <CustomSelect
+                aria-label="Уровень (Grade)"
                 value={editingTemplate.level}
                 onChange={(e) =>
                   setEditingTemplate((prev) => ({ ...prev, level: e.target.value }))
@@ -951,6 +953,7 @@ export const JobTemplatesScreen: React.FC = () => {
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-300">Целевая должность</label>
               <CustomSelect
+                aria-label="Целевая должность"
                 value={copyQuestionModal.targetTemplateId}
                 onChange={(e) =>
                   setCopyQuestionModal((prev) =>

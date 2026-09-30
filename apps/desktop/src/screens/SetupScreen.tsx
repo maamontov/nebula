@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { CustomSelect } from '../components/CustomSelect';
+import { PageHeader } from '../components/PageHeader';
 import {
   AudioDevice,
   CaptureMode,
@@ -360,9 +361,9 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
   };
 
   return (
-    <div className="setup-screen max-w-5xl mx-auto p-6 md:p-8 space-y-8 overflow-y-auto h-[calc(100vh-4rem)]">
+    <div className="setup-screen workspace-page overflow-y-auto">
       {/* Top Header */}
-      <div className="screen-header flex flex-col md:flex-row md:items-center justify-between gap-4 glass-panel p-6 rounded-2xl shadow-xl">
+      <PageHeader className="screen-header">
         <div className="flex items-center space-x-3">
           {onBackToHome && (
             <button
@@ -402,7 +403,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
             <span>{isSavingDraft ? 'Сохранение...' : 'Сохранить черновик'}</span>
           </button>
         </div>
-      </div>
+      </PageHeader>
 
       {errorMsg && (
         <div className="p-4 bg-rose-950/60 border border-rose-800 rounded-xl flex items-center space-x-3 text-rose-300 text-sm shadow-md">
@@ -441,6 +442,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
             <div className="flex items-center space-x-2">
               <div className="flex-1">
                 <CustomSelect
+                  aria-label="Шаблон должности"
                   value={selectedTemplateId}
                   onChange={(e) => handleTemplateChange(e.target.value)}
                   className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -726,6 +728,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
             </label>
             <div className="relative">
               <CustomSelect
+                aria-label="Общее аудиоустройство"
                 value={selectedShared}
                 onChange={(e) => setSelectedShared(e.target.value)}
                 className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3 pr-10 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -747,6 +750,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
               </label>
               <div className="relative">
                 <CustomSelect
+                  aria-label="Микрофон интервьюера"
                   value={selectedMic}
                   onChange={(e) => setSelectedMic(e.target.value)}
                   className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3 pr-10 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
@@ -767,6 +771,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
               </label>
               <div className="relative">
                 <CustomSelect
+                  aria-label="Звук кандидата"
                   value={selectedSpeaker}
                   onChange={(e) => setSelectedSpeaker(e.target.value)}
                   className="form-control w-full bg-slate-950 border border-slate-800 rounded-lg px-3 pr-10 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 cursor-pointer"

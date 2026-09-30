@@ -19,6 +19,14 @@ interface SelectOption {
   disabled: boolean;
 }
 
+function optionText(children: React.ReactNode): string {
+  return React.Children.toArray(children).map((child) => {
+    if (typeof child === 'string' || typeof child === 'number') return String(child);
+    if (isValidElement<{ children?: React.ReactNode }>(child)) return optionText(child.props.children);
+    return '';
+  }).join('');
+}
+
 export const CustomSelect: React.FC<CustomSelectProps> = ({
   children,
   className = '',
@@ -30,6 +38,8 @@ export const CustomSelect: React.FC<CustomSelectProps> = ({
   defaultValue,
   title,
   'aria-label': ariaLabel,
+  'aria-labelledby': ariaLabelledBy,
+  ...nativeProps
 }) => {
   const generatedId = useId();
   const listboxId = `${generatedId}-listbox`;
@@ -40,50 +50,52 @@ export const CustomSelect: React.FC<CustomSelectProps> = ({
   const [isOpen, setIsOpen] = useState(false);
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
   const [menuStyle, setMenuStyle] = useState<React.CSSProperties>({});
+  const [localValue, setLocalValue] = useState(defaultValue);
 
   const options = useMemo<SelectOption[]>(
     () =>
       React.Children.toArray(children).flatMap((child) => {
         if (!isValidElement<React.OptionHTMLAttributes<HTMLOptionElement>>(child)) return [];
         const optionValue = String(child.props.value ?? '');
-        const label =
-          typeof child.props.children === 'string' || typeof child.props.children === 'number'
-            ? String(child.props.children)
-            : optionValue;
+        const label = child.props.label ?? optionText(child.props.children);
         return [{ value: optionValue, label, disabled: Boolean(child.props.disabled) }];
       }),
     [children]
   );
 
-  const selectedValue = String(value ?? defaultValue ?? options[0]?.value ?? '');
-  const selectedIndex = Math.max(0, options.findIndex((option) => option.value === selectedValue));
+  const selectedValue = String(value ?? localValue ?? options[0]?.value ?? '');
+  const selectedIndex = options.findIndex((option) => option.value === selectedValue);
   const selectedOption = options[selectedIndex];
 
   const updatePosition = useCallback(() => {
     const trigger = triggerRef.current;
     if (!trigger) return;
     const rect = trigger.getBoundingClientRect();
-    const menuHeight = Math.min(options.length * 38 + 10, 280);
+    const desiredHeight = Math.min(options.length * 38 + 10, 280);
     const roomBelow = window.innerHeight - rect.bottom;
-    const openAbove = roomBelow < menuHeight + 12 && rect.top > roomBelow;
+    const openAbove = roomBelow < desiredHeight + 12 && rect.top > roomBelow;
+    const menuHeight = Math.max(0, Math.min(desiredHeight, (openAbove ? rect.top : roomBelow) - 14));
+    const width = Math.min(rect.width, window.innerWidth - 16);
     setMenuStyle({
       position: 'fixed',
-      left: rect.left,
+      left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
       top: openAbove ? Math.max(8, rect.top - menuHeight - 6) : rect.bottom + 6,
-      width: rect.width,
+      width,
       maxHeight: menuHeight,
     });
   }, [options.length]);
 
   const openMenu = useCallback(() => {
-    if (disabled) return;
+    if (disabled || options.length === 0) return;
+    updatePosition();
     setHighlightedIndex(selectedIndex);
     setIsOpen(true);
-  }, [disabled, selectedIndex]);
+  }, [disabled, selectedIndex, options.length, updatePosition]);
 
   const choose = useCallback(
     (nextValue: string) => {
       const nativeSelect = nativeRef.current;
+      if (value === undefined) setLocalValue(nextValue);
       if (nativeSelect) {
         nativeSelect.value = nextValue;
         onChange?.({
@@ -94,7 +106,7 @@ export const CustomSelect: React.FC<CustomSelectProps> = ({
       setIsOpen(false);
       window.requestAnimationFrame(() => triggerRef.current?.focus());
     },
-    [onChange]
+    [onChange, value]
   );
 
   useEffect(() => {
@@ -115,7 +127,18 @@ export const CustomSelect: React.FC<CustomSelectProps> = ({
     };
   }, [isOpen, updatePosition]);
 
+  useEffect(() => {
+    if (isOpen && highlightedIndex >= 0) {
+      menuRef.current?.querySelector<HTMLElement>(`[data-option-index="${highlightedIndex}"]`)
+        ?.scrollIntoView?.({ block: 'nearest' });
+    }
+  }, [isOpen, highlightedIndex]);
+
   const handleKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === 'Tab') {
+      setIsOpen(false);
+      return;
+    }
     if (event.key === 'Escape') {
       setIsOpen(false);
       return;
@@ -132,27 +155,33 @@ export const CustomSelect: React.FC<CustomSelectProps> = ({
       return;
     }
     event.preventDefault();
+    if (options.length === 0) return;
     if (!isOpen) openMenu();
-    const direction = event.key === 'ArrowUp' ? -1 : 1;
+    const direction = event.key === 'ArrowUp' || event.key === 'End' ? -1 : 1;
     const edgeIndex = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1 : null;
     setHighlightedIndex((current) => {
-      let next = edgeIndex ?? Math.max(0, current);
+      let next = edgeIndex ?? (isOpen ? current : selectedIndex);
       if (edgeIndex === null) next = (next + direction + options.length) % options.length;
-      while (options[next]?.disabled && next !== current) {
+      for (let checked = 0; checked < options.length; checked += 1) {
+        if (!options[next]?.disabled) return next;
         next = (next + direction + options.length) % options.length;
       }
-      return next;
+      return -1;
     });
   };
 
   return (
     <div ref={rootRef} className={`custom-select ${className}`}>
       <select
+        {...nativeProps}
         ref={nativeRef}
         id={id ? `${id}-native` : undefined}
         name={name}
         value={selectedValue}
-        onChange={onChange}
+        onChange={(event) => {
+          if (value === undefined) setLocalValue(event.target.value);
+          onChange?.(event);
+        }}
         disabled={disabled}
         className="custom-select-native"
         aria-hidden="true"
@@ -169,9 +198,11 @@ export const CustomSelect: React.FC<CustomSelectProps> = ({
         title={title}
         role="combobox"
         aria-label={ariaLabel}
+        aria-labelledby={ariaLabelledBy}
         aria-expanded={isOpen}
         aria-controls={listboxId}
         aria-haspopup="listbox"
+        aria-activedescendant={isOpen && highlightedIndex >= 0 ? `${listboxId}-${highlightedIndex}` : undefined}
         onClick={() => (isOpen ? setIsOpen(false) : openMenu())}
         onKeyDown={handleKeyDown}
       >
@@ -194,14 +225,18 @@ export const CustomSelect: React.FC<CustomSelectProps> = ({
               return (
                 <button
                   key={`${option.value}-${index}`}
+                  id={`${listboxId}-${index}`}
+                  data-option-index={index}
                   type="button"
                   role="option"
                   aria-selected={isSelected}
                   disabled={option.disabled}
+                  tabIndex={-1}
                   className={`custom-select-option${isSelected ? ' is-selected' : ''}${
                     isHighlighted ? ' is-highlighted' : ''
                   }`}
                   onPointerEnter={() => setHighlightedIndex(index)}
+                  onMouseDown={(event) => event.preventDefault()}
                   onClick={() => choose(option.value)}
                 >
                   <span>{option.label}</span>

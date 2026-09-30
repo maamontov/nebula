@@ -47,6 +47,8 @@ const NavButton: React.FC<NavButtonProps> = ({ label, active, onClick, children 
     onClick={onClick}
     className={`sidebar-nav-item${active ? ' sidebar-nav-item-active' : ''}`}
     aria-current={active ? 'page' : undefined}
+    aria-label={label}
+    title={label}
   >
     {children}
     <span>{label}</span>
@@ -80,6 +82,7 @@ export const Header: React.FC<HeaderProps> = ({
           className="sidebar-new-action"
           onClick={onNewInterview}
           disabled={hasActiveRecording}
+          aria-label="Новое интервью"
           title={hasActiveRecording ? 'Запись уже активна' : 'Создать новое интервью'}
         >
           <Plus className="sidebar-nav-icon" />

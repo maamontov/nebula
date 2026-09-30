@@ -413,7 +413,7 @@ export const FollowUpSuggestions: React.FC<FollowUpSuggestionsProps> = ({
         <div className="flex min-w-0 flex-1 items-start space-x-2">
           <HelpCircle className="w-4 h-4 text-cyan-400 shrink-0" />
           <div className="min-w-0">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-200 block">
+            <span className="live-section-title text-xs font-bold text-slate-200 block">
               Что спросить дальше
             </span>
             {questionTitle && (
